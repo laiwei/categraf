@@ -101,7 +101,6 @@ require (
 	github.com/elastic/go-windows v1.0.2 // indirect
 	github.com/emicklei/go-restful/v3 v3.11.0 // indirect
 	github.com/facette/natsort v0.0.0-20181210072756-2cd4dd1e2dcb // indirect
-	github.com/frankban/quicktest v1.14.3 // indirect
 	github.com/fxamacker/cbor/v2 v2.7.0 // indirect
 	github.com/gabriel-vasile/mimetype v1.4.2 // indirect
 	github.com/go-asn1-ber/asn1-ber v1.5.5 // indirect
@@ -193,6 +192,7 @@ require (
 	github.com/blang/semver/v4 v4.0.0
 	github.com/bmatcuk/doublestar/v3 v3.0.0
 	github.com/cenkalti/backoff/v4 v4.3.0
+	github.com/cilium/ebpf v0.12.3
 	github.com/coreos/go-systemd/v22 v22.5.0
 	github.com/dennwc/btrfs v0.0.0-20230312211831-a1f570bd01a1
 	github.com/dop251/goja v0.0.0-20251103141225-af2ceb9156d7

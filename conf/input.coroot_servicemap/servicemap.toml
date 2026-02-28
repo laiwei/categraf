@@ -1,0 +1,42 @@
+# Coroot Service Map Plugin Configuration
+# This plugin uses eBPF to trace TCP connections and build a service map
+
+[[instances]]
+# 采集间隔（秒）
+interval = 60
+
+# L7协议解析开关
+enable_l7_tracing = true
+enable_http = true
+enable_tcp = true
+
+# 过滤配置
+# 忽略的端口列表（如SSH、监控端口等）
+ignore_ports = [22, 9100]
+
+# 忽略的CIDR列表（如本地回环）
+ignore_cidrs = ["127.0.0.0/8"]
+
+# 容器发现配置
+# Docker socket路径
+docker_socket = "/var/run/docker.sock"
+
+# 启用Docker容器发现
+enable_docker = true
+
+# 启用Kubernetes容器发现
+enable_k8s = true
+
+# 启用Cgroup容器发现（最基础的方式）
+enable_cgroup = true
+
+# 附加标签
+[instances.labels]
+  # env = "production"
+  # cluster = "cluster-1"
+
+## 注意事项：
+## 1. 此插件需要 root 权限运行
+## 2. Linux 内核版本需 >= 4.16
+## 3. 需要挂载 /sys/fs/cgroup 和 /proc
+## 4. 建议在容器中以 privileged 模式运行或添加 CAP_SYS_ADMIN capability
