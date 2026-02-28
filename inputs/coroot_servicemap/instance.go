@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net/http"
 	"runtime"
 
 	"flashcat.cloud/categraf/config"
@@ -32,11 +33,15 @@ type Instance struct {
 	MaxTrackedConnections int `toml:"max_tracked_connections"`
 	MaxContainers         int `toml:"max_containers"`
 
+	// Graph API 服务地址，例如 ":9099"；为空时不启动
+	APIAddr string `toml:"api_addr"`
+
 	// 内部状态
-	ctx      context.Context
-	cancel   context.CancelFunc
-	tracer   *tracer.Tracer
-	registry *containers.Registry
+	ctx       context.Context
+	cancel    context.CancelFunc
+	tracer    *tracer.Tracer
+	registry  *containers.Registry
+	apiServer *http.Server
 }
 
 // Init 初始化实例
@@ -105,6 +110,9 @@ func (ins *Instance) Init() error {
 	}
 
 	ins.registry = reg
+
+	// 启动内嵌 Graph API server
+	ins.startAPIServer()
 
 	log.Printf("I! coroot_servicemap: instance initialized successfully")
 	return nil
@@ -180,6 +188,9 @@ func (ins *Instance) Drop() {
 	if ins.cancel != nil {
 		ins.cancel()
 	}
+
+	// 先关闭 API server，再关闭 registry/tracer
+	ins.stopAPIServer()
 
 	if ins.registry != nil {
 		ins.registry.Close()

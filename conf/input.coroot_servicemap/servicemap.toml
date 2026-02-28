@@ -14,6 +14,14 @@ enable_tcp = true
 # max_tracked_connections = 50000
 # max_containers = 5000
 
+# Graph API 服务地址（供用户和 AI 查询 service map 拓扑）
+# 启用后可通过以下方式查看数据：
+#   curl http://localhost:9099/graph           # JSON 格式
+#   curl http://localhost:9099/graph/text      # 人类可读文本格式
+#   curl http://localhost:9099/health          # 健康检查
+# 留空则不启动（默认关闭）
+# api_addr = ":9099"
+
 # 过滤配置
 # 忽略的端口列表（如SSH、监控端口等）
 ignore_ports = [22, 9100]
