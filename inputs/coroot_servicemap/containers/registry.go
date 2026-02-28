@@ -1,6 +1,7 @@
 package containers
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"os"
@@ -10,6 +11,14 @@ import (
 	"sync"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/clientcmd"
+
+	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/client"
 	"flashcat.cloud/categraf/inputs/coroot_servicemap/tracer"
 )
 
@@ -21,12 +30,23 @@ type Config struct {
 	EnableK8s    bool
 	EnableCgroup bool
 	DockerSocket string
+	KubeConfig   string
+}
+
+type k8sContainerMeta struct {
+	PodName   string
+	Namespace string
+	Labels    map[string]string
 }
 
 // Registry 容器注册表
 type Registry struct {
 	config Config
 	tracer *tracer.Tracer
+	docker *client.Client
+	kube   kubernetes.Interface
+
+	k8sContainerMeta map[string]k8sContainerMeta
 
 	containers map[string]*Container
 	mu         sync.RWMutex
@@ -37,10 +57,38 @@ type Registry struct {
 // NewRegistry 创建新的容器注册表
 func NewRegistry(tr *tracer.Tracer, config Config) (*Registry, error) {
 	r := &Registry{
-		config:     config,
-		tracer:     tr,
-		containers: make(map[string]*Container),
-		stopChan:   make(chan struct{}),
+		config:           config,
+		tracer:           tr,
+		containers:       make(map[string]*Container),
+		k8sContainerMeta: make(map[string]k8sContainerMeta),
+		stopChan:         make(chan struct{}),
+	}
+
+	if config.EnableDocker {
+		dockerHost := "unix:///var/run/docker.sock"
+		if config.DockerSocket != "" {
+			dockerHost = "unix://" + config.DockerSocket
+		}
+
+		cli, err := client.NewClientWithOpts(
+			client.WithHost(dockerHost),
+			client.WithAPIVersionNegotiation(),
+		)
+		if err != nil {
+			log.Printf("W! coroot_servicemap: init docker client failed: %v", err)
+		} else {
+			r.docker = cli
+		}
+	}
+
+	if config.EnableK8s {
+		kubeClient, err := newKubeClient(config.KubeConfig)
+		if err != nil {
+			log.Printf("W! coroot_servicemap: init kubernetes client failed: %v", err)
+		} else {
+			r.kube = kubeClient
+			r.refreshK8sContainerMeta()
+		}
 	}
 
 	// 启动事件处理
@@ -114,8 +162,96 @@ func (r *Registry) getOrCreateContainer(id string) *Container {
 	}
 
 	container := NewContainer(id)
+	r.enrichContainerMetadata(container)
+	r.enrichContainerWithK8sMetadata(container)
 	r.containers[id] = container
 	return container
+}
+
+func (r *Registry) enrichContainerWithK8sMetadata(c *Container) {
+	if c == nil || c.ID == "" || len(r.k8sContainerMeta) == 0 {
+		return
+	}
+
+	meta, ok := r.k8sContainerMeta[c.ID]
+	if !ok {
+		for id, m := range r.k8sContainerMeta {
+			if strings.HasPrefix(id, c.ID) || strings.HasPrefix(c.ID, id) {
+				meta = m
+				ok = true
+				break
+			}
+		}
+	}
+
+	if !ok {
+		return
+	}
+
+	if c.PodName == "" {
+		c.PodName = meta.PodName
+	}
+	if c.Namespace == "" {
+		c.Namespace = meta.Namespace
+	}
+
+	if c.Labels == nil {
+		c.Labels = make(map[string]string)
+	}
+	for k, v := range meta.Labels {
+		key := "k8s_label_" + k
+		if _, exists := c.Labels[key]; !exists {
+			c.Labels[key] = v
+		}
+	}
+}
+
+func (r *Registry) enrichContainerMetadata(c *Container) {
+	if c == nil || c.ID == "" || r.docker == nil {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	ins, err := r.docker.ContainerInspect(ctx, c.ID)
+	if err != nil {
+		return
+	}
+
+	r.applyInspectMetadata(c, ins)
+}
+
+func (r *Registry) applyInspectMetadata(c *Container, ins container.InspectResponse) {
+	if c == nil {
+		return
+	}
+
+	if ins.ContainerJSONBase != nil && ins.Name != "" {
+		c.Name = strings.TrimPrefix(ins.Name, "/")
+	}
+
+	if ins.Config != nil {
+		if ins.Config.Image != "" {
+			c.Image = ins.Config.Image
+		}
+
+		if len(ins.Config.Labels) > 0 {
+			if c.Labels == nil {
+				c.Labels = make(map[string]string, len(ins.Config.Labels))
+			}
+			for k, v := range ins.Config.Labels {
+				c.Labels[k] = v
+			}
+
+			if v := ins.Config.Labels["io.kubernetes.pod.name"]; v != "" {
+				c.PodName = v
+			}
+			if v := ins.Config.Labels["io.kubernetes.pod.namespace"]; v != "" {
+				c.Namespace = v
+			}
+		}
+	}
 }
 
 // getContainerIDByPID 根据PID获取容器ID（简化版）
@@ -179,6 +315,85 @@ func extractContainerID(cgroupLine string) string {
 	return ""
 }
 
+func normalizeContainerID(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+
+	if idx := strings.Index(raw, "://"); idx >= 0 {
+		raw = raw[idx+3:]
+	}
+
+	raw = strings.TrimSuffix(raw, ".scope")
+	return raw
+}
+
+func newKubeClient(kubeConfig string) (kubernetes.Interface, error) {
+	var cfg *rest.Config
+	var err error
+
+	if kubeConfig != "" {
+		cfg, err = clientcmd.BuildConfigFromFlags("", kubeConfig)
+	} else {
+		cfg, err = rest.InClusterConfig()
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	return kubernetes.NewForConfig(cfg)
+}
+
+func (r *Registry) refreshK8sContainerMeta() {
+	if r.kube == nil {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	pods, err := r.kube.CoreV1().Pods("").List(ctx, metav1.ListOptions{})
+	if err != nil {
+		log.Printf("W! coroot_servicemap: list kubernetes pods failed: %v", err)
+		return
+	}
+
+	metaMap := make(map[string]k8sContainerMeta)
+	for i := range pods.Items {
+		p := &pods.Items[i]
+		indexPodContainerMeta(metaMap, p)
+	}
+
+	r.k8sContainerMeta = metaMap
+}
+
+func indexPodContainerMeta(metaMap map[string]k8sContainerMeta, p *corev1.Pod) {
+	if p == nil {
+		return
+	}
+
+	base := k8sContainerMeta{
+		PodName:   p.Name,
+		Namespace: p.Namespace,
+		Labels:    p.GetLabels(),
+	}
+
+	indexStatuses := func(statuses []corev1.ContainerStatus) {
+		for _, st := range statuses {
+			id := normalizeContainerID(st.ContainerID)
+			if id == "" {
+				continue
+			}
+			metaMap[id] = base
+		}
+	}
+
+	indexStatuses(p.Status.ContainerStatuses)
+	indexStatuses(p.Status.InitContainerStatuses)
+	indexStatuses(p.Status.EphemeralContainerStatuses)
+}
+
 // discoverContainersByCgroup 通过cgroup发现容器（待实现）
 func (r *Registry) discoverContainersByCgroup() {
 	ticker := time.NewTicker(30 * time.Second)
@@ -189,9 +404,12 @@ func (r *Registry) discoverContainersByCgroup() {
 		case <-r.stopChan:
 			return
 		case <-ticker.C:
-			// TODO: 扫描 /sys/fs/cgroup
-			// 发现新容器
-			log.Println("D! coroot_servicemap: discovering containers...")
+			if r.kube != nil {
+				r.mu.Lock()
+				r.refreshK8sContainerMeta()
+				r.mu.Unlock()
+			}
+			log.Println("D! coroot_servicemap: discovering containers and refreshing metadata...")
 		}
 	}
 }
@@ -211,5 +429,8 @@ func (r *Registry) GetContainers() []*Container {
 // Close 关闭注册表
 func (r *Registry) Close() {
 	close(r.stopChan)
+	if r.docker != nil {
+		_ = r.docker.Close()
+	}
 	log.Println("I! coroot_servicemap: container registry closed")
 }

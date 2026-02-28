@@ -36,9 +36,12 @@ type HTTPStats struct {
 
 // Container 容器对象
 type Container struct {
-	ID   string
-	PID  uint32
-	Name string
+	ID        string
+	PID       uint32
+	Name      string
+	Image     string
+	PodName   string
+	Namespace string
 	// 标签
 	Labels map[string]string
 

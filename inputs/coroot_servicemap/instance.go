@@ -6,6 +6,7 @@ import (
 
 	"flashcat.cloud/categraf/config"
 	"flashcat.cloud/categraf/inputs/coroot_servicemap/containers"
+	"flashcat.cloud/categraf/inputs/coroot_servicemap/servicemap"
 	"flashcat.cloud/categraf/inputs/coroot_servicemap/tracer"
 	"flashcat.cloud/categraf/types"
 	"github.com/vishvananda/netns"
@@ -65,6 +66,7 @@ func (ins *Instance) Init() error {
 		EnableK8s:    ins.KubeConfigPath != "",
 		EnableCgroup: ins.EnableCgroup,
 		DockerSocket: ins.DockerSocketPath,
+		KubeConfig:   ins.KubeConfigPath,
 	}
 
 	reg, err := containers.NewRegistry(t, regConfig)
@@ -101,6 +103,15 @@ func (ins *Instance) Gather(slist *types.SampleList) error {
 		if container.Name != "" {
 			tags["container_name"] = container.Name
 		}
+		if container.PodName != "" {
+			tags["pod_name"] = container.PodName
+		}
+		if container.Namespace != "" {
+			tags["namespace"] = container.Namespace
+		}
+		if container.Image != "" {
+			tags["image"] = container.Image
+		}
 
 		// 添加标签
 		for k, v := range container.Labels {
@@ -116,6 +127,10 @@ func (ins *Instance) Gather(slist *types.SampleList) error {
 		if ins.EnableHTTP {
 			ins.collectHTTPStats(container, tags, slist)
 		}
+	}
+
+	if ins.EnableTCP {
+		ins.collectServiceMapStats(containers, slist)
 	}
 
 	return nil
@@ -245,6 +260,75 @@ func (ins *Instance) collectHTTPStats(container *containers.Container, baseTags 
 			float64(stats.BytesReceived),
 			tags))
 	}
+}
+
+// collectServiceMapStats 输出服务拓扑图聚合指标
+func (ins *Instance) collectServiceMapStats(cs []*containers.Container, slist *types.SampleList) {
+	g := servicemap.Build(cs)
+
+	for _, edge := range g.Edges {
+		tags := map[string]string{
+			"source_id":   edge.Source.ID,
+			"source_name": edge.Source.Name,
+			"destination": edge.Destination,
+		}
+
+		if edge.Source.ContainerID != "" {
+			tags["container_id"] = edge.Source.ContainerID
+		}
+		if edge.Source.Namespace != "" {
+			tags["namespace"] = edge.Source.Namespace
+		}
+		if edge.Source.PodName != "" {
+			tags["pod_name"] = edge.Source.PodName
+		}
+		if edge.DestHost != "" {
+			tags["destination_host"] = edge.DestHost
+		}
+		if edge.DestPort != "" {
+			tags["destination_port"] = edge.DestPort
+		}
+
+		slist.PushFront(types.NewSample(inputName,
+			"service_map_edge_successful_connects_total",
+			float64(edge.SuccessfulConnects),
+			tags))
+
+		slist.PushFront(types.NewSample(inputName,
+			"service_map_edge_failed_connects_total",
+			float64(edge.FailedConnects),
+			tags))
+
+		slist.PushFront(types.NewSample(inputName,
+			"service_map_edge_active_connections",
+			float64(edge.ActiveConnections),
+			tags))
+
+		slist.PushFront(types.NewSample(inputName,
+			"service_map_edge_retransmissions_total",
+			float64(edge.Retransmissions),
+			tags))
+
+		slist.PushFront(types.NewSample(inputName,
+			"service_map_edge_bytes_sent_total",
+			float64(edge.BytesSent),
+			tags))
+
+		slist.PushFront(types.NewSample(inputName,
+			"service_map_edge_bytes_received_total",
+			float64(edge.BytesReceived),
+			tags))
+	}
+
+	slist.PushFront(types.NewSample(inputName,
+		"service_map_nodes",
+		float64(len(g.Nodes)),
+		map[string]string{}))
+
+	slist.PushFront(types.NewSample(inputName,
+		"service_map_edges",
+		float64(len(g.Edges)),
+		map[string]string{}))
 }
 
 // mergeTags 合并标签

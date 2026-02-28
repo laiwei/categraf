@@ -9,6 +9,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"os"
 	"runtime"
 	"strconv"
 	"strings"
@@ -97,7 +98,7 @@ type Tracer struct {
 	activeConns  map[ConnectionID]Connection
 	lastSnapshot map[ConnectionID]Event
 
-	started bool
+	started  bool
 	stopOnce sync.Once
 
 	eventChan chan Event
@@ -159,15 +160,14 @@ func (t *Tracer) Start() error {
 		return nil
 	}
 
-	// 在实际部署时需要：
-	// 1. 编写eBPF C代码
-	// 2. 使用clang编译为字节码
-	// 3. 嵌入到Go程序中
-	// 由于eBPF程序需要预编译，这里暂时返回提示信息
-	// 注意: 这里需要实际的eBPF字节码
+	if err := t.loadEBPF(); err != nil {
+		log.Printf("W! coroot_servicemap: load eBPF failed, fallback to polling tracer: %v", err)
+		go t.startPollingTracer()
+		t.started = true
+		return nil
+	}
 
-	log.Println("W! coroot_servicemap: eBPF program loading is not yet implemented, fallback to polling tracer")
-	go t.startPollingTracer()
+	log.Println("I! coroot_servicemap: eBPF tracer started")
 	t.started = true
 	return nil
 }
@@ -180,12 +180,124 @@ func (t *Tracer) loadEBPF() error {
 		Max: unix.RLIM_INFINITY,
 	})
 
-	// TODO: 加载预编译的eBPF程序
-	// 这需要：
-	// 1. eBPF C代码 (tcp连接跟踪、L7解析等)
-	// 2. 编译脚本
-	// 3. 字节码嵌入
-	return fmt.Errorf("eBPF program loading not implemented")
+	program, err := getEmbeddedEBPFProgram(runtime.GOARCH)
+	if err != nil {
+		return err
+	}
+
+	progBytes, err := decompressEBPFProgram(program)
+	if err != nil {
+		return fmt.Errorf("decompress ebpf program failed: %w", err)
+	}
+
+	spec, err := ebpf.LoadCollectionSpecFromReader(bytes.NewReader(progBytes))
+	if err != nil {
+		return fmt.Errorf("load ebpf collection spec failed: %w", err)
+	}
+
+	collection, err := ebpf.NewCollection(spec)
+	if err != nil {
+		return fmt.Errorf("create ebpf collection failed: %w", err)
+	}
+
+	t.collection = collection
+
+	if err := t.attachProbes(); err != nil {
+		return err
+	}
+
+	if err := t.initPerfReaders(); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (t *Tracer) attachProbes() error {
+	if t.collection == nil {
+		return fmt.Errorf("collection is nil")
+	}
+
+	attached := 0
+	for name, prog := range t.collection.Programs {
+		switch name {
+		case "trace_inet_sock_set_state":
+			l, err := link.Tracepoint("sock", "inet_sock_set_state", prog, nil)
+			if err != nil {
+				return fmt.Errorf("attach %s failed: %w", name, err)
+			}
+			t.links = append(t.links, l)
+			attached++
+		case "trace_sys_enter_connect":
+			l, err := link.Tracepoint("syscalls", "sys_enter_connect", prog, nil)
+			if err != nil {
+				return fmt.Errorf("attach %s failed: %w", name, err)
+			}
+			t.links = append(t.links, l)
+			attached++
+		case "trace_sys_exit_connect":
+			l, err := link.Tracepoint("syscalls", "sys_exit_connect", prog, nil)
+			if err != nil {
+				return fmt.Errorf("attach %s failed: %w", name, err)
+			}
+			t.links = append(t.links, l)
+			attached++
+		}
+	}
+
+	if attached == 0 {
+		return fmt.Errorf("no known tracepoint program found in ebpf collection")
+	}
+
+	return nil
+}
+
+func (t *Tracer) initPerfReaders() error {
+	if t.collection == nil {
+		return fmt.Errorf("collection is nil")
+	}
+
+	m, ok := t.collection.Maps["events"]
+	if !ok {
+		return nil
+	}
+
+	r, err := perf.NewReader(m, os.Getpagesize()*16)
+	if err != nil {
+		return fmt.Errorf("create perf reader failed: %w", err)
+	}
+
+	t.readers["events"] = r
+	go t.runEventReader(r)
+	return nil
+}
+
+func (t *Tracer) runEventReader(r *perf.Reader) {
+	for {
+		rec, err := r.Read()
+		if err != nil {
+			select {
+			case <-t.closeChan:
+				return
+			default:
+				log.Printf("W! coroot_servicemap: read perf event failed: %v", err)
+				continue
+			}
+		}
+
+		if rec.LostSamples > 0 {
+			log.Printf("W! coroot_servicemap: perf events lost samples=%d", rec.LostSamples)
+			continue
+		}
+
+		// NOTE: 事件结构需与 eBPF C 结构保持一致；当前仅保留读取通路
+		_ = rec.RawSample
+		select {
+		case <-t.closeChan:
+			return
+		default:
+		}
+	}
 }
 
 // Events 返回事件通道
