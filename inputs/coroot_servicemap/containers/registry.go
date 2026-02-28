@@ -172,7 +172,7 @@ func (r *Registry) processEvent(event *tracer.Event) {
 		return
 	}
 
-	// 处理事件
+	// 处理事件（包括 L4 和 L7 事件类型）
 	container.OnEvent(event)
 }
 

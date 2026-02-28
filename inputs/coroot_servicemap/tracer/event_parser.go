@@ -5,6 +5,9 @@ import (
 	"encoding/binary"
 	"fmt"
 	"net"
+	"time"
+
+	"flashcat.cloud/categraf/inputs/coroot_servicemap/l7"
 )
 
 // rawEvent 对应 eBPF C 端的 struct event
@@ -89,4 +92,66 @@ func intArrayToIPv6(addr [4]uint32) net.IP {
 // ntohs 网络字节序转主机字节序（16位）
 func ntohs(n uint16) uint16 {
 	return (n >> 8) | (n << 8)
+}
+
+// ============================================================
+// P2-9: L7 事件解析
+// ============================================================
+
+// rawL7Event 对应 eBPF C 端的 struct l7_event
+// 必须与 eBPF 程序中的定义保持一致
+type rawL7Event struct {
+	Fd                  uint64
+	ConnectionTimestamp uint64
+	Pid                 uint32
+	Status              int32
+	Duration            uint64 // nanoseconds
+	Protocol            uint8
+	Method              uint8
+	Padding             uint16
+	StatementId         uint32
+	PayloadSize         uint64
+}
+
+// parseRawL7Event 将 L7 perf buffer 原始字节解析为 Event
+func parseRawL7Event(data []byte) (*Event, error) {
+	headerSize := int(binary.Size(rawL7Event{}))
+	if len(data) < headerSize {
+		return nil, fmt.Errorf("raw L7 event data too short: %d bytes", len(data))
+	}
+
+	var raw rawL7Event
+	reader := bytes.NewReader(data[:headerSize])
+	if err := binary.Read(reader, binary.LittleEndian, &raw); err != nil {
+		return nil, fmt.Errorf("parse raw L7 event failed: %w", err)
+	}
+
+	// 提取 payload
+	payloadSize := int(raw.PayloadSize)
+	if payloadSize > l7.MaxPayloadSize {
+		payloadSize = l7.MaxPayloadSize
+	}
+
+	var payload []byte
+	if payloadSize > 0 && len(data) >= headerSize+payloadSize {
+		payload = make([]byte, payloadSize)
+		copy(payload, data[headerSize:headerSize+payloadSize])
+	}
+
+	event := &Event{
+		Type:      EventTypeL7Request,
+		Timestamp: raw.ConnectionTimestamp,
+		Pid:       raw.Pid,
+		Fd:        raw.Fd,
+		L7Request: &l7.RequestData{
+			Protocol:    l7.Protocol(raw.Protocol),
+			Status:      l7.Status(raw.Status),
+			Duration:    time.Duration(raw.Duration),
+			Method:      l7.Method(raw.Method),
+			StatementId: raw.StatementId,
+			Payload:     payload,
+		},
+	}
+
+	return event, nil
 }

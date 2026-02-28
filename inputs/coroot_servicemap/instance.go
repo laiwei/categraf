@@ -160,6 +160,11 @@ func (ins *Instance) Gather(slist *types.SampleList) {
 		if ins.EnableHTTP {
 			ins.collectHTTPStats(container, tags, slist)
 		}
+
+		// L7 协议统计 (MySQL/Postgres/Redis/Kafka)
+		if !ins.DisableL7Tracing {
+			ins.collectL7ProtoStats(container, tags, slist)
+		}
 	}
 
 	if ins.EnableTCP {
@@ -247,14 +252,15 @@ func (ins *Instance) collectTCPStats(container *containers.Container, baseTags m
 	}
 }
 
-// collectHTTPStats 采集HTTP统计 (P1-5: counter 语义; P1-7: 命名规范)
+// collectHTTPStats 采集HTTP统计 (P1-5: counter 语义; P1-7: 命名规范; P2-9: 增加 status_class)
 func (ins *Instance) collectHTTPStats(container *containers.Container, baseTags map[string]string, slist *types.SampleList) {
 	httpStats := container.GetHTTPStatsSnapshot()
-	for dest, stats := range httpStats {
+	for _, stats := range httpStats {
 		tags := mergeTags(baseTags, map[string]string{
-			"destination": dest,
-			"method":      stats.Method,
-			"status_code": fmt.Sprintf("%d", stats.StatusCode),
+			"destination":  stats.DestinationAddr,
+			"method":       stats.Method,
+			"status_code":  fmt.Sprintf("%d", stats.StatusCode),
+			"status_class": httpStatusClass(stats.StatusCode),
 		})
 
 		// Counters
@@ -267,6 +273,58 @@ func (ins *Instance) collectHTTPStats(container *containers.Container, baseTags 
 		slist.PushFront(types.NewSample(inputName, "http_request_duration_seconds_sum", float64(stats.TotalLatency)/1000.0, tags))
 		slist.PushFront(types.NewSample(inputName, "http_request_duration_seconds_count", float64(stats.RequestCount), tags))
 	}
+}
+
+// collectL7ProtoStats 采集非 HTTP 协议（MySQL/Postgres/Redis/Kafka）的 L7 统计
+func (ins *Instance) collectL7ProtoStats(container *containers.Container, baseTags map[string]string, slist *types.SampleList) {
+	l7Stats := container.GetL7StatsSnapshot()
+	for _, stats := range l7Stats {
+		tags := mergeTags(baseTags, map[string]string{
+			"destination": stats.DestinationAddr,
+			"protocol":    stats.Protocol,
+			"status":      stats.Status,
+		})
+
+		// 使用协议名称作为指标前缀（小写）
+		var prefix string
+		switch stats.Protocol {
+		case "MySQL":
+			prefix = "mysql"
+		case "Postgres":
+			prefix = "postgres"
+		case "Redis":
+			prefix = "redis"
+		case "Kafka":
+			prefix = "kafka"
+		default:
+			prefix = "l7"
+		}
+
+		// Counters
+		slist.PushFront(types.NewSample(inputName, prefix+"_requests_total", float64(stats.RequestCount), tags))
+		slist.PushFront(types.NewSample(inputName, prefix+"_request_errors_total", float64(stats.ErrorCount), tags))
+
+		// Summary-style counters: _sum/_count
+		slist.PushFront(types.NewSample(inputName, prefix+"_request_duration_seconds_sum", float64(stats.TotalLatency)/1000.0, tags))
+		slist.PushFront(types.NewSample(inputName, prefix+"_request_duration_seconds_count", float64(stats.RequestCount), tags))
+	}
+}
+
+// httpStatusClass 将 HTTP 状态码归类为 1xx/2xx/3xx/4xx/5xx
+func httpStatusClass(code uint16) string {
+	switch {
+	case code >= 100 && code < 200:
+		return "1xx"
+	case code >= 200 && code < 300:
+		return "2xx"
+	case code >= 300 && code < 400:
+		return "3xx"
+	case code >= 400 && code < 500:
+		return "4xx"
+	case code >= 500 && code < 600:
+		return "5xx"
+	}
+	return "unknown"
 }
 
 // collectServiceMapStats 输出服务拓扑图聚合指标 (P1-7)

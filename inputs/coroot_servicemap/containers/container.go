@@ -1,9 +1,11 @@
 package containers
 
 import (
+	"fmt"
 	"sync"
 	"time"
 
+	"flashcat.cloud/categraf/inputs/coroot_servicemap/l7"
 	"flashcat.cloud/categraf/inputs/coroot_servicemap/tracer"
 )
 
@@ -34,6 +36,17 @@ type HTTPStats struct {
 	BytesReceived   uint64
 }
 
+// L7Stats 非 HTTP 协议（MySQL/Postgres/Redis/Kafka）的 L7 统计
+type L7Stats struct {
+	DestinationAddr string
+	Protocol        string // "MySQL", "Postgres", "Redis", "Kafka"
+	Status          string // "ok", "failed", "unknown"
+	RequestCount    uint64
+	ErrorCount      uint64
+	TotalLatency    uint64 // ms
+	MaxLatency      uint64 // ms
+}
+
 // Container 容器对象
 type Container struct {
 	ID        string
@@ -48,6 +61,7 @@ type Container struct {
 	// 统计数据 — 由 mu 保护
 	TCPStats  map[string]*TCPStats
 	HTTPStats map[string]*HTTPStats
+	L7Stats   map[string]*L7Stats // 非 HTTP 协议的 L7 统计
 
 	// 活跃连接追踪 — 由 mu 保护
 	mu                sync.RWMutex
@@ -73,6 +87,7 @@ func NewContainer(id string) *Container {
 		Labels:            make(map[string]string),
 		TCPStats:          make(map[string]*TCPStats),
 		HTTPStats:         make(map[string]*HTTPStats),
+		L7Stats:           make(map[string]*L7Stats),
 		activeConnections: make(map[uint64]*ConnectionTracker),
 		connectionsByDest: make(map[string][]uint64),
 		LastActivity:      time.Now(),
@@ -88,6 +103,8 @@ func (c *Container) OnEvent(event *tracer.Event) {
 		c.onConnectionClose(event)
 	case tracer.EventTypeTCPRetransmit:
 		c.onRetransmit(event)
+	case tracer.EventTypeL7Request:
+		c.onL7Request(event)
 	}
 
 	// P0-5: 更新最后活跃时间（无需加锁，time.Time 赋值对这个用途是安全的）
@@ -230,6 +247,151 @@ func (c *Container) UpdateTrafficStats(fd uint64, sent, received uint64) {
 }
 
 // ============================================================
+// P2-9: L7 协议事件处理
+// ============================================================
+
+// onL7Request 处理 L7 请求/响应事件
+func (c *Container) onL7Request(event *tracer.Event) {
+	if event.L7Request == nil {
+		return
+	}
+
+	r := event.L7Request
+
+	switch r.Protocol {
+	case l7.ProtocolHTTP:
+		c.onHTTPRequest(event)
+	case l7.ProtocolMySQL:
+		c.onMySQLRequest(event)
+	case l7.ProtocolPostgres:
+		c.onPostgresRequest(event)
+	case l7.ProtocolRedis:
+		c.onRedisRequest(event)
+	case l7.ProtocolKafka:
+		c.onKafkaRequest(event)
+	default:
+		// 未支持的协议，静默跳过
+	}
+}
+
+// onHTTPRequest 处理 HTTP L7 事件，填充 HTTPStats
+func (c *Container) onHTTPRequest(event *tracer.Event) {
+	r := event.L7Request
+	if r == nil {
+		return
+	}
+
+	// 解析 HTTP 方法和路径
+	method, _ := l7.ParseHTTP(r.Payload)
+	if method == "" {
+		method = "UNKNOWN"
+	}
+
+	// 状态码
+	statusCode := uint16(r.Status)
+
+	// 确定目标地址
+	dest := event.DstAddr
+	if dest == "" {
+		dest = "unknown"
+	}
+
+	// 构造聚合 key: destination + method + status_class
+	// HTTPStats 的 key 使用 "dest|method|status_class" 以便细粒度聚合
+	statusClass := r.Status.HTTPStatusClass()
+	key := fmt.Sprintf("%s|%s|%s", dest, method, statusClass)
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	stats := c.HTTPStats[key]
+	if stats == nil {
+		stats = &HTTPStats{
+			DestinationAddr: dest,
+			Method:          method,
+			StatusCode:      statusCode,
+		}
+		c.HTTPStats[key] = stats
+	}
+
+	stats.RequestCount++
+	if r.Status.IsError() {
+		stats.ErrorCount++
+	}
+
+	latencyMs := uint64(r.Duration.Milliseconds())
+	stats.TotalLatency += latencyMs
+	if latencyMs > stats.MaxLatency {
+		stats.MaxLatency = latencyMs
+	}
+}
+
+// observeL7Stats 通用的非 HTTP 协议统计汇聚辅助方法
+func (c *Container) observeL7Stats(event *tracer.Event, protocol string) {
+	r := event.L7Request
+	if r == nil {
+		return
+	}
+
+	// 忽略 MethodStatementClose（仅维护状态，不产生统计）
+	if r.Method == l7.MethodStatementClose {
+		return
+	}
+
+	dest := event.DstAddr
+	if dest == "" {
+		dest = "unknown"
+	}
+
+	status := r.Status.String()
+	key := fmt.Sprintf("%s|%s|%s", dest, protocol, status)
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	stats := c.L7Stats[key]
+	if stats == nil {
+		stats = &L7Stats{
+			DestinationAddr: dest,
+			Protocol:        protocol,
+			Status:          status,
+		}
+		c.L7Stats[key] = stats
+	}
+
+	stats.RequestCount++
+	if r.Status.Error() {
+		stats.ErrorCount++
+	}
+
+	latencyMs := uint64(r.Duration.Milliseconds())
+	stats.TotalLatency += latencyMs
+	if latencyMs > stats.MaxLatency {
+		stats.MaxLatency = latencyMs
+	}
+}
+
+// onMySQLRequest 处理 MySQL L7 事件
+func (c *Container) onMySQLRequest(event *tracer.Event) {
+	c.observeL7Stats(event, l7.ProtocolMySQL.String())
+}
+
+// onPostgresRequest 处理 PostgreSQL L7 事件
+func (c *Container) onPostgresRequest(event *tracer.Event) {
+	c.observeL7Stats(event, l7.ProtocolPostgres.String())
+}
+
+// onRedisRequest 处理 Redis L7 事件
+func (c *Container) onRedisRequest(event *tracer.Event) {
+	c.observeL7Stats(event, l7.ProtocolRedis.String())
+}
+
+// onKafkaRequest 处理 Kafka L7 事件
+func (c *Container) onKafkaRequest(event *tracer.Event) {
+	c.observeL7Stats(event, l7.ProtocolKafka.String())
+}
+
+// ============================================================
 // P0-3: 线程安全的快照方法 — 供 Gather() 使用
 // ============================================================
 
@@ -256,6 +418,22 @@ func (c *Container) GetHTTPStatsSnapshot() map[string]*HTTPStats {
 
 	snapshot := make(map[string]*HTTPStats, len(c.HTTPStats))
 	for k, v := range c.HTTPStats {
+		if v == nil {
+			continue
+		}
+		cp := *v
+		snapshot[k] = &cp
+	}
+	return snapshot
+}
+
+// GetL7StatsSnapshot 返回 L7Stats 的深拷贝（线程安全）
+func (c *Container) GetL7StatsSnapshot() map[string]*L7Stats {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	snapshot := make(map[string]*L7Stats, len(c.L7Stats))
+	for k, v := range c.L7Stats {
 		if v == nil {
 			continue
 		}

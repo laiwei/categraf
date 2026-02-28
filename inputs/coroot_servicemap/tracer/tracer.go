@@ -18,6 +18,7 @@ import (
 	"sync"
 	"time"
 
+	"flashcat.cloud/categraf/inputs/coroot_servicemap/l7"
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/perf"
@@ -37,6 +38,7 @@ const (
 	EventTypeListenOpen      EventType = 6
 	EventTypeListenClose     EventType = 7
 	EventTypeTCPRetransmit   EventType = 9
+	EventTypeL7Request       EventType = 10 // P2-9: L7 协议事件
 )
 
 func (t EventType) String() string {
@@ -55,6 +57,8 @@ func (t EventType) String() string {
 		return "ListenClose"
 	case EventTypeTCPRetransmit:
 		return "TCPRetransmit"
+	case EventTypeL7Request:
+		return "L7Request"
 	default:
 		return fmt.Sprintf("Unknown(%d)", t)
 	}
@@ -70,6 +74,9 @@ type Event struct {
 	DstAddr   string
 	SrcPort   uint16
 	DstPort   uint16
+
+	// P2-9: L7 请求数据（仅当 Type == EventTypeL7Request 时有效）
+	L7Request *l7.RequestData
 }
 
 // ConnectionID 连接标识
@@ -100,7 +107,7 @@ const (
 
 // Tracer eBPF追踪器
 type Tracer struct {
-	ctx              context.Context    // P1-8: 生命周期 context
+	ctx              context.Context // P1-8: 生命周期 context
 	hostNetNs        netns.NsHandle
 	selfNetNs        netns.NsHandle
 	disableL7Tracing bool
@@ -314,6 +321,7 @@ func (t *Tracer) initPerfReaders() error {
 		return fmt.Errorf("collection is nil")
 	}
 
+	// 主事件 perf buffer
 	m, ok := t.collection.Maps["events"]
 	if !ok {
 		return nil
@@ -330,6 +338,25 @@ func (t *Tracer) initPerfReaders() error {
 		defer t.wg.Done()
 		t.runEventReader(r)
 	}()
+
+	// P2-9: L7 事件 perf buffer
+	if !t.disableL7Tracing {
+		if l7m, ok := t.collection.Maps["l7_events"]; ok {
+			l7r, err := perf.NewReader(l7m, os.Getpagesize()*16)
+			if err != nil {
+				log.Printf("W! coroot_servicemap: create L7 perf reader failed: %v", err)
+			} else {
+				t.readers["l7_events"] = l7r
+				t.wg.Add(1)
+				go func() {
+					defer t.wg.Done()
+					t.runL7EventReader(l7r)
+				}()
+				log.Println("I! coroot_servicemap: L7 perf reader started")
+			}
+		}
+	}
+
 	return nil
 }
 
@@ -375,6 +402,41 @@ func (t *Tracer) runEventReader(r *perf.Reader) {
 // Events 返回事件通道
 func (t *Tracer) Events() <-chan Event {
 	return t.eventChan
+}
+
+// runL7EventReader 读取 L7 perf buffer 中的协议事件 (P2-9)
+func (t *Tracer) runL7EventReader(r *perf.Reader) {
+	for {
+		rec, err := r.Read()
+		if err != nil {
+			select {
+			case <-t.closeChan:
+				return
+			default:
+				log.Printf("W! coroot_servicemap: read L7 perf event failed: %v", err)
+				continue
+			}
+		}
+
+		if rec.LostSamples > 0 {
+			log.Printf("W! coroot_servicemap: L7 perf events lost samples=%d", rec.LostSamples)
+			continue
+		}
+
+		event, err := parseRawL7Event(rec.RawSample)
+		if err != nil {
+			log.Printf("W! coroot_servicemap: parse L7 event failed: %v", err)
+			continue
+		}
+
+		select {
+		case t.eventChan <- *event:
+		case <-t.closeChan:
+			return
+		default:
+			// 通道满，丢弃事件
+		}
+	}
 }
 
 // GetActiveConnections 获取活跃连接迭代器

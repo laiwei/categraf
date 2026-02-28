@@ -132,3 +132,95 @@ func TestNtohs(t *testing.T) {
 		}
 	}
 }
+
+// ============================================================
+// P2-9: L7 事件解析测试
+// ============================================================
+
+func TestParseRawL7Event_HTTP(t *testing.T) {
+	payload := []byte("GET /api/v1/health HTTP/1.1\r\n")
+
+	raw := rawL7Event{
+		Fd:                  42,
+		ConnectionTimestamp: 123456789,
+		Pid:                 1234,
+		Status:              200,
+		Duration:            5000000, // 5ms in nanoseconds
+		Protocol:            1,       // ProtocolHTTP
+		Method:              0,
+		Padding:             0,
+		StatementId:         0,
+		PayloadSize:         uint64(len(payload)),
+	}
+
+	buf := new(bytes.Buffer)
+	if err := binary.Write(buf, binary.LittleEndian, &raw); err != nil {
+		t.Fatalf("write raw L7 event failed: %v", err)
+	}
+	buf.Write(payload)
+
+	event, err := parseRawL7Event(buf.Bytes())
+	if err != nil {
+		t.Fatalf("parse raw L7 event failed: %v", err)
+	}
+
+	if event.Type != EventTypeL7Request {
+		t.Errorf("expected Type %v, got %v", EventTypeL7Request, event.Type)
+	}
+	if event.Pid != 1234 {
+		t.Errorf("expected Pid 1234, got %d", event.Pid)
+	}
+	if event.Fd != 42 {
+		t.Errorf("expected Fd 42, got %d", event.Fd)
+	}
+	if event.L7Request == nil {
+		t.Fatal("L7Request is nil")
+	}
+	if event.L7Request.Status != 200 {
+		t.Errorf("expected Status 200, got %d", event.L7Request.Status)
+	}
+	if event.L7Request.Protocol != 1 {
+		t.Errorf("expected Protocol HTTP(1), got %d", event.L7Request.Protocol)
+	}
+	if string(event.L7Request.Payload) != string(payload) {
+		t.Errorf("payload mismatch: got %q", event.L7Request.Payload)
+	}
+}
+
+func TestParseRawL7Event_TooShort(t *testing.T) {
+	data := []byte{1, 2, 3}
+	_, err := parseRawL7Event(data)
+	if err == nil {
+		t.Error("expected error for too short data, got nil")
+	}
+}
+
+func TestParseRawL7Event_NoPayload(t *testing.T) {
+	raw := rawL7Event{
+		Fd:                  10,
+		ConnectionTimestamp: 999,
+		Pid:                 100,
+		Status:              500,
+		Duration:            1000000,
+		Protocol:            1,
+		Method:              0,
+		PayloadSize:         0,
+	}
+
+	buf := new(bytes.Buffer)
+	if err := binary.Write(buf, binary.LittleEndian, &raw); err != nil {
+		t.Fatalf("write raw L7 event failed: %v", err)
+	}
+
+	event, err := parseRawL7Event(buf.Bytes())
+	if err != nil {
+		t.Fatalf("parse raw L7 event failed: %v", err)
+	}
+
+	if event.L7Request == nil {
+		t.Fatal("L7Request is nil")
+	}
+	if len(event.L7Request.Payload) != 0 {
+		t.Errorf("expected empty payload, got %d bytes", len(event.L7Request.Payload))
+	}
+}
