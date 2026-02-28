@@ -198,7 +198,9 @@ func (ins *Instance) collectHostStats(slist *types.SampleList) {
 
 // collectTCPStats 采集TCP统计
 func (ins *Instance) collectTCPStats(container *containers.Container, baseTags map[string]string, slist *types.SampleList) {
-	for dest, stats := range container.TCPStats {
+	// P0-3: 使用快照方法避免并发读写竞争
+	tcpStats := container.GetTCPStatsSnapshot()
+	for dest, stats := range tcpStats {
 		tags := mergeTags(baseTags, map[string]string{
 			"destination": dest,
 		})
@@ -259,7 +261,9 @@ func (ins *Instance) collectTCPStats(container *containers.Container, baseTags m
 
 // collectHTTPStats 采集HTTP统计
 func (ins *Instance) collectHTTPStats(container *containers.Container, baseTags map[string]string, slist *types.SampleList) {
-	for dest, stats := range container.HTTPStats {
+	// P0-3: 使用快照方法避免并发读写竞争
+	httpStats := container.GetHTTPStatsSnapshot()
+	for dest, stats := range httpStats {
 		tags := mergeTags(baseTags, map[string]string{
 			"destination": dest,
 			"method":      stats.Method,

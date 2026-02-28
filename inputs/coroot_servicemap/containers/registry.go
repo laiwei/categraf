@@ -33,6 +33,12 @@ type Config struct {
 	KubeConfig   string
 }
 
+const (
+	// P0-5: 容器 GC 参数
+	containerGCInterval = 60 * time.Second
+	containerTimeout    = 10 * time.Minute
+)
+
 type k8sContainerMeta struct {
 	PodName   string
 	Namespace string
@@ -93,6 +99,9 @@ func NewRegistry(tr *tracer.Tracer, config Config) (*Registry, error) {
 
 	// 启动事件处理
 	go r.handleEvents()
+
+	// P0-5: 启动容器 GC
+	go r.containerGCLoop()
 
 	// 启动容器发现
 	if config.EnableCgroup {
@@ -411,6 +420,46 @@ func (r *Registry) discoverContainersByCgroup() {
 			}
 			log.Println("D! coroot_servicemap: discovering containers and refreshing metadata...")
 		}
+	}
+}
+
+// containerGCLoop 定期清理不活跃容器 (P0-5)
+func (r *Registry) containerGCLoop() {
+	ticker := time.NewTicker(containerGCInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-r.stopChan:
+			return
+		case <-ticker.C:
+			r.gcContainers()
+		}
+	}
+}
+
+// gcContainers 清理超时未活跃的容器 (P0-5)
+func (r *Registry) gcContainers() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	now := time.Now()
+	expired := 0
+	for id, c := range r.containers {
+		// 跳过有活跃连接的容器
+		if c.ActiveConnectionCount() > 0 {
+			continue
+		}
+		// 跳过最近活跃的容器
+		if now.Sub(c.LastActivity) < containerTimeout {
+			continue
+		}
+		delete(r.containers, id)
+		expired++
+	}
+
+	if expired > 0 {
+		log.Printf("D! coroot_servicemap: container GC cleaned %d expired containers, %d remaining", expired, len(r.containers))
 	}
 }
 

@@ -48,7 +48,9 @@ func Build(cs []*containers.Container) Graph {
 		src := sourceNode(c)
 		g.Nodes[src.ID] = src
 
-		for dest, s := range c.TCPStats {
+		// P0-3: 使用快照方法避免并发读写竞争
+		tcpStats := c.GetTCPStatsSnapshot()
+		for dest, s := range tcpStats {
 			if s == nil {
 				continue
 			}

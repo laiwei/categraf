@@ -80,9 +80,22 @@ type ConnectionID struct {
 // Connection 连接统计
 type Connection struct {
 	Timestamp     uint64
+	LastSeen      time.Time // P0-2: 用于过期清理
 	BytesSent     uint64
 	BytesReceived uint64
 }
+
+// ListenKey 监听端口标识 (P0-4)
+type ListenKey struct {
+	Port uint16
+	Addr string
+}
+
+const (
+	// P0-2: 连接过期超时
+	connectionGCInterval = 30 * time.Second
+	connectionTimeout    = 5 * time.Minute
+)
 
 // Tracer eBPF追踪器
 type Tracer struct {
@@ -95,9 +108,14 @@ type Tracer struct {
 	uprobes    map[string]*ebpf.Program
 	links      []link.Link
 
+	// P0-3: 活跃连接，由 activeConnMu 保护
 	activeConnMu sync.RWMutex
 	activeConns  map[ConnectionID]Connection
 	lastSnapshot map[ConnectionID]Event
+
+	// P0-4: 监听端口追踪，由 listenMu 保护
+	listenMu    sync.RWMutex
+	listenPorts map[ListenKey]struct{}
 
 	started  bool
 	stopOnce sync.Once
@@ -120,7 +138,8 @@ func NewTracer(hostNetNs, selfNetNs netns.NsHandle, disableL7Tracing bool) (*Tra
 		uprobes:          make(map[string]*ebpf.Program),
 		activeConns:      make(map[ConnectionID]Connection),
 		lastSnapshot:     make(map[ConnectionID]Event),
-		eventChan:        make(chan Event, 1000),
+		listenPorts:      make(map[ListenKey]struct{}),
+		eventChan:        make(chan Event, 10000),
 		closeChan:        make(chan struct{}),
 	}, nil
 }
@@ -134,6 +153,7 @@ func (t *Tracer) Start() error {
 	if runtime.GOOS != "linux" {
 		log.Printf("I! coroot_servicemap: eBPF is unsupported on %s, fallback to polling tracer", runtime.GOOS)
 		go t.startPollingTracer()
+		go t.startConnectionGC()
 		t.started = true
 		return nil
 	}
@@ -157,6 +177,7 @@ func (t *Tracer) Start() error {
 	if traceFsPath == "" {
 		log.Println("W! coroot_servicemap: tracefs unavailable, fallback to polling tracer")
 		go t.startPollingTracer()
+		go t.startConnectionGC()
 		t.started = true
 		return nil
 	}
@@ -164,6 +185,7 @@ func (t *Tracer) Start() error {
 	if err := checkKernelVersion(); err != nil {
 		log.Printf("W! coroot_servicemap: kernel check failed, fallback to polling tracer: %v", err)
 		go t.startPollingTracer()
+		go t.startConnectionGC()
 		t.started = true
 		return nil
 	}
@@ -171,10 +193,12 @@ func (t *Tracer) Start() error {
 	if err := t.loadEBPF(); err != nil {
 		log.Printf("W! coroot_servicemap: load eBPF failed, fallback to polling tracer: %v", err)
 		go t.startPollingTracer()
+		go t.startConnectionGC()
 		t.started = true
 		return nil
 	}
 
+	go t.startConnectionGC()
 	log.Println("I! coroot_servicemap: eBPF tracer started")
 	t.started = true
 	return nil
@@ -305,6 +329,9 @@ func (t *Tracer) runEventReader(r *perf.Reader) {
 			continue
 		}
 
+		// P0-4: 处理 ListenOpen/ListenClose 事件
+		t.handleListenEvent(event)
+
 		// 发送到事件通道
 		select {
 		case t.eventChan <- *event:
@@ -339,6 +366,58 @@ func (t *Tracer) ForEachActiveConnection(fn func(connID ConnectionID, conn Conne
 	}
 }
 
+// ActiveConnectionCount 返回当前活跃连接数
+func (t *Tracer) ActiveConnectionCount() int {
+	t.activeConnMu.RLock()
+	defer t.activeConnMu.RUnlock()
+	return len(t.activeConns)
+}
+
+// IsListening 检查指定端口是否在监听 (P0-4)
+func (t *Tracer) IsListening(port uint16) bool {
+	t.listenMu.RLock()
+	defer t.listenMu.RUnlock()
+
+	for key := range t.listenPorts {
+		if key.Port == port {
+			return true
+		}
+	}
+	return false
+}
+
+// GetListenPorts 返回所有监听端口的快照 (P0-4)
+func (t *Tracer) GetListenPorts() map[uint16]struct{} {
+	t.listenMu.RLock()
+	defer t.listenMu.RUnlock()
+
+	ports := make(map[uint16]struct{}, len(t.listenPorts))
+	for key := range t.listenPorts {
+		ports[key.Port] = struct{}{}
+	}
+	return ports
+}
+
+// handleListenEvent 处理 ListenOpen / ListenClose 事件 (P0-4)
+func (t *Tracer) handleListenEvent(event *Event) {
+	if event == nil {
+		return
+	}
+
+	key := ListenKey{Port: event.DstPort, Addr: event.DstAddr}
+
+	switch event.Type {
+	case EventTypeListenOpen:
+		t.listenMu.Lock()
+		t.listenPorts[key] = struct{}{}
+		t.listenMu.Unlock()
+	case EventTypeListenClose:
+		t.listenMu.Lock()
+		delete(t.listenPorts, key)
+		t.listenMu.Unlock()
+	}
+}
+
 // Close 关闭Tracer
 func (t *Tracer) Close() {
 	t.stopOnce.Do(func() {
@@ -368,6 +447,16 @@ func (t *Tracer) Close() {
 		_ = t.hostNetNs.Close()
 	}
 
+	// P0-1: 清空内部状态，确保无残留
+	t.activeConnMu.Lock()
+	t.activeConns = nil
+	t.lastSnapshot = nil
+	t.activeConnMu.Unlock()
+
+	t.listenMu.Lock()
+	t.listenPorts = nil
+	t.listenMu.Unlock()
+
 	log.Println("I! coroot_servicemap: tracer closed")
 }
 
@@ -389,6 +478,44 @@ func (t *Tracer) startPollingTracer() {
 	}
 }
 
+// startConnectionGC 定期清理过期连接，防止内存泄漏 (P0-2)
+func (t *Tracer) startConnectionGC() {
+	ticker := time.NewTicker(connectionGCInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-t.closeChan:
+			return
+		case <-ticker.C:
+			t.gcConnections()
+		}
+	}
+}
+
+// gcConnections 清理已过期的活跃连接 (P0-2)
+func (t *Tracer) gcConnections() {
+	t.activeConnMu.Lock()
+	defer t.activeConnMu.Unlock()
+
+	if t.activeConns == nil {
+		return
+	}
+
+	now := time.Now()
+	expired := 0
+	for id, conn := range t.activeConns {
+		if !conn.LastSeen.IsZero() && now.Sub(conn.LastSeen) > connectionTimeout {
+			delete(t.activeConns, id)
+			expired++
+		}
+	}
+
+	if expired > 0 {
+		log.Printf("D! coroot_servicemap: GC cleaned %d expired connections, %d remaining", expired, len(t.activeConns))
+	}
+}
+
 func (t *Tracer) pollConnections() {
 	conns, err := gopsnet.Connections("tcp")
 	if err != nil {
@@ -398,10 +525,24 @@ func (t *Tracer) pollConnections() {
 
 	log.Printf("D! coroot_servicemap: polled %d tcp connections", len(conns))
 
-	now := uint64(time.Now().UnixNano())
+	now := time.Now()
+	nowNano := uint64(now.UnixNano())
 	current := make(map[ConnectionID]Event, len(conns))
 
+	// P0-4: 同时发现 LISTEN 状态的端口
+	discoveredListens := make(map[ListenKey]struct{})
+
 	for _, c := range conns {
+		// P0-4: 收集 LISTEN 端口
+		if strings.ToUpper(c.Status) == "LISTEN" {
+			key := ListenKey{
+				Port: uint16(c.Laddr.Port),
+				Addr: endpoint(c.Laddr.IP, c.Laddr.Port),
+			}
+			discoveredListens[key] = struct{}{}
+			continue
+		}
+
 		if !isTrackedTCPConnection(c) {
 			continue
 		}
@@ -410,7 +551,7 @@ func (t *Tracer) pollConnections() {
 		id := ConnectionID{FD: fd, PID: uint32(c.Pid)}
 		e := Event{
 			Type:      EventTypeConnectionOpen,
-			Timestamp: now,
+			Timestamp: nowNano,
 			Pid:       uint32(c.Pid),
 			Fd:        fd,
 			SrcAddr:   endpoint(c.Laddr.IP, c.Laddr.Port),
@@ -421,8 +562,17 @@ func (t *Tracer) pollConnections() {
 		current[id] = e
 	}
 
+	// P0-4: 更新监听端口列表
+	t.listenMu.Lock()
+	t.listenPorts = discoveredListens
+	t.listenMu.Unlock()
+
 	t.activeConnMu.Lock()
 	defer t.activeConnMu.Unlock()
+
+	if t.activeConns == nil {
+		return
+	}
 
 	for id, e := range current {
 		if _, ok := t.lastSnapshot[id]; !ok {
@@ -430,13 +580,18 @@ func (t *Tracer) pollConnections() {
 		}
 
 		if existing, ok := t.activeConns[id]; ok {
+			// P0-2: 已有连接，更新 LastSeen
 			t.activeConns[id] = Connection{
 				Timestamp:     existing.Timestamp,
+				LastSeen:      now,
 				BytesSent:     existing.BytesSent,
 				BytesReceived: existing.BytesReceived,
 			}
 		} else {
-			t.activeConns[id] = Connection{Timestamp: e.Timestamp}
+			t.activeConns[id] = Connection{
+				Timestamp: e.Timestamp,
+				LastSeen:  now,
+			}
 		}
 	}
 
@@ -446,7 +601,7 @@ func (t *Tracer) pollConnections() {
 		}
 
 		old.Type = EventTypeConnectionClose
-		old.Timestamp = now
+		old.Timestamp = nowNano
 		t.emitEventLocked(old)
 		delete(t.activeConns, id)
 	}
@@ -458,7 +613,7 @@ func (t *Tracer) emitEventLocked(e Event) {
 	select {
 	case t.eventChan <- e:
 	default:
-		log.Println("W! coroot_servicemap: event channel is full, dropping event")
+		// 通道满，静默丢弃避免日志洪泛
 	}
 }
 

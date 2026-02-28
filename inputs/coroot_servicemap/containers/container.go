@@ -45,14 +45,17 @@ type Container struct {
 	// 标签
 	Labels map[string]string
 
-	// 统计数据
+	// 统计数据 — 由 mu 保护
 	TCPStats  map[string]*TCPStats
 	HTTPStats map[string]*HTTPStats
 
-	// 活跃连接追踪
+	// 活跃连接追踪 — 由 mu 保护
 	mu                sync.RWMutex
 	activeConnections map[uint64]*ConnectionTracker
 	connectionsByDest map[string][]uint64
+
+	// P0-5: 最后活跃时间，用于容器 GC
+	LastActivity time.Time
 }
 
 // ConnectionTracker 连接追踪器
@@ -72,6 +75,7 @@ func NewContainer(id string) *Container {
 		HTTPStats:         make(map[string]*HTTPStats),
 		activeConnections: make(map[uint64]*ConnectionTracker),
 		connectionsByDest: make(map[string][]uint64),
+		LastActivity:      time.Now(),
 	}
 }
 
@@ -85,6 +89,9 @@ func (c *Container) OnEvent(event *tracer.Event) {
 	case tracer.EventTypeTCPRetransmit:
 		c.onRetransmit(event)
 	}
+
+	// P0-5: 更新最后活跃时间（无需加锁，time.Time 赋值对这个用途是安全的）
+	c.LastActivity = time.Now()
 }
 
 // onConnectionOpen 连接打开
@@ -220,4 +227,47 @@ func (c *Container) UpdateTrafficStats(fd uint64, sent, received uint64) {
 
 	stats.BytesSent += sentDelta
 	stats.BytesReceived += receivedDelta
+}
+
+// ============================================================
+// P0-3: 线程安全的快照方法 — 供 Gather() 使用
+// ============================================================
+
+// GetTCPStatsSnapshot 返回 TCPStats 的深拷贝（线程安全）
+func (c *Container) GetTCPStatsSnapshot() map[string]*TCPStats {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	snapshot := make(map[string]*TCPStats, len(c.TCPStats))
+	for k, v := range c.TCPStats {
+		if v == nil {
+			continue
+		}
+		cp := *v // 值拷贝
+		snapshot[k] = &cp
+	}
+	return snapshot
+}
+
+// GetHTTPStatsSnapshot 返回 HTTPStats 的深拷贝（线程安全）
+func (c *Container) GetHTTPStatsSnapshot() map[string]*HTTPStats {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	snapshot := make(map[string]*HTTPStats, len(c.HTTPStats))
+	for k, v := range c.HTTPStats {
+		if v == nil {
+			continue
+		}
+		cp := *v
+		snapshot[k] = &cp
+	}
+	return snapshot
+}
+
+// ActiveConnectionCount 返回当前活跃连接数（线程安全）
+func (c *Container) ActiveConnectionCount() int {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return len(c.activeConnections)
 }
