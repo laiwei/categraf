@@ -78,7 +78,7 @@ func TestSplitEndpoint(t *testing.T) {
 		{"localhost:3000", "localhost", "3000"},
 		{"", "", ""},
 		{"invalid", "invalid", ""},
-		{"10.0.0.1:port", "10.0.0.1", "port"},  // net.SplitHostPort 能解析非数字端口
+		{"10.0.0.1:port", "10.0.0.1", "port"}, // net.SplitHostPort 能解析非数字端口
 	}
 
 	for _, tc := range tests {

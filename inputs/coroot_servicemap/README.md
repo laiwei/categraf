@@ -60,17 +60,50 @@ volumeMounts:
 
 ## 安装
 
-### 编译 eBPF 程序（待实现）
+### 1. 编译 eBPF 程序
 
-**注意**: 当前版本的 eBPF 程序加载功能尚未完全实现。完整功能需要：
+#### Linux 环境（推荐）
 
-1. 编写 eBPF C 代码
-2. 使用 clang 编译为字节码
-3. 嵌入到 Go 程序中
+在 Linux 系统上编译 eBPF 程序：
 
-完整实现路线图请参考 [开发文档](./DEVELOPMENT.md)。
+```bash
+# 安装依赖
+# Ubuntu/Debian
+sudo apt-get install -y clang llvm libbpf-dev linux-tools-common bpftool
 
-### 配置
+# CentOS/RHEL
+sudo yum install -y clang llvm bpftool
+
+# 生成 vmlinux.h
+cd inputs/coroot_servicemap/tracer/bpf
+bpftool btf dump file /sys/kernel/btf/vmlinux format c > vmlinux.h
+
+# 编译 eBPF 程序
+cd ..
+make
+
+# 验证生成的文件
+ls -lh ebpf_programs_generated.go
+```
+
+#### 使用预编译字节码
+
+如果无法在本地编译，可以：
+
+1. 在 CI/CD 环境中编译
+2. 使用预生成的 `ebpf_programs_generated.go`
+3. 跨平台交叉编译（需要 target 系统的 vmlinux.h）
+
+详细说明请参考 [tracer/bpf/README.md](./tracer/bpf/README.md)。
+
+#### macOS / 其他系统
+
+eBPF 仅支持 Linux。在非 Linux 系统上：
+- 插件会自动回退到**轮询模式**（使用 gopsutil）
+- 功能稍弱但仍可正常工作
+- 无需编译 eBPF 程序
+
+### 2. 配置
 
 创建配置文件 `conf/input.coroot_servicemap/servicemap.toml`:
 

@@ -1,0 +1,14 @@
+# eBPF 编译产物
+*.o
+*.o.gz
+ebpf_programs_generated.go
+
+# vmlinux.h 应该在 Linux 环境生成，不提交到仓库
+vmlinux.h
+
+# IDE
+.vscode/
+.idea/
+
+# macOS
+.DS_Store

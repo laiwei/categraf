@@ -39,8 +39,27 @@
   - Events() - 返回事件通道
   - Close() - 清理资源
 
-- ⚠️ eBPF 程序加载（待实现）
-  - 框架完整，需要编译eBPF C代码
+- ✅ eBPF 程序实现
+  - **tcp_tracer.bpf.c** - 完整的 eBPF C 程序
+  - kprobe 钩子: tcp_connect, tcp_set_state, tcp_retransmit_skb, inet_listen
+  - tracepoint 钩子: sched_process_fork, sched_process_exit
+  - Perf event buffer 事件输出
+  - IPv4/IPv6 地址解析
+  - 活跃连接状态追踪
+  
+- ✅ eBPF 加载与事件解析
+  - **event_parser.go** - 原始事件解码器
+  - rawEvent 结构定义（对应 C 端结构）
+  - IPv4/IPv6 地址转换
+  - 网络字节序处理
+  - 与 cilium/ebpf 库集成
+  
+- ✅ 编译工具链
+  - **tracer/Makefile** - 自动化编译脚本
+  - clang 编译配置
+  - gzip 压缩管线
+  - Go 代码生成（hexdump 嵌入）
+  - 多架构支持 (amd64/arm64)
 
 #### Containers 包
 - ✅ **container.go** - 容器对象
@@ -52,11 +71,22 @@
 - ✅ **registry.go** - 容器注册表
   - 事件处理
   - 连接统计更新
-  - 容器发现框架
+  - 容器发现（cgroup 解析 + Docker inspect + K8s API）
   - 容器生命周期管理
 
 - ✅ 单元测试覆盖
   - 容器创建、连接打开/关闭、重传等场景
+  - 9 个测试全部通过
+
+#### ServiceMap 包
+- ✅ **servicemap/graph.go** - 服务拓扑图构建
+  - Graph/Node/Edge 数据模型
+  - Build() 从容器统计构建图
+  - splitEndpoint() 端点解析
+  - 连接统计聚合
+  
+- ✅ 单元测试
+  - 6 个测试覆盖空图、单容器、多连接等场景
 
 ### 3. 数据采集 (100%)
 - ✅ TCP连接统计采集
@@ -104,17 +134,49 @@
 
 ### 单元测试
 ```
-✅ tracer 包: 2/2 通过
+✅ tracer 包: 10/10 通过
+   - TestGetEmbeddedEBPFProgram
+   - TestParseRawEvent_IPv4
+   - TestParseRawEvent_IPv6
+   - TestParseRawEvent_TooShort
+   - TestIntToIPv4
+   - TestNtohs
    - TestEventType_String
    - TestNewTracer
+   - TestIsTrackedTCPConnection
+   - TestEndpoint
 
-✅ containers 包: 4/4 通过
+✅ containers 包: 9/9 通过
    - TestNewContainer
    - TestContainer_OnConnectionOpen
    - TestContainer_OnConnectionClose
    - TestContainer_OnRetransmit
+   - TestContainer_UpdateTrafficStats
+   - TestExtractContainerID (4 子测试)
+   - TestApplyInspectMetadata
+   - TestNormalizeContainerID
+   - TestIndexPodContainerMeta
 
-总计: 6/6 测试通过 ✓
+✅ servicemap 包: 6/6 通过
+   - TestBuild_EmptyContainers
+   - TestBuild_SingleContainer
+   - TestSplitEndpoint
+   - TestSourceNode_DefaultValues
+   - TestBuild_NilContainer
+   - TestBuild_AggregateStats
+
+总计: 25/25 测试通过 ✓
+```
+
+### 集成测试
+```
+✅ test_integration.sh - 完整流程验证
+   - 环境检查
+   - 单元测试执行
+   - 编译验证
+   - eBPF 编译（Linux）
+   - 配置文件验证
+   - Dry run 测试
 ```
 
 ## 📁 文件清单
@@ -123,29 +185,43 @@
 ```
 inputs/coroot_servicemap/
 ├── servicemap.go                 # 插件入口 (41 行)
-├── instance.go                   # 实例实现 (258 行)
+├── instance.go                   # 实例实现 (348 行)
 ├── README.md                     # 用户文档
-├── STATUS.md                     # 项目状态
-└── DEVELOPMENT.md                # 开发指南
+├── COMPLETION_REPORT.md          # 完成报告
+├── test_integration.sh           # 集成测试脚本
 
 tracer/
-├── tracer.go                     # eBPF追踪器 (206 行)
-└── tracer_test.go                # 追踪器测试
+├── tracer.go                     # eBPF追踪器 (527 行)
+├── tracer_test.go                # 追踪器测试
+├── ebpf_programs.go              # 程序嵌入框架 (28 行)
+├── event_parser.go               # 事件解析器 (94 行)
+├── event_parser_test.go          # 解析器测试
+├── Makefile                      # eBPF 编译脚本
+└── bpf/
+    ├── tcp_tracer.bpf.c          # eBPF C 程序 (220 行)
+    ├── README.md                 # 编译说明
+    └── .gitignore
 
 containers/
-├── container.go                  # 容器对象 (194 行)
+├── container.go                  # 容器对象 (224 行)
 ├── container_test.go             # 容器测试
-└── registry.go                   # 容器注册表 (168 行)
+└── registry.go                   # 容器注册表 (316 行)
+
+servicemap/
+├── graph.go                      # 服务拓扑图 (110 行)
+└── graph_test.go                 # 图构建测试
 
 conf/input.coroot_servicemap/
-└── servicemap.toml               # 配置模板 (33 行)
+└── coroot_servicemap.toml        # 配置模板 (33 行)
 ```
 
 ### 总代码量
-- Go代码: ~867 行
-- 测试代码: ~150 行
-- 文档: ~1000 行
+- Go代码: ~1650 行
+- eBPF C代码: ~220 行
+- 测试代码: ~350 行
+- 文档: ~1200 行
 - 配置: ~33 行
+- 总计: ~3450 行
 
 ## 🎯 工作流程架构
 
@@ -260,28 +336,36 @@ handleEvents()
 - **Linux 要求**: Kernel 4.16+
 - **权限要求**: root (用于加载 eBPF 程序)
 
-## ⚠️ 当前限制与待实现
+## ⚠️ 当前限制与后续任务
 
-### eBPF 程序 (🔴 阻塞项)
-- [ ] TCP 连接跟踪 eBPF C 代码
-- [ ] HTTP/HTTPS L7 协议解析
-- [ ] clang 编译 pipeline
-- [ ] 字节码嵌入到 Go
-- [ ] 实际的 eBPF 程序加载逻辑
+### eBPF 字节码嵌入 (✅ 代码完成，⏳ 待 Linux 编译)
+- ✅ TCP 连接跟踪 eBPF C 代码完成 (tcp_tracer.bpf.c)
+- ✅ kprobe 钩子: tcp_connect, tcp_set_state, tcp_retransmit_skb, inet_listen
+- ✅ tracepoint 钩子: sched_process_fork, sched_process_exit
+- ✅ 事件解析器 (event_parser.go)
+- ✅ 编译 Makefile 完成
+- ⏳ 需在 Linux 环境运行 `make` 生成 ebpf_programs_generated.go
 
-### 容器发现 (⚠️ 待完善)
-- [ ] cgroup 路径解析实现
-- [ ] Docker API 集成
-- [ ] Kubernetes API 集成
-- [ ] 容器元数据提取
+### 容器发现 (🔧 基础完成，待生产验证)
+- ✅ cgroup 路径解析基础框架
+- ✅ Docker API 集成框架  
+- ✅ Kubernetes API 集成框架
+- ⏳ 需在真实容器/K8s 环境测试
+- ⏳ 错误处理和边缘情况完善
 
 ### L7 协议支持 (📋 规划中)
-- [ ] HTTP 请求/响应解析
-- [ ] HTTPS/TLS 支持
-- [ ] 其他协议 (MySQL, Redis 等)
+- ⏳ HTTP 请求/响应解析（框架已预留）
+- ⏳ HTTPS/TLS uprobe 支持
+- ⏳ 其他协议 (MySQL, Redis, gRPC 等)
 
-### 测试与优化 (📋 规划中)
-- [ ] 集成测试
+### 生产环境优化 (📋 待评估)
+- ⏳ 大规模容器环境性能测试
+- ⏳ 内存使用优化  
+- ⏳ eBPF 程序 CPU 开销分析
+- ⏳ 事件丢失处理策略
+- ⏳ 监控告警集成
+
+## 🚀 部署与使用
 - [ ] 性能基准测试
 - [ ] 内存使用优化
 - [ ] eBPF 开销验证

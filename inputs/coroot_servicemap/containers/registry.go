@@ -17,9 +17,9 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 
+	"flashcat.cloud/categraf/inputs/coroot_servicemap/tracer"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/client"
-	"flashcat.cloud/categraf/inputs/coroot_servicemap/tracer"
 )
 
 var containerIDRegex = regexp.MustCompile(`[a-f0-9]{64}`)

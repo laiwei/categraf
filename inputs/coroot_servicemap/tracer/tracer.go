@@ -290,12 +290,20 @@ func (t *Tracer) runEventReader(r *perf.Reader) {
 			continue
 		}
 
-		// NOTE: 事件结构需与 eBPF C 结构保持一致；当前仅保留读取通路
-		_ = rec.RawSample
+		// 解析原始事件数据
+		event, err := parseRawEvent(rec.RawSample)
+		if err != nil {
+			log.Printf("W! coroot_servicemap: parse event failed: %v", err)
+			continue
+		}
+
+		// 发送到事件通道
 		select {
+		case t.eventChan <- *event:
 		case <-t.closeChan:
 			return
 		default:
+			// 通道满，丢弃事件
 		}
 	}
 }
