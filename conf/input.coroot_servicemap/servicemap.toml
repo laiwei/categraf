@@ -10,6 +10,10 @@ enable_l7_tracing = true
 enable_http = true
 enable_tcp = true
 
+# P1-6: 资源限制 (0 = 使用默认值: 连接50000, 容器5000)
+# max_tracked_connections = 50000
+# max_containers = 5000
+
 # 过滤配置
 # 忽略的端口列表（如SSH、监控端口等）
 ignore_ports = [22, 9100]

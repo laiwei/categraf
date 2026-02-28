@@ -3,6 +3,7 @@ package tracer
 import (
 	"bytes"
 	"compress/gzip"
+	"context"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -99,9 +100,11 @@ const (
 
 // Tracer eBPF追踪器
 type Tracer struct {
+	ctx              context.Context    // P1-8: 生命周期 context
 	hostNetNs        netns.NsHandle
 	selfNetNs        netns.NsHandle
 	disableL7Tracing bool
+	maxActiveConns   int // P1-6: 活跃连接数上限，0 = 不限制
 
 	collection *ebpf.Collection
 	readers    map[string]*perf.Reader
@@ -119,21 +122,24 @@ type Tracer struct {
 
 	started  bool
 	stopOnce sync.Once
+	wg       sync.WaitGroup // P1-8: 追踪后台 goroutine
 
 	eventChan chan Event
 	closeChan chan struct{}
 }
 
 // NewTracer 创建新的Tracer
-func NewTracer(hostNetNs, selfNetNs netns.NsHandle, disableL7Tracing bool) (*Tracer, error) {
+func NewTracer(ctx context.Context, hostNetNs, selfNetNs netns.NsHandle, disableL7Tracing bool, maxActiveConns int) (*Tracer, error) {
 	if disableL7Tracing {
 		log.Println("I! coroot_servicemap: L7 tracing is disabled")
 	}
 
-	return &Tracer{
+	t := &Tracer{
+		ctx:              ctx,
 		hostNetNs:        hostNetNs,
 		selfNetNs:        selfNetNs,
 		disableL7Tracing: disableL7Tracing,
+		maxActiveConns:   maxActiveConns,
 		readers:          make(map[string]*perf.Reader),
 		uprobes:          make(map[string]*ebpf.Program),
 		activeConns:      make(map[ConnectionID]Connection),
@@ -141,7 +147,27 @@ func NewTracer(hostNetNs, selfNetNs netns.NsHandle, disableL7Tracing bool) (*Tra
 		listenPorts:      make(map[ListenKey]struct{}),
 		eventChan:        make(chan Event, 10000),
 		closeChan:        make(chan struct{}),
-	}, nil
+	}
+
+	// P1-8: 监听 context 取消，自动触发关闭
+	go func() {
+		select {
+		case <-ctx.Done():
+			t.stopOnce.Do(func() { close(t.closeChan) })
+		case <-t.closeChan:
+		}
+	}()
+
+	return t, nil
+}
+
+// launchBackground 启动后台 goroutine 并追踪生命周期 (P1-8)
+func (t *Tracer) launchBackground(fn func()) {
+	t.wg.Add(1)
+	go func() {
+		defer t.wg.Done()
+		fn()
+	}()
 }
 
 // Start 启动eBPF程序
@@ -152,9 +178,7 @@ func (t *Tracer) Start() error {
 
 	if runtime.GOOS != "linux" {
 		log.Printf("I! coroot_servicemap: eBPF is unsupported on %s, fallback to polling tracer", runtime.GOOS)
-		go t.startPollingTracer()
-		go t.startConnectionGC()
-		t.started = true
+		t.startFallbackMode()
 		return nil
 	}
 
@@ -176,32 +200,33 @@ func (t *Tracer) Start() error {
 	}
 	if traceFsPath == "" {
 		log.Println("W! coroot_servicemap: tracefs unavailable, fallback to polling tracer")
-		go t.startPollingTracer()
-		go t.startConnectionGC()
-		t.started = true
+		t.startFallbackMode()
 		return nil
 	}
 
 	if err := checkKernelVersion(); err != nil {
 		log.Printf("W! coroot_servicemap: kernel check failed, fallback to polling tracer: %v", err)
-		go t.startPollingTracer()
-		go t.startConnectionGC()
-		t.started = true
+		t.startFallbackMode()
 		return nil
 	}
 
 	if err := t.loadEBPF(); err != nil {
 		log.Printf("W! coroot_servicemap: load eBPF failed, fallback to polling tracer: %v", err)
-		go t.startPollingTracer()
-		go t.startConnectionGC()
-		t.started = true
+		t.startFallbackMode()
 		return nil
 	}
 
-	go t.startConnectionGC()
+	t.launchBackground(t.startConnectionGC)
 	log.Println("I! coroot_servicemap: eBPF tracer started")
 	t.started = true
 	return nil
+}
+
+// startFallbackMode 启动轮询回退模式
+func (t *Tracer) startFallbackMode() {
+	t.launchBackground(t.startPollingTracer)
+	t.launchBackground(t.startConnectionGC)
+	t.started = true
 }
 
 // loadEBPF 加载eBPF程序（待实现）
@@ -300,7 +325,11 @@ func (t *Tracer) initPerfReaders() error {
 	}
 
 	t.readers["events"] = r
-	go t.runEventReader(r)
+	t.wg.Add(1)
+	go func() {
+		defer t.wg.Done()
+		t.runEventReader(r)
+	}()
 	return nil
 }
 
@@ -418,11 +447,13 @@ func (t *Tracer) handleListenEvent(event *Event) {
 	}
 }
 
-// Close 关闭Tracer
+// Close 关闭Tracer (P1-8: 等待所有后台 goroutine 退出后再释放资源)
 func (t *Tracer) Close() {
 	t.stopOnce.Do(func() {
 		close(t.closeChan)
 	})
+	// P1-8: 等待所有后台 goroutine 退出
+	t.wg.Wait()
 
 	for _, p := range t.uprobes {
 		_ = p.Close()
@@ -588,6 +619,10 @@ func (t *Tracer) pollConnections() {
 				BytesReceived: existing.BytesReceived,
 			}
 		} else {
+			// P1-6: 检查连接数上限
+			if t.maxActiveConns > 0 && len(t.activeConns) >= t.maxActiveConns {
+				continue
+			}
 			t.activeConns[id] = Connection{
 				Timestamp: e.Timestamp,
 				LastSeen:  now,

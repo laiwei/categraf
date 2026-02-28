@@ -26,11 +26,12 @@ var containerIDRegex = regexp.MustCompile(`[a-f0-9]{64}`)
 
 // Config 容器注册表配置
 type Config struct {
-	EnableDocker bool
-	EnableK8s    bool
-	EnableCgroup bool
-	DockerSocket string
-	KubeConfig   string
+	EnableDocker  bool
+	EnableK8s     bool
+	EnableCgroup  bool
+	DockerSocket  string
+	KubeConfig    string
+	MaxContainers int // P1-6: 容器数上限，0 = 不限制
 }
 
 const (
@@ -47,6 +48,7 @@ type k8sContainerMeta struct {
 
 // Registry 容器注册表
 type Registry struct {
+	ctx    context.Context // P1-8: 生命周期 context
 	config Config
 	tracer *tracer.Tracer
 	docker *client.Client
@@ -58,17 +60,32 @@ type Registry struct {
 	mu         sync.RWMutex
 
 	stopChan chan struct{}
+	wg       sync.WaitGroup // P1-8: 追踪后台 goroutine
 }
 
 // NewRegistry 创建新的容器注册表
-func NewRegistry(tr *tracer.Tracer, config Config) (*Registry, error) {
+func NewRegistry(ctx context.Context, tr *tracer.Tracer, config Config) (*Registry, error) {
 	r := &Registry{
+		ctx:              ctx,
 		config:           config,
 		tracer:           tr,
 		containers:       make(map[string]*Container),
 		k8sContainerMeta: make(map[string]k8sContainerMeta),
 		stopChan:         make(chan struct{}),
 	}
+
+	// P1-8: 监听 context 取消，自动触发关闭
+	go func() {
+		select {
+		case <-ctx.Done():
+			select {
+			case <-r.stopChan:
+			default:
+				close(r.stopChan)
+			}
+		case <-r.stopChan:
+		}
+	}()
 
 	if config.EnableDocker {
 		dockerHost := "unix:///var/run/docker.sock"
@@ -98,18 +115,27 @@ func NewRegistry(tr *tracer.Tracer, config Config) (*Registry, error) {
 	}
 
 	// 启动事件处理
-	go r.handleEvents()
+	r.launchBackground(r.handleEvents)
 
 	// P0-5: 启动容器 GC
-	go r.containerGCLoop()
+	r.launchBackground(r.containerGCLoop)
 
 	// 启动容器发现
 	if config.EnableCgroup {
-		go r.discoverContainersByCgroup()
+		r.launchBackground(r.discoverContainersByCgroup)
 	}
 
 	log.Println("I! coroot_servicemap: container registry initialized")
 	return r, nil
+}
+
+// launchBackground 启动后台 goroutine 并追踪生命周期 (P1-8)
+func (r *Registry) launchBackground(fn func()) {
+	r.wg.Add(1)
+	go func() {
+		defer r.wg.Done()
+		fn()
+	}()
 }
 
 // handleEvents 处理eBPF事件
@@ -142,6 +168,9 @@ func (r *Registry) processEvent(event *tracer.Event) {
 	}
 
 	container := r.getOrCreateContainer(containerID)
+	if container == nil {
+		return
+	}
 
 	// 处理事件
 	container.OnEvent(event)
@@ -160,6 +189,9 @@ func (r *Registry) updateConnectionStats() {
 		}
 
 		container := r.getOrCreateContainer(containerID)
+		if container == nil {
+			return
+		}
 		container.UpdateTrafficStats(connID.FD, conn.BytesSent, conn.BytesReceived)
 	})
 }
@@ -168,6 +200,12 @@ func (r *Registry) updateConnectionStats() {
 func (r *Registry) getOrCreateContainer(id string) *Container {
 	if container, exists := r.containers[id]; exists {
 		return container
+	}
+
+	// P1-6: 检查容器数上限
+	if r.config.MaxContainers > 0 && len(r.containers) >= r.config.MaxContainers {
+		log.Printf("W! coroot_servicemap: max containers limit (%d) reached, skipping container %s", r.config.MaxContainers, id)
+		return nil
 	}
 
 	container := NewContainer(id)
@@ -475,9 +513,15 @@ func (r *Registry) GetContainers() []*Container {
 	return containers
 }
 
-// Close 关闭注册表
+// Close 关闭注册表 (P1-8: 等待后台 goroutine 退出)
 func (r *Registry) Close() {
-	close(r.stopChan)
+	select {
+	case <-r.stopChan:
+		// 已关闭
+	default:
+		close(r.stopChan)
+	}
+	r.wg.Wait()
 	if r.docker != nil {
 		_ = r.docker.Close()
 	}

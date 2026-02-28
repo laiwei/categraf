@@ -1,6 +1,7 @@
 package tracer
 
 import (
+	"context"
 	"strings"
 	"testing"
 
@@ -28,7 +29,7 @@ func TestEventType_String(t *testing.T) {
 func TestNewTracer(t *testing.T) {
 	// 注意：这个测试需要在 Linux 系统上运行
 	// 在其他系统上会跳过
-	tracer, err := NewTracer(0, 0, true)
+	tracer, err := NewTracer(context.Background(), 0, 0, true, 0)
 	if err != nil {
 		t.Skipf("NewTracer failed (expected on non-Linux): %v", err)
 	}

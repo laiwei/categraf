@@ -1,6 +1,7 @@
 package coroot_servicemap
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"runtime"
@@ -27,7 +28,13 @@ type Instance struct {
 	DockerSocketPath string   `toml:"docker_socket_path"`
 	KubeConfigPath   string   `toml:"kubeconfig_path"`
 
+	// P1-6: 资源限制
+	MaxTrackedConnections int `toml:"max_tracked_connections"`
+	MaxContainers         int `toml:"max_containers"`
+
 	// 内部状态
+	ctx      context.Context
+	cancel   context.CancelFunc
 	tracer   *tracer.Tracer
 	registry *containers.Registry
 }
@@ -35,6 +42,17 @@ type Instance struct {
 // Init 初始化实例
 func (ins *Instance) Init() error {
 	log.Printf("I! coroot_servicemap: initializing instance")
+
+	// P1-8: 创建 context 用于优雅退出
+	ins.ctx, ins.cancel = context.WithCancel(context.Background())
+
+	// P1-6: 设置默认资源限制
+	if ins.MaxTrackedConnections <= 0 {
+		ins.MaxTrackedConnections = 50000
+	}
+	if ins.MaxContainers <= 0 {
+		ins.MaxContainers = 5000
+	}
 
 	hostNetNs := netns.NsHandle(-1)
 	selfNetNs := hostNetNs
@@ -58,7 +76,7 @@ func (ins *Instance) Init() error {
 	}
 
 	// 创建 Tracer
-	t, err := tracer.NewTracer(hostNetNs, selfNetNs, ins.DisableL7Tracing)
+	t, err := tracer.NewTracer(ins.ctx, hostNetNs, selfNetNs, ins.DisableL7Tracing, ins.MaxTrackedConnections)
 	if err != nil {
 		return fmt.Errorf("failed to create tracer: %w", err)
 	}
@@ -72,14 +90,15 @@ func (ins *Instance) Init() error {
 
 	// 创建容器注册表
 	regConfig := containers.Config{
-		EnableDocker: true,
-		EnableK8s:    ins.KubeConfigPath != "",
-		EnableCgroup: ins.EnableCgroup,
-		DockerSocket: ins.DockerSocketPath,
-		KubeConfig:   ins.KubeConfigPath,
+		EnableDocker:  true,
+		EnableK8s:     ins.KubeConfigPath != "",
+		EnableCgroup:  ins.EnableCgroup,
+		DockerSocket:  ins.DockerSocketPath,
+		KubeConfig:    ins.KubeConfigPath,
+		MaxContainers: ins.MaxContainers,
 	}
 
-	reg, err := containers.NewRegistry(t, regConfig)
+	reg, err := containers.NewRegistry(ins.ctx, t, regConfig)
 	if err != nil {
 		t.Close()
 		return fmt.Errorf("failed to create registry: %w", err)
@@ -104,6 +123,7 @@ func (ins *Instance) Gather(slist *types.SampleList) {
 	if len(containers) == 0 {
 		// 即使没有容器，也尝试产生基于进程的统计
 		ins.collectHostStats(slist)
+		ins.collectInternalStats(slist)
 		return
 	}
 
@@ -145,10 +165,17 @@ func (ins *Instance) Gather(slist *types.SampleList) {
 	if ins.EnableTCP {
 		ins.collectServiceMapStats(containers, slist)
 	}
+
+	// P1-7: 内部状态指标
+	ins.collectInternalStats(slist)
 }
 
-// Drop 清理资源
+// Drop 清理资源 (P1-8: 先取消 context，再等待清理完成)
 func (ins *Instance) Drop() {
+	if ins.cancel != nil {
+		ins.cancel()
+	}
+
 	if ins.registry != nil {
 		ins.registry.Close()
 	}
@@ -196,72 +223,32 @@ func (ins *Instance) collectHostStats(slist *types.SampleList) {
 		tags))
 }
 
-// collectTCPStats 采集TCP统计
+// collectTCPStats 采集TCP统计 (P1-5: counter 语义; P1-7: 命名规范)
 func (ins *Instance) collectTCPStats(container *containers.Container, baseTags map[string]string, slist *types.SampleList) {
-	// P0-3: 使用快照方法避免并发读写竞争
 	tcpStats := container.GetTCPStatsSnapshot()
 	for dest, stats := range tcpStats {
 		tags := mergeTags(baseTags, map[string]string{
 			"destination": dest,
 		})
 
-		// 转换时间单位：毫秒 -> 秒
-		totalSeconds := float64(stats.TotalTime) / 1000.0
-		maxSeconds := float64(stats.MaxTime) / 1000.0
-		minSeconds := float64(stats.MinTime) / 1000.0
+		// Counters — 累积值，下游可通过 rate() 计算速率
+		slist.PushFront(types.NewSample(inputName, "tcp_connects_total", float64(stats.SuccessfulConnects), tags))
+		slist.PushFront(types.NewSample(inputName, "tcp_connect_failed_total", float64(stats.FailedConnects), tags))
+		slist.PushFront(types.NewSample(inputName, "tcp_retransmits_total", float64(stats.Retransmissions), tags))
+		slist.PushFront(types.NewSample(inputName, "tcp_bytes_sent_total", float64(stats.BytesSent), tags))
+		slist.PushFront(types.NewSample(inputName, "tcp_bytes_received_total", float64(stats.BytesReceived), tags))
 
-		slist.PushFront(types.NewSample(inputName,
-			"tcp_successful_connects_total",
-			float64(stats.SuccessfulConnects),
-			tags))
+		// Summary-style counters — _sum/_count 支持 avg = sum / count
+		slist.PushFront(types.NewSample(inputName, "tcp_connect_duration_seconds_sum", float64(stats.TotalTime)/1000.0, tags))
+		slist.PushFront(types.NewSample(inputName, "tcp_connect_duration_seconds_count", float64(stats.SuccessfulConnects), tags))
 
-		slist.PushFront(types.NewSample(inputName,
-			"tcp_connection_time_seconds_total",
-			totalSeconds,
-			tags))
-
-		if stats.SuccessfulConnects > 0 {
-			slist.PushFront(types.NewSample(inputName,
-				"tcp_connection_time_seconds_avg",
-				totalSeconds/float64(stats.SuccessfulConnects),
-				tags))
-
-			slist.PushFront(types.NewSample(inputName,
-				"tcp_connection_time_seconds_max",
-				maxSeconds,
-				tags))
-
-			slist.PushFront(types.NewSample(inputName,
-				"tcp_connection_time_seconds_min",
-				minSeconds,
-				tags))
-		}
-
-		slist.PushFront(types.NewSample(inputName,
-			"tcp_active_connections",
-			float64(stats.ActiveConnections),
-			tags))
-
-		slist.PushFront(types.NewSample(inputName,
-			"tcp_retransmissions_total",
-			float64(stats.Retransmissions),
-			tags))
-
-		slist.PushFront(types.NewSample(inputName,
-			"tcp_bytes_sent_total",
-			float64(stats.BytesSent),
-			tags))
-
-		slist.PushFront(types.NewSample(inputName,
-			"tcp_bytes_received_total",
-			float64(stats.BytesReceived),
-			tags))
+		// Gauges — 瞬时值
+		slist.PushFront(types.NewSample(inputName, "tcp_active_connections", float64(stats.ActiveConnections), tags))
 	}
 }
 
-// collectHTTPStats 采集HTTP统计
+// collectHTTPStats 采集HTTP统计 (P1-5: counter 语义; P1-7: 命名规范)
 func (ins *Instance) collectHTTPStats(container *containers.Container, baseTags map[string]string, slist *types.SampleList) {
-	// P0-3: 使用快照方法避免并发读写竞争
 	httpStats := container.GetHTTPStatsSnapshot()
 	for dest, stats := range httpStats {
 		tags := mergeTags(baseTags, map[string]string{
@@ -270,50 +257,19 @@ func (ins *Instance) collectHTTPStats(container *containers.Container, baseTags 
 			"status_code": fmt.Sprintf("%d", stats.StatusCode),
 		})
 
-		// 转换时间单位：毫秒 -> 秒
-		totalLatency := float64(stats.TotalLatency) / 1000.0
-		maxLatency := float64(stats.MaxLatency) / 1000.0
+		// Counters
+		slist.PushFront(types.NewSample(inputName, "http_requests_total", float64(stats.RequestCount), tags))
+		slist.PushFront(types.NewSample(inputName, "http_request_errors_total", float64(stats.ErrorCount), tags))
+		slist.PushFront(types.NewSample(inputName, "http_bytes_sent_total", float64(stats.BytesSent), tags))
+		slist.PushFront(types.NewSample(inputName, "http_bytes_received_total", float64(stats.BytesReceived), tags))
 
-		slist.PushFront(types.NewSample(inputName,
-			"http_requests_total",
-			float64(stats.RequestCount),
-			tags))
-
-		slist.PushFront(types.NewSample(inputName,
-			"http_request_errors_total",
-			float64(stats.ErrorCount),
-			tags))
-
-		if stats.RequestCount > 0 {
-			slist.PushFront(types.NewSample(inputName,
-				"http_request_latency_seconds_total",
-				totalLatency,
-				tags))
-
-			slist.PushFront(types.NewSample(inputName,
-				"http_request_latency_seconds_avg",
-				totalLatency/float64(stats.RequestCount),
-				tags))
-
-			slist.PushFront(types.NewSample(inputName,
-				"http_request_latency_seconds_max",
-				maxLatency,
-				tags))
-		}
-
-		slist.PushFront(types.NewSample(inputName,
-			"http_bytes_sent_total",
-			float64(stats.BytesSent),
-			tags))
-
-		slist.PushFront(types.NewSample(inputName,
-			"http_bytes_received_total",
-			float64(stats.BytesReceived),
-			tags))
+		// Summary-style counters
+		slist.PushFront(types.NewSample(inputName, "http_request_duration_seconds_sum", float64(stats.TotalLatency)/1000.0, tags))
+		slist.PushFront(types.NewSample(inputName, "http_request_duration_seconds_count", float64(stats.RequestCount), tags))
 	}
 }
 
-// collectServiceMapStats 输出服务拓扑图聚合指标
+// collectServiceMapStats 输出服务拓扑图聚合指标 (P1-7)
 func (ins *Instance) collectServiceMapStats(cs []*containers.Container, slist *types.SampleList) {
 	g := servicemap.Build(cs)
 
@@ -340,46 +296,20 @@ func (ins *Instance) collectServiceMapStats(cs []*containers.Container, slist *t
 			tags["destination_port"] = edge.DestPort
 		}
 
-		slist.PushFront(types.NewSample(inputName,
-			"service_map_edge_successful_connects_total",
-			float64(edge.SuccessfulConnects),
-			tags))
+		// Counters
+		slist.PushFront(types.NewSample(inputName, "edge_connects_total", float64(edge.SuccessfulConnects), tags))
+		slist.PushFront(types.NewSample(inputName, "edge_connect_failed_total", float64(edge.FailedConnects), tags))
+		slist.PushFront(types.NewSample(inputName, "edge_retransmits_total", float64(edge.Retransmissions), tags))
+		slist.PushFront(types.NewSample(inputName, "edge_bytes_sent_total", float64(edge.BytesSent), tags))
+		slist.PushFront(types.NewSample(inputName, "edge_bytes_received_total", float64(edge.BytesReceived), tags))
 
-		slist.PushFront(types.NewSample(inputName,
-			"service_map_edge_failed_connects_total",
-			float64(edge.FailedConnects),
-			tags))
-
-		slist.PushFront(types.NewSample(inputName,
-			"service_map_edge_active_connections",
-			float64(edge.ActiveConnections),
-			tags))
-
-		slist.PushFront(types.NewSample(inputName,
-			"service_map_edge_retransmissions_total",
-			float64(edge.Retransmissions),
-			tags))
-
-		slist.PushFront(types.NewSample(inputName,
-			"service_map_edge_bytes_sent_total",
-			float64(edge.BytesSent),
-			tags))
-
-		slist.PushFront(types.NewSample(inputName,
-			"service_map_edge_bytes_received_total",
-			float64(edge.BytesReceived),
-			tags))
+		// Gauges
+		slist.PushFront(types.NewSample(inputName, "edge_active_connections", float64(edge.ActiveConnections), tags))
 	}
 
-	slist.PushFront(types.NewSample(inputName,
-		"service_map_nodes",
-		float64(len(g.Nodes)),
-		map[string]string{}))
-
-	slist.PushFront(types.NewSample(inputName,
-		"service_map_edges",
-		float64(len(g.Edges)),
-		map[string]string{}))
+	// 拓扑概要
+	slist.PushFront(types.NewSample(inputName, "graph_nodes", float64(len(g.Nodes)), map[string]string{}))
+	slist.PushFront(types.NewSample(inputName, "graph_edges", float64(len(g.Edges)), map[string]string{}))
 }
 
 // mergeTags 合并标签
@@ -395,4 +325,19 @@ func mergeTags(base, additional map[string]string) map[string]string {
 	}
 
 	return result
+}
+
+// collectInternalStats 输出插件内部状态指标 (P1-7: 自监控)
+func (ins *Instance) collectInternalStats(slist *types.SampleList) {
+	if ins.tracer == nil {
+		return
+	}
+
+	tags := map[string]string{}
+	slist.PushFront(types.NewSample(inputName, "tracer_active_connections", float64(ins.tracer.ActiveConnectionCount()), tags))
+	slist.PushFront(types.NewSample(inputName, "tracer_listen_ports", float64(len(ins.tracer.GetListenPorts())), tags))
+
+	if ins.registry != nil {
+		slist.PushFront(types.NewSample(inputName, "tracked_containers", float64(len(ins.registry.GetContainers())), tags))
+	}
 }
