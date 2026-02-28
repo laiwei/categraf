@@ -119,3 +119,28 @@ func TestContainer_OnRetransmit(t *testing.T) {
 		}
 	}
 }
+
+func TestContainer_UpdateTrafficStats(t *testing.T) {
+	container := NewContainer("test")
+	openEvent := &tracer.Event{
+		Type:    tracer.EventTypeConnectionOpen,
+		Fd:      123,
+		DstAddr: "10.0.0.1:80",
+	}
+	container.OnEvent(openEvent)
+
+	container.UpdateTrafficStats(123, 100, 60)
+	container.UpdateTrafficStats(123, 150, 90)
+
+	stats := container.TCPStats["10.0.0.1:80"]
+	if stats == nil {
+		t.Fatal("tcp stats not found")
+	}
+
+	if stats.BytesSent != 150 {
+		t.Fatalf("unexpected bytes sent: %d", stats.BytesSent)
+	}
+	if stats.BytesReceived != 90 {
+		t.Fatalf("unexpected bytes received: %d", stats.BytesReceived)
+	}
+}

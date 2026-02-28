@@ -16,14 +16,14 @@ type Instance struct {
 	config.InstanceConfig
 
 	// 配置选项
-	EnableTCP         bool   `toml:"enable_tcp"`
-	EnableHTTP        bool   `toml:"enable_http"`
-	EnableCgroup      bool   `toml:"enable_cgroup"`
-	DisableL7Tracing  bool   `toml:"disable_l7_tracing"`
-	IgnorePorts       []int  `toml:"ignore_ports"`
-	IgnoreCIDRs       []string `toml:"ignore_cidrs"`
-	DockerSocketPath  string `toml:"docker_socket_path"`
-	KubeConfigPath    string `toml:"kubeconfig_path"`
+	EnableTCP        bool     `toml:"enable_tcp"`
+	EnableHTTP       bool     `toml:"enable_http"`
+	EnableCgroup     bool     `toml:"enable_cgroup"`
+	DisableL7Tracing bool     `toml:"disable_l7_tracing"`
+	IgnorePorts      []int    `toml:"ignore_ports"`
+	IgnoreCIDRs      []string `toml:"ignore_cidrs"`
+	DockerSocketPath string   `toml:"docker_socket_path"`
+	KubeConfigPath   string   `toml:"kubeconfig_path"`
 
 	// 内部状态
 	tracer   *tracer.Tracer
@@ -39,14 +39,12 @@ func (ins *Instance) Init() error {
 	if err != nil {
 		return fmt.Errorf("failed to get host network namespace: %w", err)
 	}
-	defer hostNetNs.Close()
 
 	selfNetNs, err := netns.GetFromPid(1)
 	if err != nil {
 		// 如果在容器中，直接使用当前命名空间
 		selfNetNs = hostNetNs
 	}
-	defer selfNetNs.Close()
 
 	// 创建 Tracer
 	t, err := tracer.NewTracer(hostNetNs, selfNetNs, ins.DisableL7Tracing)

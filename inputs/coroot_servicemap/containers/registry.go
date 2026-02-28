@@ -1,12 +1,19 @@
 package containers
 
 import (
+	"fmt"
 	"log"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strings"
 	"sync"
 	"time"
 
 	"flashcat.cloud/categraf/inputs/coroot_servicemap/tracer"
 )
+
+var containerIDRegex = regexp.MustCompile(`[a-f0-9]{64}`)
 
 // Config 容器注册表配置
 type Config struct {
@@ -18,8 +25,8 @@ type Config struct {
 
 // Registry 容器注册表
 type Registry struct {
-	config  Config
-	tracer  *tracer.Tracer
+	config Config
+	tracer *tracer.Tracer
 
 	containers map[string]*Container
 	mu         sync.RWMutex
@@ -88,29 +95,16 @@ func (r *Registry) updateConnectionStats() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	// 从eBPF map读取连接统计
-	iter := r.tracer.GetActiveConnections()
-	if iter == nil {
-		return
-	}
-
-	var connID tracer.ConnectionID
-	var conn tracer.Connection
-
-	for iter.Next(&connID, &conn) {
+	r.tracer.ForEachActiveConnection(func(connID tracer.ConnectionID, conn tracer.Connection) {
 		// 查找对应的容器
 		containerID := r.getContainerIDByPID(connID.PID)
 		if containerID == "" {
-			continue
+			return
 		}
 
 		container := r.getOrCreateContainer(containerID)
 		container.UpdateTrafficStats(connID.FD, conn.BytesSent, conn.BytesReceived)
-	}
-
-	if err := iter.Err(); err != nil {
-		log.Printf("E! coroot_servicemap: error iterating connections: %v", err)
-	}
+	})
 }
 
 // getOrCreateContainer 获取或创建容器
@@ -126,9 +120,62 @@ func (r *Registry) getOrCreateContainer(id string) *Container {
 
 // getContainerIDByPID 根据PID获取容器ID（简化版）
 func (r *Registry) getContainerIDByPID(pid uint32) string {
-	// TODO: 通过cgroup路径识别容器ID
-	// 读取 /proc/<pid>/cgroup
-	// 解析容器ID (Docker/Kubernetes)
+	if !r.config.EnableCgroup {
+		return ""
+	}
+
+	cgroupPath := filepath.Join("/proc", fmt.Sprintf("%d", pid), "cgroup")
+	b, err := os.ReadFile(cgroupPath)
+	if err != nil {
+		return ""
+	}
+
+	for _, line := range strings.Split(string(b), "\n") {
+		if line == "" {
+			continue
+		}
+
+		id := extractContainerID(line)
+		if id != "" {
+			return id
+		}
+	}
+
+	return ""
+}
+
+func extractContainerID(cgroupLine string) string {
+	if cgroupLine == "" {
+		return ""
+	}
+
+	if id := containerIDRegex.FindString(cgroupLine); id != "" {
+		return id
+	}
+
+	parts := strings.Split(cgroupLine, "/")
+	for i := len(parts) - 1; i >= 0; i-- {
+		token := strings.TrimSpace(parts[i])
+		token = strings.TrimSuffix(token, ".scope")
+
+		token = strings.TrimPrefix(token, "docker-")
+		token = strings.TrimPrefix(token, "cri-containerd-")
+		token = strings.TrimPrefix(token, "crio-")
+
+		if len(token) >= 12 {
+			isHex := true
+			for _, ch := range token {
+				if !(ch >= '0' && ch <= '9' || ch >= 'a' && ch <= 'f') {
+					isHex = false
+					break
+				}
+			}
+			if isHex {
+				return token
+			}
+		}
+	}
+
 	return ""
 }
 

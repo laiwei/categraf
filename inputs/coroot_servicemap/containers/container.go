@@ -47,9 +47,9 @@ type Container struct {
 	HTTPStats map[string]*HTTPStats
 
 	// 活跃连接追踪
-	mu                 sync.RWMutex
-	activeConnections  map[uint64]*ConnectionTracker
-	connectionsByDest  map[string][]uint64
+	mu                sync.RWMutex
+	activeConnections map[uint64]*ConnectionTracker
+	connectionsByDest map[string][]uint64
 }
 
 // ConnectionTracker 连接追踪器
@@ -63,12 +63,12 @@ type ConnectionTracker struct {
 // NewContainer 创建新的容器对象
 func NewContainer(id string) *Container {
 	return &Container{
-		ID:                 id,
-		Labels:             make(map[string]string),
-		TCPStats:           make(map[string]*TCPStats),
-		HTTPStats:          make(map[string]*HTTPStats),
-		activeConnections:  make(map[uint64]*ConnectionTracker),
-		connectionsByDest:  make(map[string][]uint64),
+		ID:                id,
+		Labels:            make(map[string]string),
+		TCPStats:          make(map[string]*TCPStats),
+		HTTPStats:         make(map[string]*HTTPStats),
+		activeConnections: make(map[uint64]*ConnectionTracker),
+		connectionsByDest: make(map[string][]uint64),
 	}
 }
 
@@ -190,17 +190,31 @@ func (c *Container) UpdateTrafficStats(fd uint64, sent, received uint64) {
 	}
 
 	// 计算增量
+	var sentDelta uint64
 	if sent > conn.BytesSent {
-		_ = sent - conn.BytesSent // sentDelta
+		sentDelta = sent - conn.BytesSent
 	}
 
+	var receivedDelta uint64
 	if received > conn.BytesReceived {
-		_ = received - conn.BytesReceived // receivedDelta
+		receivedDelta = received - conn.BytesReceived
 	}
 
 	// 更新连接记录
 	conn.BytesSent = sent
 	conn.BytesReceived = received
 
-	// TODO: 更新对应destination的统计
+	// 更新对应 destination 的统计
+	if conn.Destination == "" {
+		return
+	}
+
+	stats := c.TCPStats[conn.Destination]
+	if stats == nil {
+		stats = &TCPStats{DestinationAddr: conn.Destination}
+		c.TCPStats[conn.Destination] = stats
+	}
+
+	stats.BytesSent += sentDelta
+	stats.BytesReceived += receivedDelta
 }

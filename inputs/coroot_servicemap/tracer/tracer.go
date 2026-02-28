@@ -8,12 +8,17 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"runtime"
+	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/perf"
+	gopsnet "github.com/shirou/gopsutil/v3/net"
 	"github.com/vishvananda/netns"
 	"golang.org/x/sys/unix"
 )
@@ -88,6 +93,13 @@ type Tracer struct {
 	uprobes    map[string]*ebpf.Program
 	links      []link.Link
 
+	activeConnMu sync.RWMutex
+	activeConns  map[ConnectionID]Connection
+	lastSnapshot map[ConnectionID]Event
+
+	started bool
+	stopOnce sync.Once
+
 	eventChan chan Event
 	closeChan chan struct{}
 }
@@ -104,6 +116,8 @@ func NewTracer(hostNetNs, selfNetNs netns.NsHandle, disableL7Tracing bool) (*Tra
 		disableL7Tracing: disableL7Tracing,
 		readers:          make(map[string]*perf.Reader),
 		uprobes:          make(map[string]*ebpf.Program),
+		activeConns:      make(map[ConnectionID]Connection),
+		lastSnapshot:     make(map[ConnectionID]Event),
 		eventChan:        make(chan Event, 1000),
 		closeChan:        make(chan struct{}),
 	}, nil
@@ -111,6 +125,10 @@ func NewTracer(hostNetNs, selfNetNs netns.NsHandle, disableL7Tracing bool) (*Tra
 
 // Start 启动eBPF程序
 func (t *Tracer) Start() error {
+	if t.started {
+		return nil
+	}
+
 	log.Println("I! coroot_servicemap: loading eBPF programs...")
 
 	// 检查架构支持
@@ -128,7 +146,17 @@ func (t *Tracer) Start() error {
 		}
 	}
 	if traceFsPath == "" {
-		return fmt.Errorf("kernel tracing is not available: debugfs or tracefs must be mounted")
+		log.Println("W! coroot_servicemap: tracefs unavailable, fallback to polling tracer")
+		go t.startPollingTracer()
+		t.started = true
+		return nil
+	}
+
+	if err := checkKernelVersion(); err != nil {
+		log.Printf("W! coroot_servicemap: kernel check failed, fallback to polling tracer: %v", err)
+		go t.startPollingTracer()
+		t.started = true
+		return nil
 	}
 
 	// 在实际部署时需要：
@@ -138,11 +166,9 @@ func (t *Tracer) Start() error {
 	// 由于eBPF程序需要预编译，这里暂时返回提示信息
 	// 注意: 这里需要实际的eBPF字节码
 
-	log.Println("W! coroot_servicemap: eBPF program loading is not yet implemented")
-	log.Println("W! coroot_servicemap: this requires compiling eBPF C code to bytecode")
-
-	// TODO: 加载eBPF程序
-	// return t.loadEBPF()
+	log.Println("W! coroot_servicemap: eBPF program loading is not yet implemented, fallback to polling tracer")
+	go t.startPollingTracer()
+	t.started = true
 	return nil
 }
 
@@ -175,9 +201,21 @@ func (t *Tracer) GetActiveConnections() *ebpf.MapIterator {
 	return t.collection.Maps["active_connections"].Iterate()
 }
 
+// ForEachActiveConnection 遍历活跃连接（支持 eBPF 与回退模式）
+func (t *Tracer) ForEachActiveConnection(fn func(connID ConnectionID, conn Connection)) {
+	t.activeConnMu.RLock()
+	defer t.activeConnMu.RUnlock()
+
+	for id, c := range t.activeConns {
+		fn(id, c)
+	}
+}
+
 // Close 关闭Tracer
 func (t *Tracer) Close() {
-	close(t.closeChan)
+	t.stopOnce.Do(func() {
+		close(t.closeChan)
+	})
 
 	for _, p := range t.uprobes {
 		_ = p.Close()
@@ -195,7 +233,125 @@ func (t *Tracer) Close() {
 		t.collection.Close()
 	}
 
+	if t.selfNetNs >= 0 {
+		_ = t.selfNetNs.Close()
+	}
+	if t.hostNetNs >= 0 && t.hostNetNs != t.selfNetNs {
+		_ = t.hostNetNs.Close()
+	}
+
 	log.Println("I! coroot_servicemap: tracer closed")
+}
+
+func (t *Tracer) startPollingTracer() {
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	t.pollConnections()
+
+	for {
+		select {
+		case <-t.closeChan:
+			return
+		case <-ticker.C:
+			t.pollConnections()
+		}
+	}
+}
+
+func (t *Tracer) pollConnections() {
+	conns, err := gopsnet.Connections("tcp")
+	if err != nil {
+		log.Printf("W! coroot_servicemap: polling tcp connections failed: %v", err)
+		return
+	}
+
+	now := uint64(time.Now().UnixNano())
+	current := make(map[ConnectionID]Event, len(conns))
+
+	for _, c := range conns {
+		if !isTrackedTCPConnection(c) {
+			continue
+		}
+
+		id := ConnectionID{FD: uint64(c.Fd), PID: uint32(c.Pid)}
+		e := Event{
+			Type:      EventTypeConnectionOpen,
+			Timestamp: now,
+			Pid:       uint32(c.Pid),
+			Fd:        uint64(c.Fd),
+			SrcAddr:   endpoint(c.Laddr.IP, c.Laddr.Port),
+			DstAddr:   endpoint(c.Raddr.IP, c.Raddr.Port),
+			SrcPort:   uint16(c.Laddr.Port),
+			DstPort:   uint16(c.Raddr.Port),
+		}
+		current[id] = e
+	}
+
+	t.activeConnMu.Lock()
+	defer t.activeConnMu.Unlock()
+
+	for id, e := range current {
+		if _, ok := t.lastSnapshot[id]; !ok {
+			t.emitEventLocked(e)
+		}
+
+		if existing, ok := t.activeConns[id]; ok {
+			t.activeConns[id] = Connection{
+				Timestamp:     existing.Timestamp,
+				BytesSent:     existing.BytesSent,
+				BytesReceived: existing.BytesReceived,
+			}
+		} else {
+			t.activeConns[id] = Connection{Timestamp: e.Timestamp}
+		}
+	}
+
+	for id, old := range t.lastSnapshot {
+		if _, ok := current[id]; ok {
+			continue
+		}
+
+		old.Type = EventTypeConnectionClose
+		old.Timestamp = now
+		t.emitEventLocked(old)
+		delete(t.activeConns, id)
+	}
+
+	t.lastSnapshot = current
+}
+
+func (t *Tracer) emitEventLocked(e Event) {
+	select {
+	case t.eventChan <- e:
+	default:
+		log.Println("W! coroot_servicemap: event channel is full, dropping event")
+	}
+}
+
+func isTrackedTCPConnection(c gopsnet.ConnectionStat) bool {
+	if c.Status == "" {
+		return false
+	}
+
+	status := strings.ToUpper(c.Status)
+	if status != "ESTABLISHED" && status != "SYN_SENT" && status != "SYN_RECV" {
+		return false
+	}
+
+	if c.Raddr.IP == "" || c.Raddr.Port == 0 {
+		return false
+	}
+
+	return c.Fd > 0
+}
+
+func endpoint(ip string, port uint32) string {
+	if ip == "" {
+		return ""
+	}
+
+	return net.JoinHostPort(ip, strconv.FormatUint(uint64(port), 10))
 }
 
 // 辅助函数
@@ -230,6 +386,25 @@ func checkKernelVersion() error {
 	parts := strings.Split(release, ".")
 	if len(parts) < 2 {
 		return errors.New("cannot parse kernel version")
+	}
+
+	major, err := strconv.Atoi(parts[0])
+	if err != nil {
+		return fmt.Errorf("parse kernel major version failed: %w", err)
+	}
+
+	minorStr := parts[1]
+	if idx := strings.IndexAny(minorStr, "-"); idx > 0 {
+		minorStr = minorStr[:idx]
+	}
+
+	minor, err := strconv.Atoi(minorStr)
+	if err != nil {
+		return fmt.Errorf("parse kernel minor version failed: %w", err)
+	}
+
+	if major < 4 || (major == 4 && minor < 16) {
+		return fmt.Errorf("kernel version %s is too old, require >= 4.16", release)
 	}
 
 	// 这里应该做更详细的版本检查

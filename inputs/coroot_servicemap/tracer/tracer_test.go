@@ -1,7 +1,10 @@
 package tracer
 
 import (
+	"strings"
 	"testing"
+
+	gopsnet "github.com/shirou/gopsutil/v3/net"
 )
 
 func TestEventType_String(t *testing.T) {
@@ -45,5 +48,34 @@ func TestNewTracer(t *testing.T) {
 	// 清理
 	if tracer != nil {
 		tracer.Close()
+	}
+}
+
+func TestIsTrackedTCPConnection(t *testing.T) {
+	conn := gopsnet.ConnectionStat{
+		Fd:     10,
+		Status: "ESTABLISHED",
+		Raddr:  gopsnet.Addr{IP: "10.0.0.2", Port: 443},
+	}
+
+	if !isTrackedTCPConnection(conn) {
+		t.Fatal("expected ESTABLISHED tcp connection to be tracked")
+	}
+
+	conn.Status = "TIME_WAIT"
+	if isTrackedTCPConnection(conn) {
+		t.Fatal("expected TIME_WAIT to be ignored")
+	}
+}
+
+func TestEndpoint(t *testing.T) {
+	v4 := endpoint("127.0.0.1", 80)
+	if v4 != "127.0.0.1:80" {
+		t.Fatalf("unexpected endpoint: %s", v4)
+	}
+
+	v6 := endpoint("2001:db8::1", 443)
+	if !strings.HasPrefix(v6, "[") || !strings.Contains(v6, "]:443") {
+		t.Fatalf("unexpected ipv6 endpoint: %s", v6)
 	}
 }
