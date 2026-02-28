@@ -3,6 +3,7 @@ package coroot_servicemap
 import (
 	"fmt"
 	"log"
+	"runtime"
 
 	"flashcat.cloud/categraf/config"
 	"flashcat.cloud/categraf/inputs/coroot_servicemap/containers"
@@ -35,16 +36,25 @@ type Instance struct {
 func (ins *Instance) Init() error {
 	log.Printf("I! coroot_servicemap: initializing instance")
 
-	// 获取网络命名空间
-	hostNetNs, err := netns.Get()
-	if err != nil {
-		return fmt.Errorf("failed to get host network namespace: %w", err)
-	}
+	hostNetNs := netns.NsHandle(-1)
+	selfNetNs := hostNetNs
 
-	selfNetNs, err := netns.GetFromPid(1)
-	if err != nil {
-		// 如果在容器中，直接使用当前命名空间
-		selfNetNs = hostNetNs
+	// 非 Linux 平台不支持 netns，直接使用 polling 回退模式。
+	if runtime.GOOS == "linux" {
+		if h, err := netns.Get(); err != nil {
+			log.Printf("W! coroot_servicemap: failed to get host network namespace, continue without netns: %v", err)
+		} else {
+			hostNetNs = h
+			selfNetNs = h
+		}
+
+		if s, err := netns.GetFromPid(1); err != nil {
+			log.Printf("W! coroot_servicemap: failed to get self network namespace from pid 1, fallback to host namespace: %v", err)
+		} else {
+			selfNetNs = s
+		}
+	} else {
+		log.Printf("I! coroot_servicemap: netns is unsupported on %s, running with polling fallback", runtime.GOOS)
 	}
 
 	// 创建 Tracer
@@ -82,16 +92,19 @@ func (ins *Instance) Init() error {
 }
 
 // Gather 采集数据
-func (ins *Instance) Gather(slist *types.SampleList) error {
+func (ins *Instance) Gather(slist *types.SampleList) {
 	if ins.registry == nil {
-		return fmt.Errorf("registry not initialized")
+		log.Println("E! coroot_servicemap: registry not initialized")
+		return
 	}
 
 	// 获取所有容器数据
 	containers := ins.registry.GetContainers()
+
 	if len(containers) == 0 {
-		log.Println("D! coroot_servicemap: no containers found")
-		return nil
+		// 即使没有容器，也尝试产生基于进程的统计
+		ins.collectHostStats(slist)
+		return
 	}
 
 	for _, container := range containers {
@@ -132,8 +145,6 @@ func (ins *Instance) Gather(slist *types.SampleList) error {
 	if ins.EnableTCP {
 		ins.collectServiceMapStats(containers, slist)
 	}
-
-	return nil
 }
 
 // Drop 清理资源
@@ -147,6 +158,42 @@ func (ins *Instance) Drop() {
 	}
 
 	log.Println("I! coroot_servicemap: instance dropped")
+}
+
+// collectHostStats 收集主机级别的统计（当没有容器时）
+func (ins *Instance) collectHostStats(slist *types.SampleList) {
+	if ins.tracer == nil {
+		return
+	}
+
+	connCount := 0
+	var totalBytesSent, totalBytesReceived uint64
+
+	ins.tracer.ForEachActiveConnection(func(connID tracer.ConnectionID, conn tracer.Connection) {
+		connCount++
+		totalBytesSent += conn.BytesSent
+		totalBytesReceived += conn.BytesReceived
+	})
+
+	// 即使没有连接也输出指标（值为0）
+	tags := map[string]string{
+		"host": "local",
+	}
+
+	slist.PushFront(types.NewSample(inputName,
+		"host_active_connections",
+		float64(connCount),
+		tags))
+
+	slist.PushFront(types.NewSample(inputName,
+		"host_bytes_sent_total",
+		float64(totalBytesSent),
+		tags))
+
+	slist.PushFront(types.NewSample(inputName,
+		"host_bytes_received_total",
+		float64(totalBytesReceived),
+		tags))
 }
 
 // collectTCPStats 采集TCP统计

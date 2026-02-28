@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"log"
 	"net"
@@ -127,6 +128,13 @@ func NewTracer(hostNetNs, selfNetNs netns.NsHandle, disableL7Tracing bool) (*Tra
 // Start 启动eBPF程序
 func (t *Tracer) Start() error {
 	if t.started {
+		return nil
+	}
+
+	if runtime.GOOS != "linux" {
+		log.Printf("I! coroot_servicemap: eBPF is unsupported on %s, fallback to polling tracer", runtime.GOOS)
+		go t.startPollingTracer()
+		t.started = true
 		return nil
 	}
 
@@ -364,9 +372,11 @@ func (t *Tracer) Close() {
 }
 
 func (t *Tracer) startPollingTracer() {
+	log.Println("I! coroot_servicemap: polling tracer started")
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 
+	// 立即执行一次以便快速初始化
 	t.pollConnections()
 
 	for {
@@ -386,6 +396,8 @@ func (t *Tracer) pollConnections() {
 		return
 	}
 
+	log.Printf("D! coroot_servicemap: polled %d tcp connections", len(conns))
+
 	now := uint64(time.Now().UnixNano())
 	current := make(map[ConnectionID]Event, len(conns))
 
@@ -394,12 +406,13 @@ func (t *Tracer) pollConnections() {
 			continue
 		}
 
-		id := ConnectionID{FD: uint64(c.Fd), PID: uint32(c.Pid)}
+		fd := connectionFD(c)
+		id := ConnectionID{FD: fd, PID: uint32(c.Pid)}
 		e := Event{
 			Type:      EventTypeConnectionOpen,
 			Timestamp: now,
 			Pid:       uint32(c.Pid),
-			Fd:        uint64(c.Fd),
+			Fd:        fd,
 			SrcAddr:   endpoint(c.Laddr.IP, c.Laddr.Port),
 			DstAddr:   endpoint(c.Raddr.IP, c.Raddr.Port),
 			SrcPort:   uint16(c.Laddr.Port),
@@ -463,7 +476,18 @@ func isTrackedTCPConnection(c gopsnet.ConnectionStat) bool {
 		return false
 	}
 
-	return c.Fd > 0
+	return true
+}
+
+func connectionFD(c gopsnet.ConnectionStat) uint64 {
+	if c.Fd > 0 {
+		return uint64(c.Fd)
+	}
+
+	// 某些平台（如 macOS）可能无法拿到真实 fd，使用连接四元组生成稳定 ID。
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(fmt.Sprintf("%d|%s|%d|%s|%d", c.Pid, c.Laddr.IP, c.Laddr.Port, c.Raddr.IP, c.Raddr.Port)))
+	return h.Sum64()
 }
 
 func endpoint(ip string, port uint32) string {

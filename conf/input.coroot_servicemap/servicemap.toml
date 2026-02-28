@@ -1,10 +1,10 @@
 # Coroot Service Map Plugin Configuration
 # This plugin uses eBPF to trace TCP connections and build a service map
 
-[[instances]]
-# 采集间隔（秒）
-interval = 60
+# 采集间隔（秒）- 测试时设置为较短时间
+interval = 5
 
+[[instances]]
 # L7协议解析开关
 enable_l7_tracing = true
 enable_http = true
