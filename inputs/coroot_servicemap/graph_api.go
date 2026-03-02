@@ -21,10 +21,10 @@ import (
 
 // GraphResponse 是 /graph API 的顶层响应结构
 type GraphResponse struct {
-	GeneratedAt time.Time    `json:"generated_at"`
-	Summary     SummaryJSON  `json:"summary"`
-	Nodes       []NodeJSON   `json:"nodes"`
-	Edges       []EdgeJSON   `json:"edges"`
+	GeneratedAt time.Time   `json:"generated_at"`
+	Summary     SummaryJSON `json:"summary"`
+	Nodes       []NodeJSON  `json:"nodes"`
+	Edges       []EdgeJSON  `json:"edges"`
 }
 
 // NodeJSON 代表一个服务节点（通常是一个容器或进程）
@@ -40,9 +40,9 @@ type NodeJSON struct {
 // EdgeJSON 代表两个端点之间的一条有向连接
 type EdgeJSON struct {
 	// 边的标识
-	ID         string `json:"id"`           // "{source}->{target}"
-	Source     string `json:"source"`       // node ID
-	Target     string `json:"target"`       // "host:port"
+	ID         string `json:"id"`     // "{source}->{target}"
+	Source     string `json:"source"` // node ID
+	Target     string `json:"target"` // "host:port"
 	TargetHost string `json:"target_host"`
 	TargetPort string `json:"target_port"`
 
@@ -61,13 +61,13 @@ type EdgeJSON struct {
 
 // TCPStatsJSON TCP 连接统计
 type TCPStatsJSON struct {
-	ConnectsTotal         uint64  `json:"connects_total"`
-	ConnectFailedTotal    uint64  `json:"connect_failed_total"`
-	ActiveConnections     uint64  `json:"active_connections"`
-	RetransmitsTotal      uint64  `json:"retransmits_total"`
-	BytesSentTotal        uint64  `json:"bytes_sent_total"`
-	BytesReceivedTotal    uint64  `json:"bytes_received_total"`
-	AvgConnectDurationMs  float64 `json:"avg_connect_duration_ms,omitempty"`
+	ConnectsTotal        uint64  `json:"connects_total"`
+	ConnectFailedTotal   uint64  `json:"connect_failed_total"`
+	ActiveConnections    uint64  `json:"active_connections"`
+	RetransmitsTotal     uint64  `json:"retransmits_total"`
+	BytesSentTotal       uint64  `json:"bytes_sent_total"`
+	BytesReceivedTotal   uint64  `json:"bytes_received_total"`
+	AvgConnectDurationMs float64 `json:"avg_connect_duration_ms,omitempty"`
 }
 
 // HTTPEntryJSON 单个 (method, status) 组合的 HTTP 统计
@@ -93,8 +93,8 @@ type L7EntryJSON struct {
 
 // SummaryJSON 全局摘要，便于 AI/用户快速理解当前状态
 type SummaryJSON struct {
-	Nodes                  int `json:"nodes"`
-	Edges                  int `json:"edges"`
+	Nodes                   int `json:"nodes"`
+	Edges                   int `json:"edges"`
 	TracerActiveConnections int `json:"tracer_active_connections"`
 	TracerListenPorts       int `json:"tracer_listen_ports"`
 	TrackedContainers       int `json:"tracked_containers"`
