@@ -21,6 +21,7 @@ import (
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/perf"
+	"github.com/cilium/ebpf/rlimit"
 	gopsnet "github.com/shirou/gopsutil/v3/net"
 	"github.com/vishvananda/netns"
 	"golang.org/x/sys/unix"
@@ -262,11 +263,12 @@ func (t *Tracer) startFallbackMode() {
 
 // loadEBPF 加载eBPF程序（待实现）
 func (t *Tracer) loadEBPF() error {
-	// 设置资源限制
-	_ = unix.Setrlimit(unix.RLIMIT_MEMLOCK, &unix.Rlimit{
-		Cur: unix.RLIM_INFINITY,
-		Max: unix.RLIM_INFINITY,
-	})
+	// 移除 MEMLOCK 限制：
+	// - 内核 >= 5.11: 使用 cgroup 记账，无需修改 rlimit
+	// - 内核 <  5.11: 设置 RLIMIT_MEMLOCK = RLIM_INFINITY
+	if err := rlimit.RemoveMemlock(); err != nil {
+		log.Printf("W! servicemap: remove memlock rlimit failed (need CAP_SYS_RESOURCE?): %v", err)
+	}
 
 	program, err := getEmbeddedEBPFProgram(runtime.GOARCH)
 	if err != nil {
