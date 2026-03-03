@@ -61,6 +61,11 @@ type Registry struct {
 
 	stopChan chan struct{}
 	wg       sync.WaitGroup // P1-8: 追踪后台 goroutine
+
+	// pidCache 缓存 PID → cgroup-based container ID 的映射，避免重复读 /proc/<pid>/cgroup。
+	// 仅存储容器化进程的稳定 ID；裸进程不缓存（防止 PID 复用产生错误映射）。
+	// 由 r.mu 保护（所有访问路径均已持有 r.mu）。
+	pidCache map[uint32]string
 }
 
 // NewRegistry 创建新的容器注册表
@@ -72,6 +77,7 @@ func NewRegistry(ctx context.Context, tr *tracer.Tracer, config Config) (*Regist
 		containers:       make(map[string]*Container),
 		k8sContainerMeta: make(map[string]k8sContainerMeta),
 		stopChan:         make(chan struct{}),
+		pidCache:         make(map[uint32]string),
 	}
 
 	// P1-8: 监听 context 取消，自动触发关闭
@@ -155,17 +161,82 @@ func (r *Registry) handleEvents() {
 	}
 }
 
+// ─────────────────────────────────────────────────────────────
+// 裸进程支持：PID → container ID 解析
+// ─────────────────────────────────────────────────────────────
+
+// resolveContainerID 将 PID 映射为 container ID，始终返回非空字符串。
+// 必须在持有 r.mu 的情况下调用。
+// 优先级：
+//  1. pidCache（仅含 cgroup-based 稳定 ID）
+//  2. cgroup-based 容器发现（Docker / K8s 容器）→ 结果写入 pidCache
+//  3. 裸进程兜底："proc_<pid>[_<comm>]"（不缓存，防止 PID 复用污染）
+func (r *Registry) resolveContainerID(pid uint32) string {
+	if id, ok := r.pidCache[pid]; ok {
+		return id
+	}
+	if id := r.getContainerIDByPID(pid); id != "" {
+		r.pidCache[pid] = id
+		return id
+	}
+	return resolveProcID(pid)
+}
+
+// resolveProcID 为裸进程（非容器化）生成合成 container ID。
+// 格式：
+//   - "proc_<pid>_<comm>"（/proc/<pid>/comm 可读时）
+//   - "proc_<pid>"（否则，包括非 Linux 平台）
+func resolveProcID(pid uint32) string {
+	commPath := filepath.Join("/proc", fmt.Sprintf("%d", pid), "comm")
+	if b, err := os.ReadFile(commPath); err == nil {
+		comm := strings.TrimSpace(string(b))
+		comm = sanitizeProcLabel(comm)
+		if comm != "" {
+			return fmt.Sprintf("proc_%d_%s", pid, comm)
+		}
+	}
+	return fmt.Sprintf("proc_%d", pid)
+}
+
+// sanitizeProcLabel 将进程名中的非法字符替换为下划线，使其适合作为 Prometheus 标签值。
+func sanitizeProcLabel(s string) string {
+	return strings.Map(func(r rune) rune {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') ||
+			(r >= '0' && r <= '9') || r == '-' || r == '.' || r == '_' {
+			return r
+		}
+		return '_'
+	}, s)
+}
+
+// enrichProcContainer 从合成 ID（proc_<pid>[_<comm>]）中提取 PID 和进程名，
+// 填充裸进程容器的元数据，跳过 Docker / K8s API 查询。
+func enrichProcContainer(c *Container, id string) {
+	// id 格式: "proc_<pid>" 或 "proc_<pid>_<comm>"
+	// SplitN(..., 3) 最多切 3 段，第 3 段保留含下划线的完整进程名
+	parts := strings.SplitN(id, "_", 3)
+	if len(parts) >= 2 {
+		var pid uint32
+		if _, err := fmt.Sscanf(parts[1], "%d", &pid); err == nil {
+			c.PID = pid
+		}
+	}
+	if len(parts) >= 3 && parts[2] != "" {
+		c.Name = parts[2]
+	} else {
+		c.Name = id // 无进程名时用完整 ID 作为名称
+	}
+}
+
 // processEvent 处理单个事件
 func (r *Registry) processEvent(event *tracer.Event) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	// 根据PID查找或创建容器
-	containerID := r.getContainerIDByPID(event.Pid)
-	if containerID == "" {
-		// 未知容器，使用PID作为ID
-		containerID = "unknown"
-	}
+	// resolveContainerID 始终返回非空 ID：
+	//   容器化进程 → cgroup-based container ID
+	//   裸进程     → "proc_<pid>[_<comm>]"
+	containerID := r.resolveContainerID(event.Pid)
 
 	container := r.getOrCreateContainer(containerID)
 	if container == nil {
@@ -176,17 +247,15 @@ func (r *Registry) processEvent(event *tracer.Event) {
 	container.OnEvent(event)
 }
 
-// updateConnectionStats 更新连接统计
+// updateConnectionStats 更新连接统计（含裸进程的字节流量）
 func (r *Registry) updateConnectionStats() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	r.tracer.ForEachActiveConnection(func(connID tracer.ConnectionID, conn tracer.Connection) {
-		// 查找对应的容器
-		containerID := r.getContainerIDByPID(connID.PID)
-		if containerID == "" {
-			return
-		}
+		// resolveContainerID 对裸进程同样返回有效 ID（proc_<pid>[_<comm>]），
+		// 从而修复了裸进程字节流量统计被静默丢弃的问题。
+		containerID := r.resolveContainerID(connID.PID)
 
 		container := r.getOrCreateContainer(containerID)
 		if container == nil {
@@ -209,8 +278,13 @@ func (r *Registry) getOrCreateContainer(id string) *Container {
 	}
 
 	container := NewContainer(id)
-	r.enrichContainerMetadata(container)
-	r.enrichContainerWithK8sMetadata(container)
+	if strings.HasPrefix(id, "proc_") {
+		// 裸进程容器：从合成 ID 解析 PID 和进程名，跳过 Docker/K8s API 查询
+		enrichProcContainer(container, id)
+	} else {
+		r.enrichContainerMetadata(container)
+		r.enrichContainerWithK8sMetadata(container)
+	}
 	r.containers[id] = container
 	return container
 }
@@ -498,6 +572,8 @@ func (r *Registry) gcContainers() {
 
 	if expired > 0 {
 		log.Printf("D! coroot_servicemap: container GC cleaned %d expired containers, %d remaining", expired, len(r.containers))
+		// 清空 PID 缓存，防止 PID 复用后继续映射到已退出容器的旧 container ID
+		r.pidCache = make(map[uint32]string)
 	}
 }
 

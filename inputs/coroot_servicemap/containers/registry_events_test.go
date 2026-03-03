@@ -2,6 +2,7 @@ package containers
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -50,13 +51,13 @@ func TestRegistryLaunchBackground_Multiple(t *testing.T) {
 
 // ─── processEvent ─────────────────────────────────────────────
 
-func TestProcessEvent_NoCgroup_CreatesUnknownContainer(t *testing.T) {
-	// EnableCgroup=false → getContainerIDByPID 返回 "" → containerID="unknown"
+func TestProcessEvent_NoCgroup_CreatesProcContainer(t *testing.T) {
+	// EnableCgroup=false → getContainerIDByPID 返回 "" → resolveProcID(12345) → "proc_12345[_<comm>]"
 	r := newBareRegistry(Config{EnableCgroup: false})
 
 	ev := &tracer.Event{
 		Type:    tracer.EventTypeConnectionOpen,
-		Pid:     12345, // 任意 PID，不会读 /proc
+		Pid:     12345, // 任意 PID，不会命中 cgroup 路径
 		Fd:      1,
 		DstAddr: "10.0.0.1:3306",
 	}
@@ -66,8 +67,8 @@ func TestProcessEvent_NoCgroup_CreatesUnknownContainer(t *testing.T) {
 	if len(cs) != 1 {
 		t.Fatalf("expected 1 container, got %d", len(cs))
 	}
-	if cs[0].ID != "unknown" {
-		t.Errorf("expected container ID 'unknown', got %q", cs[0].ID)
+	if !strings.HasPrefix(cs[0].ID, "proc_") {
+		t.Errorf("expected container ID with 'proc_' prefix, got %q", cs[0].ID)
 	}
 }
 
@@ -80,12 +81,17 @@ func TestProcessEvent_ConnectionOpen_UpdatesTCPStats(t *testing.T) {
 		DstAddr: "192.168.1.1:5432",
 	})
 
-	r.mu.RLock()
-	c := r.containers["unknown"]
-	r.mu.RUnlock()
+	cs := r.GetContainers()
+	if len(cs) != 1 {
+		t.Fatalf("expected 1 container, got %d", len(cs))
+	}
+	c := cs[0]
+	if !strings.HasPrefix(c.ID, "proc_") {
+		t.Fatalf("expected proc_ container, got %q", c.ID)
+	}
 
 	if c == nil {
-		t.Fatal("container 'unknown' should exist")
+		t.Fatal("container should exist")
 	}
 	snap := c.GetTCPStatsSnapshot()
 	if _, ok := snap["192.168.1.1:5432"]; !ok {
@@ -97,11 +103,10 @@ func TestProcessEvent_MaxContainersReached_ReturnsNil(t *testing.T) {
 	// MaxContainers=1，先创建一个，再发 processEvent 触发第二个
 	r := newBareRegistry(Config{EnableCgroup: false, MaxContainers: 1})
 
-	// 先填满（ID="unknown" 已经创建）
+	// 先填满（创建 proc_0 容器）
 	r.processEvent(&tracer.Event{Type: tracer.EventTypeConnectionOpen, Fd: 1, DstAddr: "1.1.1.1:80"})
 
-	// 注入第二个不同 PID（但 EnableCgroup=false → 同样是 "unknown" → 返回 existing）
-	// 为了测试 MaxContainers 路径，手动更改 containers 中 "unknown" 的 ID 不可行
+	// 直接调用 getOrCreateContainer 触发 MaxContainers 上限检测
 	// 改为直接调用 getOrCreateContainer
 	r.mu.Lock()
 	got := r.getOrCreateContainer("second-container")
@@ -126,7 +131,7 @@ func TestProcessEvent_MultipleEvents_SameContainer(t *testing.T) {
 
 	cs := r.GetContainers()
 	if len(cs) != 1 {
-		t.Fatalf("expected 1 container (all pid=0 → 'unknown'), got %d", len(cs))
+		t.Fatalf("expected 1 container (all pid=0 → same proc_0 container), got %d", len(cs))
 	}
 	snap := cs[0].GetTCPStatsSnapshot()
 	if len(snap) != 3 {
@@ -161,7 +166,7 @@ func TestUpdateConnectionStats_WithActiveConns(t *testing.T) {
 	r := newBareRegistry(Config{EnableCgroup: false})
 	r.tracer = tr
 
-	// 在 registry 中创建 "unknown" 容器并打开一个连接
+	// 在 registry 中创建 proc_0（裸进程）容器并打开一个连接
 	r.processEvent(&tracer.Event{
 		Type:    tracer.EventTypeConnectionOpen,
 		Fd:      10,
@@ -293,10 +298,10 @@ func TestProcessEvent_ContainerNil_MaxContainersReached(t *testing.T) {
 		DstAddr: "10.0.0.1:80",
 	}
 
-	// 不应 panic，"unknown" 容器创建失败时静默跳过
+	// 不应 panic，"proc_0" 容器创建失败时静默跳过
 	r.processEvent(ev)
 
-	// 容器数应仍然为 1（"abc"），没有新建 "unknown"
+	// 容器数应仍然为 1（"abc"），没有新建 proc_0
 	cs := r.GetContainers()
 	if len(cs) != 1 || cs[0].ID != "abc" {
 		t.Errorf("expected only 'abc' container, got %d containers", len(cs))
