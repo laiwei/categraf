@@ -75,6 +75,11 @@ type Event struct {
 	SrcPort   uint16
 	DstPort   uint16
 
+	// Comm 进程名（comm），在事件产生时尽早读取 /proc/<pid>/comm 填充。
+	// 目的：eBPF 事件通过 eventChan 传递到 registry 时进程可能已退出，
+	// 提前读取可最大化成功率。若为空表示读取失败或 PID=0。
+	Comm string
+
 	// P2-9: L7 请求数据（仅当 Type == EventTypeL7Request 时有效）
 	L7Request *l7.RequestData
 }
@@ -248,6 +253,11 @@ func (t *Tracer) Start() error {
 		t.startFallbackMode()
 		return nil
 	}
+
+	// 初始扫描：捕获 eBPF 加载前已存在的 TCP 连接和监听端口。
+	// eBPF kprobe 只能捕获 attach 之后发生的事件，预存连接对 kprobe 不可见。
+	// 使用 gopsutil （而非 netlink）因为需要 PID 信息。
+	t.seedExistingConnections()
 
 	t.launchBackground(t.startConnectionGC)
 	log.Println("I! servicemap: eBPF tracer started")
@@ -423,6 +433,15 @@ func (t *Tracer) runEventReader(r *perf.Reader) {
 			continue
 		}
 
+		// 尽早读取进程名：此时距内核事件发生仅有极短延迟，进程大概率仍然存活。
+		// 等事件通过 eventChan 传递到 registry 时，短命进程可能已退出。
+		if event.Pid > 0 {
+			event.Comm = readProcComm(event.Pid)
+		}
+
+		// eBPF 模式下追踪活跃连接（使 ActiveConnectionCount/ForEachActiveConnection 工作）
+		t.trackConnectionEvent(event)
+
 		// P0-4: 处理 ListenOpen/ListenClose 事件
 		t.handleListenEvent(event)
 
@@ -545,6 +564,105 @@ func (t *Tracer) handleListenEvent(event *Event) {
 		t.listenMu.Lock()
 		delete(t.listenPorts, key)
 		t.listenMu.Unlock()
+	}
+}
+
+// seedExistingConnections 在 eBPF 启动后一次性扫描当前系统 TCP 连接和监听端口。
+// eBPF kprobe 只能捕获 attach 之后新发生的事件，预存连接对 kprobe 不可见。
+// 使用 gopsutil（而非 netlink）因为需要 PID 信息来将连接映射到容器/进程。
+func (t *Tracer) seedExistingConnections() {
+	conns, err := gopsnet.Connections("tcp")
+	if err != nil {
+		log.Printf("W! servicemap: seed existing connections failed: %v", err)
+		return
+	}
+
+	now := time.Now()
+	nowNano := uint64(now.UnixNano())
+	connCount := 0
+	listenCount := 0
+
+	for _, c := range conns {
+		pid := uint32(c.Pid)
+		comm := readProcComm(pid)
+
+		if strings.ToUpper(c.Status) == "LISTEN" {
+			event := Event{
+				Type:      EventTypeListenOpen,
+				Timestamp: nowNano,
+				Pid:       pid,
+				SrcAddr:   endpoint(c.Laddr.IP, c.Laddr.Port),
+				SrcPort:   uint16(c.Laddr.Port),
+				Comm:      comm,
+			}
+			t.handleListenEvent(&event)
+			select {
+			case t.eventChan <- event:
+			default:
+			}
+			listenCount++
+			continue
+		}
+
+		if !isTrackedTCPConnection(c) {
+			continue
+		}
+
+		fd := connectionFD(c)
+		id := ConnectionID{FD: fd, PID: pid}
+		event := Event{
+			Type:      EventTypeConnectionOpen,
+			Timestamp: nowNano,
+			Pid:       pid,
+			Fd:        fd,
+			SrcAddr:   endpoint(c.Laddr.IP, c.Laddr.Port),
+			DstAddr:   endpoint(c.Raddr.IP, c.Raddr.Port),
+			SrcPort:   uint16(c.Laddr.Port),
+			DstPort:   uint16(c.Raddr.Port),
+			Comm:      comm,
+		}
+
+		// 也记录到 activeConns，使 ActiveConnectionCount() 和 ForEachActiveConnection() 工作
+		t.activeConnMu.Lock()
+		t.activeConns[id] = Connection{
+			Timestamp: nowNano,
+			LastSeen:  now,
+		}
+		t.activeConnMu.Unlock()
+
+		select {
+		case t.eventChan <- event:
+		default:
+		}
+		connCount++
+	}
+
+	log.Printf("I! servicemap: seeded %d existing connections, %d listen ports", connCount, listenCount)
+}
+
+// trackConnectionEvent 从 eBPF 事件中追踪连接状态，填充 activeConns。
+// 在轮询模式中 activeConns 由 pollConnections 维护；
+// 在 eBPF 模式中需要通过此方法从事件流中维护。
+func (t *Tracer) trackConnectionEvent(event *Event) {
+	switch event.Type {
+	case EventTypeConnectionOpen:
+		id := ConnectionID{FD: event.Fd, PID: event.Pid}
+		t.activeConnMu.Lock()
+		if t.activeConns != nil {
+			if t.maxActiveConns <= 0 || len(t.activeConns) < t.maxActiveConns {
+				t.activeConns[id] = Connection{
+					Timestamp: event.Timestamp,
+					LastSeen:  time.Now(),
+				}
+			}
+		}
+		t.activeConnMu.Unlock()
+
+	case EventTypeConnectionClose:
+		id := ConnectionID{FD: event.Fd, PID: event.Pid}
+		t.activeConnMu.Lock()
+		delete(t.activeConns, id)
+		t.activeConnMu.Unlock()
 	}
 }
 
@@ -835,16 +953,18 @@ func (t *Tracer) collectFromGopsutil(
 		}
 
 		fd := connectionFD(c)
-		id := ConnectionID{FD: fd, PID: uint32(c.Pid)}
+		pid := uint32(c.Pid)
+		id := ConnectionID{FD: fd, PID: pid}
 		e := Event{
 			Type:      EventTypeConnectionOpen,
 			Timestamp: nowNano,
-			Pid:       uint32(c.Pid),
+			Pid:       pid,
 			Fd:        fd,
 			SrcAddr:   endpoint(c.Laddr.IP, c.Laddr.Port),
 			DstAddr:   endpoint(c.Raddr.IP, c.Raddr.Port),
 			SrcPort:   uint16(c.Laddr.Port),
 			DstPort:   uint16(c.Raddr.Port),
+			Comm:      readProcComm(pid),
 		}
 		current[id] = e
 	}
@@ -953,4 +1073,25 @@ func checkKernelVersion() error {
 	log.Printf("I! servicemap: kernel version check passed")
 
 	return nil
+}
+
+// readProcComm 读取 /proc/<pid>/comm 并返回 sanitized 的进程名。
+// 读取失败（进程已退出、非 Linux 等）时返回空字符串。
+func readProcComm(pid uint32) string {
+	if pid == 0 {
+		return ""
+	}
+	b, err := os.ReadFile(fmt.Sprintf("/proc/%d/comm", pid))
+	if err != nil {
+		return ""
+	}
+	comm := strings.TrimSpace(string(b))
+	// sanitize: 保留字母、数字、-._
+	return strings.Map(func(r rune) rune {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') ||
+			(r >= '0' && r <= '9') || r == '-' || r == '.' || r == '_' {
+			return r
+		}
+		return '_'
+	}, comm)
 }

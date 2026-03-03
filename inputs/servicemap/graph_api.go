@@ -107,26 +107,25 @@ type SummaryJSON struct {
 // BuildGraph 从当前 registry 快照构建完整的 Graph 响应。
 // 此方法线程安全（所有读取均通过快照方法）。
 func (ins *Instance) BuildGraph() GraphResponse {
-	resp := GraphResponse{
-		GeneratedAt: time.Now(),
-		Nodes:       []NodeJSON{},
-		Edges:       []EdgeJSON{},
+	if ins.registry == nil {
+		return GraphResponse{
+			GeneratedAt: time.Now(),
+			Nodes:       []NodeJSON{},
+			Edges:       []EdgeJSON{},
+		}
 	}
 
-	// 收集 tracer 层面的摘要数据
+	cs := ins.registry.GetContainers()
+	resp := ins.buildGraphWithContainers(cs)
+
+	// 收集 tracer 层面的摘要数据（在 buildGraphWithContainers 之后设置，避免被覆盖）
 	if ins.tracer != nil {
 		resp.Summary.TracerActiveConnections = ins.tracer.ActiveConnectionCount()
 		resp.Summary.TracerListenPorts = len(ins.tracer.GetListenPorts())
 	}
-
-	if ins.registry == nil {
-		return resp
-	}
-
-	cs := ins.registry.GetContainers()
 	resp.Summary.TrackedContainers = len(cs)
 
-	return ins.buildGraphWithContainers(cs)
+	return resp
 }
 
 // buildGraphWithContainers 从给定容器切片构建 Graph，方便测试直接注入数据。

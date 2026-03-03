@@ -279,20 +279,17 @@ func (r *Registry) processEvent(event *tracer.Event) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
+	// 所有事件类型：如果携带了进程名（tracer 层尽早读取），更新 commCache。
+	// 这保证了即使 ProcessStart 与 ConnectionOpen 跨 CPU 乱序到达，
+	// ConnectionOpen 自身携带的 Comm 也能被缓存供 resolveContainerID 使用。
+	if event.Pid > 0 && event.Comm != "" {
+		r.commCache[event.Pid] = event.Comm
+	}
+
 	switch event.Type {
 	case tracer.EventTypeProcessStart:
-		// fork 时进程一定存活 → 预热 commCache，供后续连接事件查询。
+		// fork 事件仅用于预热 commCache（已在上方统一处理）。
 		// 不创建容器（fork 不代表有 TCP 活动）。
-		if event.Pid > 0 {
-			commPath := filepath.Join("/proc", fmt.Sprintf("%d", event.Pid), "comm")
-			if b, err := os.ReadFile(commPath); err == nil {
-				comm := strings.TrimSpace(string(b))
-				comm = sanitizeProcLabel(comm)
-				if comm != "" {
-					r.commCache[event.Pid] = comm
-				}
-			}
-		}
 		return
 
 	case tracer.EventTypeProcessExit:
