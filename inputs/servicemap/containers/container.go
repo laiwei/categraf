@@ -76,6 +76,7 @@ type Container struct {
 type ConnectionTracker struct {
 	Destination   string
 	OpenTime      time.Time
+	LastSeen      time.Time // 最后一次被 UpdateTrafficStats 或 Open 触及的时间
 	BytesSent     uint64
 	BytesReceived uint64
 }
@@ -122,9 +123,11 @@ func (c *Container) onConnectionOpen(event *tracer.Event) {
 	}
 
 	// 记录活跃连接
+	now := time.Now()
 	c.activeConnections[event.Fd] = &ConnectionTracker{
 		Destination: dest,
-		OpenTime:    time.Now(),
+		OpenTime:    now,
+		LastSeen:    now,
 	}
 
 	// 按目标地址分类连接
@@ -230,6 +233,7 @@ func (c *Container) UpdateTrafficStats(fd uint64, sent, received uint64) {
 	// 更新连接记录
 	conn.BytesSent = sent
 	conn.BytesReceived = received
+	conn.LastSeen = time.Now()
 
 	// 更新对应 destination 的统计
 	if conn.Destination == "" {
@@ -448,4 +452,37 @@ func (c *Container) ActiveConnectionCount() int {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return len(c.activeConnections)
+}
+
+// GCStaleConnections 清理长时间没有任何流量更新的「僵尸」连接。
+// 场景：eBPF ConnectionClose 事件丢失（perf buffer 溢出）或 seed 阶段创建的连接
+// 与 eBPF 的 FD（sk_ptr）不匹配，导致 activeConnections 永远无法通过 onConnectionClose 清除。
+// 返回清理数量。
+func (c *Container) GCStaleConnections(maxAge time.Duration) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	now := time.Now()
+	cleaned := 0
+	for fd, conn := range c.activeConnections {
+		if now.Sub(conn.LastSeen) < maxAge {
+			continue
+		}
+		// 清理统计中的 ActiveConnections 计数
+		if stats, ok := c.TCPStats[conn.Destination]; ok && stats.ActiveConnections > 0 {
+			stats.ActiveConnections--
+		}
+		// 从目标地址连接列表中删除
+		if fds := c.connectionsByDest[conn.Destination]; len(fds) > 0 {
+			for i, f := range fds {
+				if f == fd {
+					c.connectionsByDest[conn.Destination] = append(fds[:i], fds[i+1:]...)
+					break
+				}
+			}
+		}
+		delete(c.activeConnections, fd)
+		cleaned++
+	}
+	return cleaned
 }

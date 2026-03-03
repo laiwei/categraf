@@ -31,14 +31,15 @@ import (
 type EventType uint32
 
 const (
-	EventTypeProcessStart    EventType = 1
-	EventTypeProcessExit     EventType = 2
-	EventTypeConnectionOpen  EventType = 3
-	EventTypeConnectionClose EventType = 4
-	EventTypeTCPRetransmit   EventType = 5
-	EventTypeListenOpen      EventType = 6
-	EventTypeListenClose     EventType = 7
-	EventTypeL7Request       EventType = 10 // P2-9: L7 协议事件
+	EventTypeProcessStart       EventType = 1
+	EventTypeProcessExit        EventType = 2
+	EventTypeConnectionOpen     EventType = 3
+	EventTypeConnectionClose    EventType = 4
+	EventTypeTCPRetransmit      EventType = 5
+	EventTypeListenOpen         EventType = 6
+	EventTypeListenClose        EventType = 7
+	EventTypeConnectionAccepted EventType = 8  // 服务端 accept 的被动连接
+	EventTypeL7Request          EventType = 10 // P2-9: L7 协议事件
 )
 
 func (t EventType) String() string {
@@ -57,6 +58,8 @@ func (t EventType) String() string {
 		return "ListenClose"
 	case EventTypeTCPRetransmit:
 		return "TCPRetransmit"
+	case EventTypeConnectionAccepted:
+		return "ConnectionAccepted"
 	case EventTypeL7Request:
 		return "L7Request"
 	default:
@@ -610,8 +613,22 @@ func (t *Tracer) seedExistingConnections() {
 
 		fd := connectionFD(c)
 		id := ConnectionID{FD: fd, PID: pid}
+
+		// 区分主动连接 vs 被动连接：
+		// 如果本地端口是已知监听端口，说明这是服务端 accept 的被动连接，
+		// 使用 ConnectionAccepted 类型避免生成反向边。
+		evType := EventTypeConnectionOpen
+		t.listenMu.RLock()
+		for lk := range t.listenPorts {
+			if lk.Port == uint16(c.Laddr.Port) {
+				evType = EventTypeConnectionAccepted
+				break
+			}
+		}
+		t.listenMu.RUnlock()
+
 		event := Event{
-			Type:      EventTypeConnectionOpen,
+			Type:      evType,
 			Timestamp: nowNano,
 			Pid:       pid,
 			Fd:        fd,
@@ -645,7 +662,7 @@ func (t *Tracer) seedExistingConnections() {
 // 在 eBPF 模式中需要通过此方法从事件流中维护。
 func (t *Tracer) trackConnectionEvent(event *Event) {
 	switch event.Type {
-	case EventTypeConnectionOpen:
+	case EventTypeConnectionOpen, EventTypeConnectionAccepted:
 		id := ConnectionID{FD: event.Fd, PID: event.Pid}
 		t.activeConnMu.Lock()
 		if t.activeConns != nil {
@@ -849,6 +866,14 @@ func (t *Tracer) pollConnections() int {
 			continue
 		}
 
+		// 被动连接（ConnectionAccepted）的关闭无需通知 registry：
+		// 其 Open 事件未经 OnEvent（无 TCPStats），close 事件也无需清理。
+		// 仅主动连接（ConnectionOpen）需要发出 Close 事件以更新统计。
+		if old.Type == EventTypeConnectionAccepted {
+			delete(t.activeConns, id)
+			continue
+		}
+
 		old.Type = EventTypeConnectionClose
 		old.Timestamp = nowNano
 		t.emitEventLocked(old)
@@ -893,8 +918,18 @@ func (t *Tracer) collectFromNetlink(
 		// netlink 不返回 PID/FD，使用 inode 作为稳定 FD 替代
 		fd := uint64(dc.Inode)
 		id := ConnectionID{FD: fd, PID: 0}
+
+		// 区分主动 vs 被动连接：本地端口匹配监听端口则为被动连接
+		evType := EventTypeConnectionOpen
+		for lk := range discoveredListens {
+			if lk.Port == dc.SrcPort {
+				evType = EventTypeConnectionAccepted
+				break
+			}
+		}
+
 		e := Event{
-			Type:      EventTypeConnectionOpen,
+			Type:      evType,
 			Timestamp: nowNano,
 			Pid:       0, // netlink 不提供 PID（需额外 INET_DIAG_INFO 查询，此处暂不实现）
 			Fd:        fd,
@@ -955,8 +990,18 @@ func (t *Tracer) collectFromGopsutil(
 		fd := connectionFD(c)
 		pid := uint32(c.Pid)
 		id := ConnectionID{FD: fd, PID: pid}
+
+		// 区分主动 vs 被动连接：本地端口匹配监听端口则为被动连接
+		evType := EventTypeConnectionOpen
+		for lk := range discoveredListens {
+			if lk.Port == uint16(c.Laddr.Port) {
+				evType = EventTypeConnectionAccepted
+				break
+			}
+		}
+
 		e := Event{
-			Type:      EventTypeConnectionOpen,
+			Type:      evType,
 			Timestamp: nowNano,
 			Pid:       pid,
 			Fd:        fd,

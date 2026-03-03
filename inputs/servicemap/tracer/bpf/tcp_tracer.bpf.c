@@ -17,6 +17,7 @@ enum event_type {
 	EVENT_TCP_RETRANSMIT = 5,
 	EVENT_LISTEN_OPEN = 6,
 	EVENT_LISTEN_CLOSE = 7,
+	EVENT_CONNECTION_ACCEPTED = 8,  // 服务端 accept 的被动连接（与 OPEN 区分方向）
 };
 
 // 与 Go 端 Event 结构对应
@@ -117,33 +118,67 @@ int BPF_KPROBE(tcp_connect, struct sock *sk) {
 }
 
 // Hook tcp_set_state - 连接状态变化
+// 捕获两种状态转换：
+//   TCP_ESTABLISHED (1): 服务端 accept 完成的被动连接（tcp_connect 主动发起的连接已有 kprobe 覆盖）
+//   TCP_CLOSE (7):       连接关闭
 SEC("kprobe/tcp_set_state")
 int BPF_KPROBE(tcp_set_state, struct sock *sk, int state) {
-	// state == TCP_CLOSE (7)
-	if (state != 7)
-		return 0;
-
-	struct event e = {};
-	e.type = EVENT_CONNECTION_CLOSE;
-
-	fill_addr_from_sock(sk, &e);
-
-	// 查找并删除活跃连接（从 map 中取回 connect 时保存的 PID）
 	struct conn_key key = {
 		.sk_ptr = (__u64)sk,
 	};
-	struct conn_info *info = bpf_map_lookup_elem(&active_connections, &key);
-	if (info) {
-		e.pid = info->pid;  // 使用 connect 时保存的 PID，而非当前上下文的随机 PID
-		e.bytes_sent = info->bytes_sent;
-		e.bytes_received = info->bytes_received;
-		bpf_map_delete_elem(&active_connections, &key);
-	} else {
-		// map 中找不到，fallback 到当前上下文 PID（可能不准确）
+
+	if (state == 1) {
+		// TCP_ESTABLISHED — 仅处理被动接受的连接（服务端）。
+		// tcp_connect 发起的主动连接已经在 kprobe/tcp_connect 中写入了 active_connections，
+		// 如果 map 中已有此 sk_ptr 则说明是主动连接，跳过以避免重复 Open 事件。
+		struct conn_info *existing = bpf_map_lookup_elem(&active_connections, &key);
+		if (existing)
+			return 0;  // 主动连接，已由 tcp_connect 处理
+
+		// 被动连接（accept）：创建 Accepted 事件（与主动 Open 区分方向）
+		struct event e = {};
+		e.type = EVENT_CONNECTION_ACCEPTED;
 		e.pid = bpf_get_current_pid_tgid() >> 32;
+
+		fill_addr_from_sock(sk, &e);
+
+		// 保存到 active_connections，供 close 时取回 PID 和地址
+		struct conn_info info = {};
+		info.pid = e.pid;
+		__builtin_memcpy(info.src_addr, e.src_addr, sizeof(info.src_addr));
+		__builtin_memcpy(info.dst_addr, e.dst_addr, sizeof(info.dst_addr));
+		info.src_port = e.src_port;
+		info.dst_port = e.dst_port;
+		info.family = e.family;
+		bpf_map_update_elem(&active_connections, &key, &info, BPF_ANY);
+
+		send_event(ctx, &e);
+		return 0;
 	}
 
-	send_event(ctx, &e);
+	if (state == 7) {
+		// TCP_CLOSE — 连接关闭
+		struct event e = {};
+		e.type = EVENT_CONNECTION_CLOSE;
+
+		fill_addr_from_sock(sk, &e);
+
+		// 查找并删除活跃连接（从 map 中取回 connect/accept 时保存的 PID）
+		struct conn_info *info = bpf_map_lookup_elem(&active_connections, &key);
+		if (info) {
+			e.pid = info->pid;
+			e.bytes_sent = info->bytes_sent;
+			e.bytes_received = info->bytes_received;
+			bpf_map_delete_elem(&active_connections, &key);
+		} else {
+			// map 中找不到，fallback 到当前上下文 PID（可能不准确）
+			e.pid = bpf_get_current_pid_tgid() >> 32;
+		}
+
+		send_event(ctx, &e);
+		return 0;
+	}
+
 	return 0;
 }
 

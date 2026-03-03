@@ -72,6 +72,12 @@ type Registry struct {
 	// 后续 ConnectionOpen 事件到达时进程可能已退出，直接查缓存即可。
 	// ProcessExit 时清理。由 r.mu 保护。
 	commCache map[uint32]string
+
+	// listenPorts 当前已知的监听端口集合。
+	// 由 ListenOpen/ListenClose 事件维护，用于判断重传事件的方向性：
+	// 如果重传事件的 SrcPort 匹配监听端口，说明是服务端重传（被动连接），
+	// 应跳过 OnEvent 避免生成反向边。由 r.mu 保护。
+	listenPorts map[uint16]struct{}
 }
 
 // NewRegistry 创建新的容器注册表
@@ -85,6 +91,7 @@ func NewRegistry(ctx context.Context, tr *tracer.Tracer, config Config) (*Regist
 		stopChan:         make(chan struct{}),
 		pidCache:         make(map[uint32]string),
 		commCache:        make(map[uint32]string),
+		listenPorts:      make(map[uint16]struct{}),
 	}
 
 	// P1-8: 监听 context 取消，自动触发关闭
@@ -299,8 +306,18 @@ func (r *Registry) processEvent(event *tracer.Event) {
 		return
 
 	case tracer.EventTypeConnectionOpen, tracer.EventTypeConnectionClose,
-		tracer.EventTypeTCPRetransmit, tracer.EventTypeL7Request:
-		// 仅连接相关事件需要创建/查找容器
+		tracer.EventTypeTCPRetransmit, tracer.EventTypeL7Request,
+		tracer.EventTypeListenOpen, tracer.EventTypeListenClose,
+		tracer.EventTypeConnectionAccepted:
+		// 连接相关事件 + 监听事件 + 被动连接事件均需要创建/查找容器
+		// ListenOpen 使服务端进程在开始监听时即可见于拓扑图
+		// ConnectionAccepted 使服务端可见但不生成反向边
+		// 维护 listenPorts 集合（用于重传方向性判断）
+		if event.Type == tracer.EventTypeListenOpen && event.SrcPort > 0 {
+			r.listenPorts[event.SrcPort] = struct{}{}
+		} else if event.Type == tracer.EventTypeListenClose && event.SrcPort > 0 {
+			delete(r.listenPorts, event.SrcPort)
+		}
 
 	default:
 		return
@@ -317,6 +334,20 @@ func (r *Registry) processEvent(event *tracer.Event) {
 	}
 
 	// 处理事件（包括 L4 和 L7 事件类型）
+	// ConnectionAccepted 仅创建容器节点，不记录 TCPStats（避免生成反向边）
+	if event.Type == tracer.EventTypeConnectionAccepted {
+		container.LastActivity = time.Now()
+		return
+	}
+	// 服务端重传（SrcPort 匹配监听端口）：仅更新活跃时间，不记录 TCPStats。
+	// tcp_retransmit_skb 对被动连接填充的 DstAddr 是客户端地址，
+	// 若调用 OnEvent 会在 TCPStats[client:port] 生成反向边。
+	if event.Type == tracer.EventTypeTCPRetransmit && event.SrcPort > 0 {
+		if _, isListen := r.listenPorts[event.SrcPort]; isListen {
+			container.LastActivity = time.Now()
+			return
+		}
+	}
 	container.OnEvent(event)
 }
 
@@ -629,6 +660,18 @@ func (r *Registry) gcContainers() {
 	defer r.mu.Unlock()
 
 	now := time.Now()
+
+	// 第一步：清理各容器内的「僵尸」连接
+	// （ConnectionClose 事件丢失或 FD 不匹配导致 activeConnections 永远不为 0）
+	staleConns := 0
+	for _, c := range r.containers {
+		staleConns += c.GCStaleConnections(containerTimeout)
+	}
+	if staleConns > 0 {
+		log.Printf("D! servicemap: GC cleaned %d stale connections across containers", staleConns)
+	}
+
+	// 第二步：清理无活跃连接且长时间不活跃的容器
 	expired := 0
 	for id, c := range r.containers {
 		// 跳过有活跃连接的容器

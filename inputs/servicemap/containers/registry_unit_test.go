@@ -22,6 +22,7 @@ func newBareRegistry(cfg Config) *Registry {
 		stopChan:         make(chan struct{}),
 		pidCache:         make(map[uint32]string),
 		commCache:        make(map[uint32]string),
+		listenPorts:      make(map[uint16]struct{}),
 	}
 }
 
@@ -146,8 +147,8 @@ func TestGcContainers_KeepsActiveConnections(t *testing.T) {
 	// 容器超时，但有活跃连接，不应被 GC
 	c := NewContainer("active")
 	c.LastActivity = time.Now().Add(-(containerTimeout + time.Hour))
-	// 注入活跃连接
-	c.activeConnections[1] = &ConnectionTracker{Destination: "10.0.0.1:80"}
+	// 注入活跃连接（LastSeen 为当前时间，不会被 GCStaleConnections 清理）
+	c.activeConnections[1] = &ConnectionTracker{Destination: "10.0.0.1:80", LastSeen: time.Now()}
 	r.containers["active"] = c
 
 	r.gcContainers()

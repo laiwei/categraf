@@ -2,7 +2,6 @@ package containers
 
 import (
 	"context"
-	"os"
 	"strings"
 	"testing"
 	"time"
@@ -389,25 +388,24 @@ func TestProcessEvent_ProcessExit_CleansPidCache(t *testing.T) {
 }
 
 func TestProcessEvent_ProcessStart_PrewarmsCommCache(t *testing.T) {
-	if _, err := os.Stat("/proc/self/comm"); err != nil {
-		t.Skip("skipping: /proc/<pid>/comm not available on this platform")
-	}
-
 	r := newBareRegistry(Config{EnableCgroup: false})
 
-	// 用当前进程的 PID（一定存活，comm 可读）
-	pid := uint32(os.Getpid())
+	// 模拟 tracer 层行为：事件在产生时（runEventReader / collectFromGopsutil）
+	// 已经读取了 /proc/<pid>/comm 并填入 event.Comm 字段。
+	// processEvent 直接使用该字段写入 commCache，不再自己读 /proc。
+	pid := uint32(99999)
 	r.processEvent(&tracer.Event{
 		Type: tracer.EventTypeProcessStart,
 		Pid:  pid,
+		Comm: "test_proc",
 	})
 
 	r.mu.RLock()
 	comm, ok := r.commCache[pid]
 	r.mu.RUnlock()
 
-	if !ok || comm == "" {
-		t.Errorf("ProcessStart should pre-warm commCache for living PID %d, got ok=%v comm=%q", pid, ok, comm)
+	if !ok || comm != "test_proc" {
+		t.Errorf("ProcessStart should pre-warm commCache from event.Comm, got ok=%v comm=%q", ok, comm)
 	}
 }
 
@@ -437,5 +435,237 @@ func TestProcessEvent_UnknownType_Ignored(t *testing.T) {
 	cs := r.GetContainers()
 	if len(cs) != 0 {
 		t.Errorf("unknown event type should not create container, got %d", len(cs))
+	}
+}
+
+// ─── 方向性测试 ────────────────────────────────────────────────
+
+func TestProcessEvent_ConnectionAccepted_NoTCPStats(t *testing.T) {
+	// 被动连接（ConnectionAccepted）应创建容器节点但不生成 TCPStats（避免反向边）
+	r := newBareRegistry(Config{EnableCgroup: false})
+
+	r.processEvent(&tracer.Event{
+		Type:    tracer.EventTypeConnectionAccepted,
+		Pid:     100,
+		Fd:      10,
+		SrcAddr: "10.0.0.1:8080",
+		DstAddr: "10.0.0.2:54321",
+		SrcPort: 8080,
+		DstPort: 54321,
+		Comm:    "myserver",
+	})
+
+	cs := r.GetContainers()
+	if len(cs) != 1 {
+		t.Fatalf("expected 1 container, got %d", len(cs))
+	}
+
+	snap := cs[0].GetTCPStatsSnapshot()
+	if len(snap) != 0 {
+		t.Errorf("ConnectionAccepted should NOT generate TCPStats, got %d entries: %v", len(snap), snap)
+	}
+}
+
+func TestProcessEvent_ListenOpen_TracksPort(t *testing.T) {
+	// ListenOpen 事件应维护 listenPorts 集合
+	r := newBareRegistry(Config{EnableCgroup: false})
+
+	r.processEvent(&tracer.Event{
+		Type:    tracer.EventTypeListenOpen,
+		Pid:     200,
+		SrcAddr: "0.0.0.0:9090",
+		SrcPort: 9090,
+		Comm:    "myserver",
+	})
+
+	r.mu.RLock()
+	_, found := r.listenPorts[9090]
+	r.mu.RUnlock()
+
+	if !found {
+		t.Error("ListenOpen should add port 9090 to listenPorts")
+	}
+}
+
+func TestProcessEvent_ListenClose_RemovesPort(t *testing.T) {
+	r := newBareRegistry(Config{EnableCgroup: false})
+
+	// 先打开监听
+	r.processEvent(&tracer.Event{
+		Type:    tracer.EventTypeListenOpen,
+		Pid:     200,
+		SrcAddr: "0.0.0.0:9090",
+		SrcPort: 9090,
+	})
+	// 再关闭
+	r.processEvent(&tracer.Event{
+		Type:    tracer.EventTypeListenClose,
+		Pid:     200,
+		SrcPort: 9090,
+	})
+
+	r.mu.RLock()
+	_, found := r.listenPorts[9090]
+	r.mu.RUnlock()
+
+	if found {
+		t.Error("ListenClose should remove port 9090 from listenPorts")
+	}
+}
+
+func TestProcessEvent_ServerRetransmit_NoTCPStats(t *testing.T) {
+	// 服务端重传（SrcPort 匹配监听端口）不应生成 TCPStats，避免反向边
+	r := newBareRegistry(Config{EnableCgroup: false})
+
+	// 先注册监听端口
+	r.processEvent(&tracer.Event{
+		Type:    tracer.EventTypeListenOpen,
+		Pid:     300,
+		SrcAddr: "0.0.0.0:8080",
+		SrcPort: 8080,
+		Comm:    "server",
+	})
+
+	// 模拟服务端重传：SrcPort=8080 (监听端口), DstAddr 是客户端
+	r.processEvent(&tracer.Event{
+		Type:    tracer.EventTypeTCPRetransmit,
+		Pid:     300,
+		SrcAddr: "10.0.0.1:8080",
+		DstAddr: "10.0.0.2:54321",
+		SrcPort: 8080,
+		DstPort: 54321,
+		Comm:    "server",
+	})
+
+	cs := r.GetContainers()
+	if len(cs) != 1 {
+		t.Fatalf("expected 1 container, got %d", len(cs))
+	}
+
+	snap := cs[0].GetTCPStatsSnapshot()
+	if len(snap) != 0 {
+		t.Errorf("server-side retransmit should NOT generate TCPStats, got %d entries: %v", len(snap), snap)
+	}
+}
+
+func TestProcessEvent_ClientRetransmit_HasTCPStats(t *testing.T) {
+	// 客户端重传（SrcPort 不匹配任何监听端口）应正常记录到 TCPStats
+	r := newBareRegistry(Config{EnableCgroup: false})
+
+	// 先打开连接（主动连接）
+	r.processEvent(&tracer.Event{
+		Type:    tracer.EventTypeConnectionOpen,
+		Pid:     400,
+		Fd:      20,
+		SrcAddr: "10.0.0.1:54321",
+		DstAddr: "10.0.0.2:8080",
+		SrcPort: 54321,
+		DstPort: 8080,
+		Comm:    "client",
+	})
+
+	// 客户端重传：SrcPort=54321（临时端口，不是监听端口）
+	r.processEvent(&tracer.Event{
+		Type:    tracer.EventTypeTCPRetransmit,
+		Pid:     400,
+		SrcAddr: "10.0.0.1:54321",
+		DstAddr: "10.0.0.2:8080",
+		SrcPort: 54321,
+		DstPort: 8080,
+		Comm:    "client",
+	})
+
+	cs := r.GetContainers()
+	if len(cs) != 1 {
+		t.Fatalf("expected 1 container, got %d", len(cs))
+	}
+
+	snap := cs[0].GetTCPStatsSnapshot()
+	stats, ok := snap["10.0.0.2:8080"]
+	if !ok {
+		t.Fatal("expected TCPStats entry for 10.0.0.2:8080")
+	}
+	if stats.Retransmissions != 1 {
+		t.Errorf("expected 1 retransmission, got %d", stats.Retransmissions)
+	}
+}
+
+func TestProcessEvent_DirectionIntegration(t *testing.T) {
+	// 完整场景：服务端监听 → 客户端连接 → 服务端被动接受 → 只有客户端边
+	r := newBareRegistry(Config{EnableCgroup: false})
+
+	// 1. 服务端监听
+	r.processEvent(&tracer.Event{
+		Type:    tracer.EventTypeListenOpen,
+		Pid:     500,
+		SrcAddr: "10.0.0.1:3306",
+		SrcPort: 3306,
+		Comm:    "mysqld",
+	})
+
+	// 2. 客户端主动连接到 MySQL
+	r.processEvent(&tracer.Event{
+		Type:    tracer.EventTypeConnectionOpen,
+		Pid:     600,
+		Fd:      30,
+		SrcAddr: "10.0.0.2:54321",
+		DstAddr: "10.0.0.1:3306",
+		SrcPort: 54321,
+		DstPort: 3306,
+		Comm:    "myapp",
+	})
+
+	// 3. 服务端被动接受（ConnectionAccepted）
+	r.processEvent(&tracer.Event{
+		Type:    tracer.EventTypeConnectionAccepted,
+		Pid:     500,
+		Fd:      31,
+		SrcAddr: "10.0.0.1:3306",
+		DstAddr: "10.0.0.2:54321",
+		SrcPort: 3306,
+		DstPort: 54321,
+		Comm:    "mysqld",
+	})
+
+	// 4. 服务端重传（不应生成边）
+	r.processEvent(&tracer.Event{
+		Type:    tracer.EventTypeTCPRetransmit,
+		Pid:     500,
+		SrcAddr: "10.0.0.1:3306",
+		DstAddr: "10.0.0.2:54321",
+		SrcPort: 3306,
+		DstPort: 54321,
+		Comm:    "mysqld",
+	})
+
+	cs := r.GetContainers()
+	if len(cs) != 2 {
+		t.Fatalf("expected 2 containers (mysqld + myapp), got %d", len(cs))
+	}
+
+	// 找到两个容器
+	var mysqld, myapp *Container
+	for _, c := range cs {
+		if c.Name == "mysqld" {
+			mysqld = c
+		} else if c.Name == "myapp" {
+			myapp = c
+		}
+	}
+
+	if mysqld == nil || myapp == nil {
+		t.Fatalf("expected both mysqld and myapp containers, got %v", cs)
+	}
+
+	// myapp 应有边 → mysqld (10.0.0.1:3306)
+	myappStats := myapp.GetTCPStatsSnapshot()
+	if _, ok := myappStats["10.0.0.1:3306"]; !ok {
+		t.Error("myapp should have TCPStats edge to 10.0.0.1:3306")
+	}
+
+	// mysqld 不应有任何 TCPStats（被动连接 + 服务端重传都不生成边）
+	mysqldStats := mysqld.GetTCPStatsSnapshot()
+	if len(mysqldStats) != 0 {
+		t.Errorf("mysqld should have NO TCPStats (no reverse edges), got %d entries: %v", len(mysqldStats), mysqldStats)
 	}
 }
