@@ -352,17 +352,19 @@ func (r *Registry) processEvent(event *tracer.Event) {
 }
 
 // updateConnectionStats 更新连接统计（含裸进程的字节流量）
+// 注意：只更新已存在的容器，不创建新容器。
+// 容器创建由 processEvent 负责（通过 Open/Accepted/ListenOpen 事件触发）。
+// 如果此处用 getOrCreateContainer，当进程退出后 resolveContainerID 返回不同 ID
+// （如 proc_<pid> 替代 proc_<comm>），会不断创建"幽灵"容器，阻止 GC 回收。
 func (r *Registry) updateConnectionStats() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	r.tracer.ForEachActiveConnection(func(connID tracer.ConnectionID, conn tracer.Connection) {
-		// resolveContainerID 对裸进程同样返回有效 ID（proc_<comm> 或 proc_<pid>），
-		// 从而修复了裸进程字节流量统计被静默丢弃的问题。
 		containerID := r.resolveContainerID(connID.PID)
 
-		container := r.getOrCreateContainer(containerID)
-		if container == nil {
+		container, exists := r.containers[containerID]
+		if !exists {
 			return
 		}
 		container.UpdateTrafficStats(connID.FD, conn.BytesSent, conn.BytesReceived)

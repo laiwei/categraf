@@ -612,7 +612,6 @@ func (t *Tracer) seedExistingConnections() {
 		}
 
 		fd := connectionFD(c)
-		id := ConnectionID{FD: fd, PID: pid}
 
 		// 区分主动连接 vs 被动连接：
 		// 如果本地端口是已知监听端口，说明这是服务端 accept 的被动连接，
@@ -639,13 +638,11 @@ func (t *Tracer) seedExistingConnections() {
 			Comm:      comm,
 		}
 
-		// 也记录到 activeConns，使 ActiveConnectionCount() 和 ForEachActiveConnection() 工作
-		t.activeConnMu.Lock()
-		t.activeConns[id] = Connection{
-			Timestamp: nowNano,
-			LastSeen:  now,
-		}
-		t.activeConnMu.Unlock()
+		// 注意：不写入 tracer.activeConns。
+		// eBPF 事件中 fd=0（C 代码未赋值），而 seed 使用 gopsutil fd（非零 hash），
+		// 两者 ConnectionID 永远不匹配，导致 eBPF Close 事件无法清理 seed 条目，
+		// 泄漏到 tracer GC 超时（5min），期间 updateConnectionStats 会创建幽灵容器。
+		// seed 的目的是让 processEvent 创建容器节点和 TCPStats，不需要 activeConns。
 
 		select {
 		case t.eventChan <- event:
