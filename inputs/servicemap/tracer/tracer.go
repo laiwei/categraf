@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
-	"encoding/base64"
 	"errors"
 	"fmt"
 	"hash/fnv"
@@ -880,7 +879,7 @@ func endpoint(ip string, port uint32) string {
 
 // decompressEBPFProgram 解压eBPF程序（用于后续加载预编译的字节码）
 func decompressEBPFProgram(compressed []byte) ([]byte, error) {
-	reader, err := gzip.NewReader(base64.NewDecoder(base64.StdEncoding, bytes.NewReader(compressed)))
+	reader, err := gzip.NewReader(bytes.NewReader(compressed))
 	if err != nil {
 		return nil, fmt.Errorf("invalid program encoding: %w", err)
 	}

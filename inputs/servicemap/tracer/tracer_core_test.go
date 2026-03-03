@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
-	"encoding/base64"
 	"sync"
 	"testing"
 	"time"
@@ -460,19 +459,17 @@ func TestEndpoint_HighPort(t *testing.T) {
 
 // ─── decompressEBPFProgram ────────────────────────────────────
 
-func gzipBase64(data []byte) []byte {
+func gzipBytes(data []byte) []byte {
 	var buf bytes.Buffer
-	enc := base64.NewEncoder(base64.StdEncoding, &buf)
-	gz := gzip.NewWriter(enc)
+	gz := gzip.NewWriter(&buf)
 	_, _ = gz.Write(data)
 	_ = gz.Close()
-	_ = enc.Close()
 	return buf.Bytes()
 }
 
 func TestDecompressEBPFProgram_Valid(t *testing.T) {
 	original := []byte("hello ebpf world")
-	compressed := gzipBase64(original)
+	compressed := gzipBytes(original)
 
 	out, err := decompressEBPFProgram(compressed)
 	if err != nil {
@@ -484,7 +481,7 @@ func TestDecompressEBPFProgram_Valid(t *testing.T) {
 }
 
 func TestDecompressEBPFProgram_Empty(t *testing.T) {
-	compressed := gzipBase64([]byte{})
+	compressed := gzipBytes([]byte{})
 	out, err := decompressEBPFProgram(compressed)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -494,19 +491,18 @@ func TestDecompressEBPFProgram_Empty(t *testing.T) {
 	}
 }
 
-func TestDecompressEBPFProgram_InvalidBase64(t *testing.T) {
-	_, err := decompressEBPFProgram([]byte("not-valid-base64!!!"))
+func TestDecompressEBPFProgram_NotGzip(t *testing.T) {
+	_, err := decompressEBPFProgram([]byte("this is not gzip data at all"))
 	if err == nil {
-		t.Error("expected error for invalid base64 input")
+		t.Error("expected error for non-gzip input")
 	}
 }
 
-func TestDecompressEBPFProgram_ValidBase64ButNotGzip(t *testing.T) {
-	// 合法 base64 但内容不是 gzip
-	input := []byte(base64.StdEncoding.EncodeToString([]byte("raw data not gzip")))
-	_, err := decompressEBPFProgram(input)
+func TestDecompressEBPFProgram_PlainText(t *testing.T) {
+	// 合法字节但内容不是 gzip
+	_, err := decompressEBPFProgram([]byte("raw data not gzip"))
 	if err == nil {
-		t.Error("expected error for non-gzip base64 content")
+		t.Error("expected error for non-gzip content")
 	}
 }
 
@@ -642,14 +638,10 @@ func TestDecompressEBPFProgram_CorruptGzipBody(t *testing.T) {
 	_, _ = gz.Write([]byte("some valid payload data"))
 	// 故意不调用 gz.Close()，body 不完整
 	corrupt := raw.Bytes()
-	if len(corrupt) > 0 {
-		// 截断到仅保留 header（10 字节 gzip magic + 元数据）
-		if len(corrupt) > 10 {
-			corrupt = corrupt[:10]
-		}
+	if len(corrupt) > 10 {
+		corrupt = corrupt[:10]
 	}
-	encoded := []byte(base64.StdEncoding.EncodeToString(corrupt))
-	_, err := decompressEBPFProgram(encoded)
+	_, err := decompressEBPFProgram(corrupt)
 	// 可能在 gzip.NewReader 或 io.ReadAll 阶段失败
 	if err == nil {
 		t.Error("expected error for truncated gzip body")

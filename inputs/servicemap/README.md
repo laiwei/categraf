@@ -144,7 +144,7 @@ sudo apt-get install -y clang llvm libbpf-dev linux-tools-common bpftool
 sudo yum install -y clang llvm bpftool
 
 # 生成 vmlinux.h
-cd inputs/coroot_servicemap/tracer/bpf
+cd inputs/servicemap/tracer/bpf
 bpftool btf dump file /sys/kernel/btf/vmlinux format c > vmlinux.h
 
 # 编译 eBPF 程序
