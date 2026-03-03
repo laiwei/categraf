@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"net"
+	"strconv"
 	"time"
 
 	"flashcat.cloud/categraf/inputs/servicemap/l7"
@@ -22,6 +23,7 @@ type rawEvent struct {
 	SrcPort   uint16
 	DstPort   uint16
 	Family    uint16 // AF_INET=2 or AF_INET6=10
+	Padding   uint16 // C struct 对齐填充（Family 后到 BytesSent 的 8 字节边界）
 	BytesSent uint64
 	BytesRecv uint64
 }
@@ -52,13 +54,17 @@ func parseRawEvent(data []byte) (*Event, error) {
 		DstPort:   ntohs(raw.DstPort), // eBPF 端存储为网络字节序
 	}
 
-	// 解析地址
+	// 解析地址 — 格式化为 "ip:port"，与轮询模式 endpoint() 格式一致
 	if raw.Family == afINET {
-		event.SrcAddr = intToIPv4(raw.SrcAddr[0]).String()
-		event.DstAddr = intToIPv4(raw.DstAddr[0]).String()
+		srcIP := intToIPv4(raw.SrcAddr[0]).String()
+		dstIP := intToIPv4(raw.DstAddr[0]).String()
+		event.SrcAddr = net.JoinHostPort(srcIP, strconv.Itoa(int(event.SrcPort)))
+		event.DstAddr = net.JoinHostPort(dstIP, strconv.Itoa(int(event.DstPort)))
 	} else if raw.Family == afINET6 {
-		event.SrcAddr = intArrayToIPv6(raw.SrcAddr).String()
-		event.DstAddr = intArrayToIPv6(raw.DstAddr).String()
+		srcIP := intArrayToIPv6(raw.SrcAddr).String()
+		dstIP := intArrayToIPv6(raw.DstAddr).String()
+		event.SrcAddr = net.JoinHostPort(srcIP, strconv.Itoa(int(event.SrcPort)))
+		event.DstAddr = net.JoinHostPort(dstIP, strconv.Itoa(int(event.DstPort)))
 	}
 
 	return event, nil

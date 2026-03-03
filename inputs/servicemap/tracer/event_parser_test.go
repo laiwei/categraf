@@ -17,6 +17,7 @@ func TestParseRawEvent_IPv4(t *testing.T) {
 		SrcPort:   12345,
 		DstPort:   0x5000, // 80 in network byte order (ntohs)
 		Family:    afINET,
+		Padding:   0,
 		BytesSent: 1024,
 		BytesRecv: 2048,
 	}
@@ -37,11 +38,11 @@ func TestParseRawEvent_IPv4(t *testing.T) {
 	if event.Pid != 1234 {
 		t.Errorf("expected Pid 1234, got %d", event.Pid)
 	}
-	if event.SrcAddr != "127.0.0.1" {
-		t.Errorf("expected SrcAddr 127.0.0.1, got %s", event.SrcAddr)
+	if event.SrcAddr != "127.0.0.1:12345" {
+		t.Errorf("expected SrcAddr 127.0.0.1:12345, got %s", event.SrcAddr)
 	}
-	if event.DstAddr != "192.168.1.1" {
-		t.Errorf("expected DstAddr 192.168.1.1, got %s", event.DstAddr)
+	if event.DstAddr != "192.168.1.1:80" {
+		t.Errorf("expected DstAddr 192.168.1.1:80, got %s", event.DstAddr)
 	}
 	if event.SrcPort != 12345 {
 		t.Errorf("expected SrcPort 12345, got %d", event.SrcPort)
@@ -63,6 +64,7 @@ func TestParseRawEvent_IPv6(t *testing.T) {
 		SrcPort:   54321,
 		DstPort:   0xbb01, // 443 in network byte order
 		Family:    afINET6,
+		Padding:   0,
 	}
 
 	buf := new(bytes.Buffer)
@@ -81,8 +83,8 @@ func TestParseRawEvent_IPv6(t *testing.T) {
 	if event.Pid != 5678 {
 		t.Errorf("expected Pid 5678, got %d", event.Pid)
 	}
-	if event.SrcAddr != "::1" {
-		t.Errorf("expected SrcAddr ::1, got %s", event.SrcAddr)
+	if event.SrcAddr != "[::1]:54321" {
+		t.Errorf("expected SrcAddr [::1]:54321, got %s", event.SrcAddr)
 	}
 	if event.DstPort != 443 {
 		t.Errorf("expected DstPort 443, got %d", event.DstPort)

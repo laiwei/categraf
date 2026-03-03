@@ -35,9 +35,9 @@ const (
 	EventTypeProcessExit     EventType = 2
 	EventTypeConnectionOpen  EventType = 3
 	EventTypeConnectionClose EventType = 4
+	EventTypeTCPRetransmit   EventType = 5
 	EventTypeListenOpen      EventType = 6
 	EventTypeListenClose     EventType = 7
-	EventTypeTCPRetransmit   EventType = 9
 	EventTypeL7Request       EventType = 10 // P2-9: L7 协议事件
 )
 
@@ -308,37 +308,48 @@ func (t *Tracer) attachProbes() error {
 		return fmt.Errorf("collection is nil")
 	}
 
+	// kprobe 程序名 → 内核函数名（与 bpf C 代码 SEC("kprobe/xxx") 对应）
+	kprobeTargets := map[string]string{
+		"tcp_connect":        "tcp_connect",
+		"tcp_set_state":      "tcp_set_state",
+		"tcp_retransmit_skb": "tcp_retransmit_skb",
+		"inet_listen":        "inet_listen",
+	}
+
+	// tracepoint 程序名 → (group, name)（与 SEC("tracepoint/group/name") 对应）
+	type tpTarget struct{ group, name string }
+	tracepointTargets := map[string]tpTarget{
+		"handle_fork": {group: "sched", name: "sched_process_fork"},
+		"handle_exit": {group: "sched", name: "sched_process_exit"},
+	}
+
 	attached := 0
-	for name, prog := range t.collection.Programs {
-		switch name {
-		case "trace_inet_sock_set_state":
-			l, err := link.Tracepoint("sock", "inet_sock_set_state", prog, nil)
+	for progName, prog := range t.collection.Programs {
+		if kfunc, ok := kprobeTargets[progName]; ok {
+			l, err := link.Kprobe(kfunc, prog, nil)
 			if err != nil {
-				return fmt.Errorf("attach %s failed: %w", name, err)
+				return fmt.Errorf("attach kprobe %s failed: %w", progName, err)
 			}
 			t.links = append(t.links, l)
 			attached++
-		case "trace_sys_enter_connect":
-			l, err := link.Tracepoint("syscalls", "sys_enter_connect", prog, nil)
+			log.Printf("I! servicemap: attached kprobe/%s", kfunc)
+		} else if tp, ok := tracepointTargets[progName]; ok {
+			l, err := link.Tracepoint(tp.group, tp.name, prog, nil)
 			if err != nil {
-				return fmt.Errorf("attach %s failed: %w", name, err)
+				log.Printf("W! servicemap: attach tracepoint %s/%s failed: %v (non-fatal)", tp.group, tp.name, err)
+				continue
 			}
 			t.links = append(t.links, l)
 			attached++
-		case "trace_sys_exit_connect":
-			l, err := link.Tracepoint("syscalls", "sys_exit_connect", prog, nil)
-			if err != nil {
-				return fmt.Errorf("attach %s failed: %w", name, err)
-			}
-			t.links = append(t.links, l)
-			attached++
+			log.Printf("I! servicemap: attached tracepoint/%s/%s", tp.group, tp.name)
 		}
 	}
 
 	if attached == 0 {
-		return fmt.Errorf("no known tracepoint program found in ebpf collection")
+		return fmt.Errorf("no known probe program found in ebpf collection")
 	}
 
+	log.Printf("I! servicemap: attached %d eBPF probes", attached)
 	return nil
 }
 
@@ -521,14 +532,15 @@ func (t *Tracer) handleListenEvent(event *Event) {
 		return
 	}
 
-	key := ListenKey{Port: event.DstPort, Addr: event.DstAddr}
-
 	switch event.Type {
 	case EventTypeListenOpen:
+		// eBPF inet_listen 填充 src_port/src_addr（监听地址）
+		key := ListenKey{Port: event.SrcPort, Addr: event.SrcAddr}
 		t.listenMu.Lock()
 		t.listenPorts[key] = struct{}{}
 		t.listenMu.Unlock()
 	case EventTypeListenClose:
+		key := ListenKey{Port: event.SrcPort, Addr: event.SrcAddr}
 		t.listenMu.Lock()
 		delete(t.listenPorts, key)
 		t.listenMu.Unlock()

@@ -43,11 +43,11 @@ struct {
 
 // 存储进程的活跃连接信息（用于关闭时找回地址）
 struct conn_key {
-	__u32 pid;
-	__u64 fd;
+	__u64 sk_ptr;  // sock 指针作为唯一 key（不含 PID，避免 softirq 上下文中 PID 错误）
 };
 
 struct conn_info {
+	__u32 pid;         // 在 connect 时保存，close 时取回
 	__u32 src_addr[4];
 	__u32 dst_addr[4];
 	__u16 src_port;
@@ -78,13 +78,13 @@ static __always_inline int fill_addr_from_sock(struct sock *sk, struct event *e)
 	if (family == AF_INET) {
 		e->src_addr[0] = BPF_CORE_READ(sk, __sk_common.skc_rcv_saddr);
 		e->dst_addr[0] = BPF_CORE_READ(sk, __sk_common.skc_daddr);
-		e->src_port = bpf_ntohs(BPF_CORE_READ(sk, __sk_common.skc_num));
-		e->dst_port = BPF_CORE_READ(sk, __sk_common.skc_dport);
+		e->src_port = BPF_CORE_READ(sk, __sk_common.skc_num);  // 已是主机字节序
+		e->dst_port = BPF_CORE_READ(sk, __sk_common.skc_dport); // 网络字节序，Go 端 ntohs
 	} else if (family == AF_INET6) {
 		BPF_CORE_READ_INTO(&e->src_addr, sk, __sk_common.skc_v6_rcv_saddr.in6_u.u6_addr32);
 		BPF_CORE_READ_INTO(&e->dst_addr, sk, __sk_common.skc_v6_daddr.in6_u.u6_addr32);
-		e->src_port = bpf_ntohs(BPF_CORE_READ(sk, __sk_common.skc_num));
-		e->dst_port = BPF_CORE_READ(sk, __sk_common.skc_dport);
+		e->src_port = BPF_CORE_READ(sk, __sk_common.skc_num);  // 已是主机字节序
+		e->dst_port = BPF_CORE_READ(sk, __sk_common.skc_dport); // 网络字节序，Go 端 ntohs
 	}
 
 	return 0;
@@ -99,12 +99,12 @@ int BPF_KPROBE(tcp_connect, struct sock *sk) {
 
 	fill_addr_from_sock(sk, &e);
 
-	// 保存连接信息
+	// 保存连接信息（以 sock 指针为 key，存储 PID 供 close 时取回）
 	struct conn_key key = {
-		.pid = e.pid,
-		.fd = (__u64)sk,  // 使用 sock 指针作为临时 fd
+		.sk_ptr = (__u64)sk,
 	};
 	struct conn_info info = {};
+	info.pid = e.pid;
 	__builtin_memcpy(info.src_addr, e.src_addr, sizeof(info.src_addr));
 	__builtin_memcpy(info.dst_addr, e.dst_addr, sizeof(info.dst_addr));
 	info.src_port = e.src_port;
@@ -125,20 +125,22 @@ int BPF_KPROBE(tcp_set_state, struct sock *sk, int state) {
 
 	struct event e = {};
 	e.type = EVENT_CONNECTION_CLOSE;
-	e.pid = bpf_get_current_pid_tgid() >> 32;
 
 	fill_addr_from_sock(sk, &e);
 
-	// 查找并删除活跃连接
+	// 查找并删除活跃连接（从 map 中取回 connect 时保存的 PID）
 	struct conn_key key = {
-		.pid = e.pid,
-		.fd = (__u64)sk,
+		.sk_ptr = (__u64)sk,
 	};
 	struct conn_info *info = bpf_map_lookup_elem(&active_connections, &key);
 	if (info) {
+		e.pid = info->pid;  // 使用 connect 时保存的 PID，而非当前上下文的随机 PID
 		e.bytes_sent = info->bytes_sent;
 		e.bytes_received = info->bytes_received;
 		bpf_map_delete_elem(&active_connections, &key);
+	} else {
+		// map 中找不到，fallback 到当前上下文 PID（可能不准确）
+		e.pid = bpf_get_current_pid_tgid() >> 32;
 	}
 
 	send_event(ctx, &e);
@@ -169,10 +171,10 @@ int BPF_KPROBE(inet_listen, struct socket *sock, int backlog) {
 		e.family = BPF_CORE_READ(sk, __sk_common.skc_family);
 		if (e.family == AF_INET) {
 			e.src_addr[0] = BPF_CORE_READ(sk, __sk_common.skc_rcv_saddr);
-			e.src_port = bpf_ntohs(BPF_CORE_READ(sk, __sk_common.skc_num));
+			e.src_port = BPF_CORE_READ(sk, __sk_common.skc_num); // 已是主机字节序
 		} else if (e.family == AF_INET6) {
 			BPF_CORE_READ_INTO(&e.src_addr, sk, __sk_common.skc_v6_rcv_saddr.in6_u.u6_addr32);
-			e.src_port = bpf_ntohs(BPF_CORE_READ(sk, __sk_common.skc_num));
+			e.src_port = BPF_CORE_READ(sk, __sk_common.skc_num); // 已是主机字节序
 		}
 	}
 

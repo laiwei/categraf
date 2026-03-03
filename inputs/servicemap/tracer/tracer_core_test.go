@@ -53,8 +53,8 @@ func TestHandleListenEvent_Open(t *testing.T) {
 
 	ev := &Event{
 		Type:    EventTypeListenOpen,
-		DstPort: 8080,
-		DstAddr: "0.0.0.0:8080",
+		SrcPort: 8080,
+		SrcAddr: "0.0.0.0:8080",
 	}
 	tr.handleListenEvent(ev)
 
@@ -68,10 +68,10 @@ func TestHandleListenEvent_Close(t *testing.T) {
 	defer tr.Close()
 
 	// 先注册再关闭
-	open := &Event{Type: EventTypeListenOpen, DstPort: 9090, DstAddr: "0.0.0.0:9090"}
+	open := &Event{Type: EventTypeListenOpen, SrcPort: 9090, SrcAddr: "0.0.0.0:9090"}
 	tr.handleListenEvent(open)
 
-	close := &Event{Type: EventTypeListenClose, DstPort: 9090, DstAddr: "0.0.0.0:9090"}
+	close := &Event{Type: EventTypeListenClose, SrcPort: 9090, SrcAddr: "0.0.0.0:9090"}
 	tr.handleListenEvent(close)
 
 	if tr.IsListening(9090) {
@@ -91,7 +91,7 @@ func TestHandleListenEvent_NonListenType(t *testing.T) {
 	defer tr.Close()
 
 	// ConnectionOpen 不应修改 listenPorts
-	ev := &Event{Type: EventTypeConnectionOpen, DstPort: 7777}
+	ev := &Event{Type: EventTypeConnectionOpen, SrcPort: 7777}
 	tr.handleListenEvent(ev)
 
 	if tr.IsListening(7777) {
@@ -104,8 +104,8 @@ func TestHandleListenEvent_MultipleAddresses(t *testing.T) {
 	defer tr.Close()
 
 	// 同一端口两个地址
-	tr.handleListenEvent(&Event{Type: EventTypeListenOpen, DstPort: 443, DstAddr: "0.0.0.0:443"})
-	tr.handleListenEvent(&Event{Type: EventTypeListenOpen, DstPort: 443, DstAddr: "127.0.0.1:443"})
+	tr.handleListenEvent(&Event{Type: EventTypeListenOpen, SrcPort: 443, SrcAddr: "0.0.0.0:443"})
+	tr.handleListenEvent(&Event{Type: EventTypeListenOpen, SrcPort: 443, SrcAddr: "127.0.0.1:443"})
 
 	if !tr.IsListening(443) {
 		t.Error("expected port 443 to be listening")
@@ -143,7 +143,7 @@ func TestGetListenPorts_ReturnsCopy(t *testing.T) {
 	tr := newTestTracer(t)
 	defer tr.Close()
 
-	tr.handleListenEvent(&Event{Type: EventTypeListenOpen, DstPort: 1234})
+	tr.handleListenEvent(&Event{Type: EventTypeListenOpen, SrcPort: 1234})
 	ports := tr.GetListenPorts()
 	// 修改返回值不应影响内部状态
 	delete(ports, 1234)
@@ -545,7 +545,7 @@ func TestHandleListenEvent_Concurrent(t *testing.T) {
 		wg.Add(2)
 		go func(p uint16) {
 			defer wg.Done()
-			tr.handleListenEvent(&Event{Type: EventTypeListenOpen, DstPort: p})
+			tr.handleListenEvent(&Event{Type: EventTypeListenOpen, SrcPort: p})
 		}(port)
 		go func() {
 			defer wg.Done()
