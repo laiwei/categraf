@@ -19,5 +19,5 @@ type DiagConnection struct {
 	Inode   uint32
 }
 
-func (d *DiagConnection) IsListen() bool   { return false }
-func (d *DiagConnection) IsTracked() bool  { return false }
+func (d *DiagConnection) IsListen() bool  { return false }
+func (d *DiagConnection) IsTracked() bool { return false }

@@ -13,3 +13,4 @@ docker/categraf
 
 conf_local/
 containers.test
+*.swp

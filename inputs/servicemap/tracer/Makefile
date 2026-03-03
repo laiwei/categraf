@@ -54,7 +54,7 @@ $(GENERATED_GO): $(BPF_COMPRESSED)
 	@echo "      MinKernel: \"4.14\"," >> $@
 	@echo "      Flags:     \"\"," >> $@
 	@echo -n "      Program:   []byte{" >> $@
-	@hexdump -v -e '16/1 "0x%02x, " "\n"' $< | sed 's/, $$//' >> $@
+	@hexdump -v -e '1/1 "0x%02x, "' $< | sed 's/, $$//' >> $@
 	@echo "}," >> $@
 	@echo "    }," >> $@
 	@echo "  }," >> $@

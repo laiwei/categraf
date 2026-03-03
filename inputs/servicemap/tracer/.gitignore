@@ -1,0 +1,2 @@
+# Makefile 生成的 eBPF 嵌入代码（由 `make generate` 在 Linux 上构建，不提交到仓库）
+ebpf_programs_generated.go
