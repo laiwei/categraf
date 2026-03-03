@@ -594,3 +594,104 @@ func TestGcContainers_Concurrent(t *testing.T) {
 		t.Errorf("expected 0 containers after GC, got %d", len(cs))
 	}
 }
+
+// ─── GetTrackedPIDs ────────────────────────────────────────────
+
+func TestGetTrackedPIDs_Empty(t *testing.T) {
+	r := newBareRegistry(Config{})
+	pids := r.GetTrackedPIDs()
+	if len(pids) != 0 {
+		t.Errorf("expected 0 PIDs, got %d", len(pids))
+	}
+}
+
+func TestGetTrackedPIDs_FromPidCache(t *testing.T) {
+	r := newBareRegistry(Config{})
+	// pidCache 包含容器内进程
+	r.pidCache[100] = "container-abc"
+	r.pidCache[200] = "container-abc"
+	r.pidCache[300] = "container-xyz"
+
+	pids := r.GetTrackedPIDs()
+	for _, pid := range []uint32{100, 200, 300} {
+		if _, ok := pids[pid]; !ok {
+			t.Errorf("expected PID %d to be in tracked set", pid)
+		}
+	}
+	if len(pids) != 3 {
+		t.Errorf("expected 3 tracked PIDs, got %d", len(pids))
+	}
+}
+
+func TestGetTrackedPIDs_FromContainerPID(t *testing.T) {
+	r := newBareRegistry(Config{})
+	// proc_<pid> 兑退格式：c.PID 非零
+	c := NewContainer("proc_12345")
+	c.PID = 12345
+	r.containers["proc_12345"] = c
+
+	pids := r.GetTrackedPIDs()
+	if _, ok := pids[12345]; !ok {
+		t.Error("expected PID 12345 from container.PID to be in tracked set")
+	}
+}
+
+func TestGetTrackedPIDs_ProcCommContainerExcluded(t *testing.T) {
+	r := newBareRegistry(Config{})
+	// proc_<comm> 格式：c.PID == 0，不应加入（需走 30s 全量扫描）
+	c := NewContainer("proc_nginx")
+	c.PID = 0
+	r.containers["proc_nginx"] = c
+
+	pids := r.GetTrackedPIDs()
+	if _, ok := pids[0]; ok {
+		t.Error("PID 0 should not be in tracked set")
+	}
+	if len(pids) != 0 {
+		t.Errorf("expected 0 tracked PIDs for proc_<comm> container, got %d", len(pids))
+	}
+}
+
+func TestGetTrackedPIDs_MixedSources(t *testing.T) {
+	r := newBareRegistry(Config{})
+	// pidCache 来源
+	r.pidCache[10] = "container-a"
+	r.pidCache[20] = "container-a"
+	// container.PID 来源（proc_<pid> 兑退）
+	c := NewContainer("proc_99")
+	c.PID = 99
+	r.containers["proc_99"] = c
+	// proc_<comm> 不贡献
+	c2 := NewContainer("proc_mysql")
+	c2.PID = 0
+	r.containers["proc_mysql"] = c2
+
+	pids := r.GetTrackedPIDs()
+	for _, pid := range []uint32{10, 20, 99} {
+		if _, ok := pids[pid]; !ok {
+			t.Errorf("expected PID %d to be in tracked set", pid)
+		}
+	}
+	if _, ok := pids[0]; ok {
+		t.Error("PID 0 should not be present")
+	}
+	if len(pids) != 3 {
+		t.Errorf("expected 3 tracked PIDs, got %d", len(pids))
+	}
+}
+
+func TestGetTrackedPIDs_ConcurrentSafe(t *testing.T) {
+	r := newBareRegistry(Config{})
+	r.pidCache[1] = "c1"
+	r.pidCache[2] = "c1"
+
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = r.GetTrackedPIDs()
+		}()
+	}
+	wg.Wait()
+}

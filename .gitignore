@@ -12,3 +12,4 @@ docker/categraf
 /embedded
 
 conf_local/
+containers.test

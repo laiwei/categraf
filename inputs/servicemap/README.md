@@ -13,15 +13,25 @@
 
 ## 系统要求
 
-### 必需条件
+### 运行模式
 
-- **Linux 内核**: >= 4.16 (推荐 5.1+)
-- **权限**: root 或 CAP_SYS_ADMIN capability
+插件支持两种运行模式，**自动降级，无需手动配置**：
+
+| 模式 | 触发条件 | 功能 |
+|---|---|---|
+| **eBPF 模式**（完整功能） | Linux >= 4.16，amd64/arm64，有 tracefs，eBPF 加载成功 | TCP + L7（HTTP/MySQL/Redis 等）全量追踪 |
+| **轮询模式**（自动降级） | 非 Linux 平台、旧内核、无 tracefs、eBPF 加载失败时，自动触发 | TCP 连接追踪（无 L7 协议解析） |
+
+> 插件在任何情况下都不会因环境不满足而启动失败。eBPF 不可用时自动切换轮询模式，日志中会打印 `W! servicemap: ... fallback to polling tracer`。
+
+### eBPF 模式要求（可选，获得完整功能）
+
+- **Linux 内核**: >= 4.16（推荐 5.1+）
 - **架构**: amd64 或 arm64
+- **权限**: root 或 CAP_SYS_ADMIN capability
+- **tracefs 挂载**: `/sys/kernel/debug/tracing` 或 `/sys/kernel/tracing` 可访问
 
-### 内核功能要求
-
-检查内核是否支持 eBPF:
+检查 eBPF 支持：
 
 ```bash
 # 检查内核版本
@@ -30,19 +40,23 @@ uname -r
 # 检查 BPF 功能
 zgrep CONFIG_BPF /proc/config.gz
 zgrep CONFIG_BPF_SYSCALL /proc/config.gz
+
+# 检查 tracefs
+ls /sys/kernel/debug/tracing 2>/dev/null || ls /sys/kernel/tracing
 ```
 
-### 容器环境
+### 轮询模式（任意平台可用）
 
-如果在容器中运行，需要：
+在以下情况下自动使用轮询模式（gopsutil 实现）：
+
+- macOS / Windows 开发机
+- Linux 内核 < 4.16
+- 容器内未挂载 tracefs
+- eBPF 程序加载失败（权限不足等）
+
+### 容器环境（eBPF 模式）
 
 ```yaml
-# Docker
-docker run --privileged \
-  -v /sys/fs/cgroup:/sys/fs/cgroup:ro \
-  -v /proc:/host/proc:ro \
-  ...
-
 # Kubernetes
 securityContext:
   privileged: true
@@ -57,6 +71,61 @@ volumeMounts:
     mountPath: /host/proc
     readOnly: true
 ```
+
+## 运行模式对比
+
+### 数据采集机制
+
+| 维度 | eBPF 模式 | 轮询模式 |
+|---|---|---|
+| **触发方式** | 内核事件驱动（tracepoint hook） | 每 **2 秒**扫描一次 `/proc/net/tcp` |
+| **数据来源** | `inet_sock_set_state`、`sys_enter_connect` 等内核 tracepoint | `gopsutil.Connections("tcp")` 读 procfs |
+| **事件粒度** | 每个 connect / close / retransmit 单独事件 | 前后两次快照对比，推断 open / close |
+
+### 功能差异
+
+| 功能 | eBPF 模式 | 轮询模式 |
+|---|---|---|
+| TCP 连接追踪 | ✅ | ✅ |
+| 监听端口发现 | ✅（ListenOpen/ListenClose 事件） | ✅（扫描 LISTEN 状态） |
+| 字节数统计（BytesSent/Received） | ✅（内核直接计数） | ❌ 始终为 0（gopsutil 无法获取） |
+| TCP Retransmit 事件 | ✅ | ❌ |
+| **L7 协议解析**（HTTP/MySQL/Redis 等） | ✅（独立 `l7_events` perf buffer） | ❌ 完全不支持 |
+| 连接精确时间戳 | ✅（纳秒级） | ⚠️ 取当前时刻，精度约 ±2s |
+| **短连接捕获**（< 2s 即断开） | ✅ 不丢 | ❌ 两次快照之间打开并关闭的连接**不可见** |
+
+> **关键限制**：轮询模式下 `servicemap_edge_bytes_sent_total`、`servicemap_edge_bytes_received_total`、`servicemap_edge_retransmits_total` 恒为 0，L7 相关指标系列（`servicemap_mysql_*` 等）不会产生数据。
+
+### 性能对比
+
+| 指标 | eBPF 模式 | 轮询模式 |
+|---|---|---|
+| **CPU 开销** | 极低：内核态过滤 + perf ring buffer 异步消费，只有事件触发时才有用户态开销 | 固定周期开销：每 2s 系统调用读取全量连接表，连接数越多开销线性增长 |
+| **内存开销** | 需分配 eBPF Map + perf buffer（默认 `pagesize × 16 ≈ 64 KB`），内核空间额外占用约 1–2 MB | 仅 Go 堆内存，无内核空间占用 |
+| **事件延迟** | 亚毫秒（tracepoint 同步触发） | 最长 **2 秒**（下次 poll 才感知） |
+| **高连接密度** | 百万级连接/秒不退化 | 连接数 > 1 万时 procfs 读取开销显著增加 |
+
+### 指标可用性汇总
+
+| 指标系列 | eBPF 模式 | 轮询模式 |
+|---|---|---|
+| `servicemap_tcp_*` | ✅ 全量 | ✅ 连接数 / ❌ 字节 / ❌ 重传 |
+| `servicemap_edge_*` | ✅ 全量 | ✅ 连接数 / ❌ 字节 / ❌ 重传 |
+| `servicemap_http_*` | ✅ | ❌ |
+| `servicemap_mysql_*` / `redis_*` 等 | ✅ | ❌ |
+| `servicemap_graph_*` | ✅ | ✅ |
+| `servicemap_tracer_*` | ✅ | ✅ |
+
+### 选型建议
+
+| 场景 | 建议 |
+|---|---|
+| 生产 Linux 环境（K8s / 裸机） | 配置 `CAP_SYS_ADMIN` 权限，启用 eBPF 获取完整数据 |
+| 开发机 / macOS | 轮询模式足够验证拓扑逻辑，无需额外配置 |
+| Linux 旧内核（< 4.16）| 轮询模式可用，字节统计和 L7 数据缺失，告警规则中相关指标需设兜底处理 |
+| 高连接密度旧内核（> 5000 连接）| 评估 procfs 扫描的 CPU 成本，优先考虑升级内核到 4.16+ |
+
+---
 
 ## 安装
 

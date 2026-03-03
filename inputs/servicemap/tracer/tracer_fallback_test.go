@@ -205,3 +205,114 @@ func TestTracer_StartPollingTracer_ExitsOnClose(t *testing.T) {
 		t.Error("startPollingTracer did not exit after Close()")
 	}
 }
+
+// ─── adaptiveInterval ──────────────────────────────────────────
+
+func TestAdaptiveInterval_Thresholds(t *testing.T) {
+	cases := []struct {
+		connCount int
+		wantMax   time.Duration // 必须走该分档，取指定区间的上限
+	}{
+		{0, 2 * time.Second},
+		{999, 2 * time.Second},
+		{1000, 5 * time.Second},
+		{4999, 5 * time.Second},
+		{5000, 10 * time.Second},
+		{100_000, 10 * time.Second},
+	}
+	for _, c := range cases {
+		got := adaptiveInterval(c.connCount)
+		if got != c.wantMax {
+			t.Errorf("adaptiveInterval(%d) = %v, want %v", c.connCount, got, c.wantMax)
+		}
+	}
+}
+
+func TestAdaptiveInterval_MonotonicallyNonDecreasing(t *testing.T) {
+	// 连接数增大时，间隔不应减小
+	counts := []int{0, 500, 1000, 2000, 5000, 10000, 50000}
+	prev := adaptiveInterval(0)
+	for _, n := range counts[1:] {
+		cur := adaptiveInterval(n)
+		if cur < prev {
+			t.Errorf("adaptiveInterval(%d)=%v < adaptiveInterval(smaller)=%v: not monotone", n, cur, prev)
+		}
+		prev = cur
+	}
+}
+
+// ─── SetPIDFilter / PID 过滤路径 ───────────────────────────────
+
+func TestSetPIDFilter_NilFilter_NoEffect(t *testing.T) {
+	tr := newTestTracer(t)
+	defer tr.Close()
+
+	// 未设置过滤器时，pollConnections 应走全量扫描路径，不 panic
+	if tr.pidFilter != nil {
+		t.Fatal("pidFilter should be nil by default")
+	}
+	tr.pollConnections() // 不应 panic
+}
+
+func TestSetPIDFilter_EmptySet_ForcesGlobalScan(t *testing.T) {
+	tr := newTestTracer(t)
+	defer tr.Close()
+
+	// 过滤回调返回空集合：应走全量扫描分支，不过滤任何连接
+	tr.SetPIDFilter(func() map[uint32]struct{} {
+		return map[uint32]struct{}{}
+	})
+
+	// 第一次：pidFilter 返回空集合 len==0，应走全量扫描路径
+	tr.pollConnections()
+
+	// lastGlobalScan 应被更新
+	if tr.lastGlobalScan.IsZero() {
+		t.Error("lastGlobalScan should be set after global scan with empty PID set")
+	}
+}
+
+func TestSetPIDFilter_WithPIDs_SkipsGlobalScanWithinWindow(t *testing.T) {
+	tr := newTestTracer(t)
+	defer tr.Close()
+
+	// 设置一个返回非空 PID 集的过滤器
+	calledCount := 0
+	tr.SetPIDFilter(func() map[uint32]struct{} {
+		calledCount++
+		return map[uint32]struct{}{99999: {}}
+	})
+
+	// 首次：PID 集非空但 lastGlobalScan 为零 → 应走全量扫描
+	tr.pollConnections()
+	first := tr.lastGlobalScan
+	if first.IsZero() {
+		t.Fatal("lastGlobalScan should be set after first poll with non-empty PID set")
+	}
+
+	// 第二次：30s 窗口内 → 应走 PID 过滤路径，不更新 lastGlobalScan
+	tr.pollConnections()
+	if tr.lastGlobalScan != first {
+		t.Error("lastGlobalScan should NOT be updated within 30s window")
+	}
+}
+
+func TestSetPIDFilter_GlobalScanAfterWindow(t *testing.T) {
+	tr := newTestTracer(t)
+	defer tr.Close()
+
+	tr.SetPIDFilter(func() map[uint32]struct{} {
+		return map[uint32]struct{}{99999: {}}
+	})
+
+	// 手动设置 lastGlobalScan 为 31s 前——模拟 30s 窗口已过期
+	tr.lastGlobalScan = time.Now().Add(-31 * time.Second)
+	old := tr.lastGlobalScan
+
+	tr.pollConnections()
+
+	// 应重新走全量扫描，lastGlobalScan 应被更新
+	if !tr.lastGlobalScan.After(old) {
+		t.Error("lastGlobalScan should be updated after 30s global scan window expires")
+	}
+}

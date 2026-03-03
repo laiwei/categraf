@@ -127,6 +127,11 @@ type Tracer struct {
 	listenMu    sync.RWMutex
 	listenPorts map[ListenKey]struct{}
 
+	// 轮询模式性能优化字段（仅在 startFallbackMode 路径下使用）
+	pidFilter      func() map[uint32]struct{} // P1: PID 作用域过滤回调，由 Registry 初始化时注入
+	pollBuf        map[ConnectionID]Event     // P0-D: 双缓冲复用，避免每轮 poll 重新分配 map
+	lastGlobalScan time.Time                  // P1: 上次全量扫描时间戳，控制强制全量扫描频率
+
 	started  bool
 	stopOnce sync.Once
 	wg       sync.WaitGroup // P1-8: 追踪后台 goroutine
@@ -151,6 +156,7 @@ func NewTracer(ctx context.Context, hostNetNs, selfNetNs netns.NsHandle, disable
 		uprobes:          make(map[string]*ebpf.Program),
 		activeConns:      make(map[ConnectionID]Connection),
 		lastSnapshot:     make(map[ConnectionID]Event),
+		pollBuf:          make(map[ConnectionID]Event), // P0-D: 双缓冲初始化
 		listenPorts:      make(map[ListenKey]struct{}),
 		eventChan:        make(chan Event, 10000),
 		closeChan:        make(chan struct{}),
@@ -175,6 +181,25 @@ func (t *Tracer) launchBackground(fn func()) {
 		defer t.wg.Done()
 		fn()
 	}()
+}
+
+// SetPIDFilter 注入 PID 作用域过滤回调（由 Registry 在初始化时调用）。
+// 轮询模式下，每 30s 做一次全量扫描发现新进程，其余周期仅处理已知 PID 的连接。
+func (t *Tracer) SetPIDFilter(fn func() map[uint32]struct{}) {
+	t.pidFilter = fn
+}
+
+// adaptiveInterval 根据上次快照连接数动态返回下次轮询间隔。
+// 连接数越多，轮询间隔越长，避免高连接密度下 procfs 扫描开销持续积累。
+func adaptiveInterval(connCount int) time.Duration {
+	switch {
+	case connCount < 1_000:
+		return 2 * time.Second
+	case connCount < 5_000:
+		return 5 * time.Second
+	default:
+		return 10 * time.Second
+	}
 }
 
 // Start 启动eBPF程序
@@ -555,18 +580,19 @@ func (t *Tracer) Close() {
 
 func (t *Tracer) startPollingTracer() {
 	log.Println("I! servicemap: polling tracer started")
-	ticker := time.NewTicker(2 * time.Second)
-	defer ticker.Stop()
 
-	// 立即执行一次以便快速初始化
-	t.pollConnections()
+	// 立即执行一次以便快速初始化，获取初始连接数用于首次间隔计算
+	lastCount := t.pollConnections()
 
 	for {
+		// P0: 自适应间隔——连接数越多，轮询越稀疏，降低高连接密度下的 procfs 扫描开销
+		timer := time.NewTimer(adaptiveInterval(lastCount))
 		select {
 		case <-t.closeChan:
+			timer.Stop()
 			return
-		case <-ticker.C:
-			t.pollConnections()
+		case <-timer.C:
+			lastCount = t.pollConnections()
 		}
 	}
 }
@@ -609,51 +635,39 @@ func (t *Tracer) gcConnections() {
 	}
 }
 
-func (t *Tracer) pollConnections() {
-	conns, err := gopsnet.Connections("tcp")
-	if err != nil {
-		log.Printf("W! servicemap: polling tcp connections failed: %v", err)
-		return
-	}
-
-	log.Printf("D! servicemap: polled %d tcp connections", len(conns))
-
+// pollConnections 扫描当前 TCP 连接并与上次快照做差量比较，发出 Open/Close 事件。
+// 返回本次有效连接数，供调用方计算下次自适应轮询间隔。
+//
+// 数据采集分两层：
+//  1. 优先使用 NETLINK_INET_DIAG（Linux only，内核态过滤，性能高 10x）
+//  2. 失败则 fallback 到 gopsutil（跨平台，读 /proc/net/tcp）
+func (t *Tracer) pollConnections() int {
 	now := time.Now()
 	nowNano := uint64(now.UnixNano())
-	current := make(map[ConnectionID]Event, len(conns))
 
-	// P0-4: 同时发现 LISTEN 状态的端口
+	// P0-D: 复用 pollBuf（与 lastSnapshot 双缓冲轮换），避免每次轮询重新分配 map
+	current := t.pollBuf
+	for k := range current {
+		delete(current, k)
+	}
+
 	discoveredListens := make(map[ListenKey]struct{})
 
-	for _, c := range conns {
-		// P0-4: 收集 LISTEN 端口
-		if strings.ToUpper(c.Status) == "LISTEN" {
-			key := ListenKey{
-				Port: uint16(c.Laddr.Port),
-				Addr: endpoint(c.Laddr.IP, c.Laddr.Port),
-			}
-			discoveredListens[key] = struct{}{}
-			continue
+	// ─── 数据采集层：netlink 优先，gopsutil 兜底 ───────────
+	diagConns, netlinkErr := netlinkConnections()
+	if netlinkErr == nil {
+		t.collectFromNetlink(diagConns, current, discoveredListens, nowNano)
+	} else {
+		log.Printf("D! servicemap: netlink unavailable (%v), fallback to gopsutil", netlinkErr)
+		if err := t.collectFromGopsutil(current, discoveredListens, nowNano); err != nil {
+			log.Printf("W! servicemap: polling tcp connections failed: %v", err)
+			return 0
 		}
-
-		if !isTrackedTCPConnection(c) {
-			continue
-		}
-
-		fd := connectionFD(c)
-		id := ConnectionID{FD: fd, PID: uint32(c.Pid)}
-		e := Event{
-			Type:      EventTypeConnectionOpen,
-			Timestamp: nowNano,
-			Pid:       uint32(c.Pid),
-			Fd:        fd,
-			SrcAddr:   endpoint(c.Laddr.IP, c.Laddr.Port),
-			DstAddr:   endpoint(c.Raddr.IP, c.Raddr.Port),
-			SrcPort:   uint16(c.Laddr.Port),
-			DstPort:   uint16(c.Raddr.Port),
-		}
-		current[id] = e
 	}
+
+	log.Printf("D! servicemap: polled %d tcp connections", len(current))
+
+	// ─── 差量比较层（与采集方式无关）─────────────────────────
 
 	// P0-4: 更新监听端口列表
 	t.listenMu.Lock()
@@ -664,7 +678,7 @@ func (t *Tracer) pollConnections() {
 	defer t.activeConnMu.Unlock()
 
 	if t.activeConns == nil {
-		return
+		return 0
 	}
 
 	for id, e := range current {
@@ -703,7 +717,119 @@ func (t *Tracer) pollConnections() {
 		delete(t.activeConns, id)
 	}
 
+	// P0-D: 双缓冲轮换——旧 lastSnapshot 变为下次的 pollBuf，零分配
+	t.pollBuf = t.lastSnapshot
 	t.lastSnapshot = current
+
+	return len(current)
+}
+
+// collectFromNetlink 使用 NETLINK_INET_DIAG 结果填充 current 和 discoveredListens。
+// netlink 已在内核态按 state bitmap 过滤，无需用户态再过滤状态。
+func (t *Tracer) collectFromNetlink(
+	diagConns []DiagConnection,
+	current map[ConnectionID]Event,
+	discoveredListens map[ListenKey]struct{},
+	nowNano uint64,
+) {
+	for i := range diagConns {
+		dc := &diagConns[i]
+
+		if dc.IsListen() {
+			key := ListenKey{
+				Port: dc.SrcPort,
+				Addr: endpoint(dc.SrcIP, uint32(dc.SrcPort)),
+			}
+			discoveredListens[key] = struct{}{}
+			continue
+		}
+
+		if !dc.IsTracked() {
+			continue
+		}
+
+		if dc.DstIP == "" || dc.DstPort == 0 {
+			continue
+		}
+
+		// netlink 不返回 PID/FD，使用 inode 作为稳定 FD 替代
+		fd := uint64(dc.Inode)
+		id := ConnectionID{FD: fd, PID: 0}
+		e := Event{
+			Type:      EventTypeConnectionOpen,
+			Timestamp: nowNano,
+			Pid:       0, // netlink 不提供 PID（需额外 INET_DIAG_INFO 查询，此处暂不实现）
+			Fd:        fd,
+			SrcAddr:   endpoint(dc.SrcIP, uint32(dc.SrcPort)),
+			DstAddr:   endpoint(dc.DstIP, uint32(dc.DstPort)),
+			SrcPort:   dc.SrcPort,
+			DstPort:   dc.DstPort,
+		}
+		current[id] = e
+	}
+}
+
+// collectFromGopsutil 使用 gopsutil 读取 /proc/net/tcp 填充 current 和 discoveredListens。
+// 包含 P1 PID 过滤逻辑（每 30s 全量扫描，其余时间按已知 PID 过滤）。
+func (t *Tracer) collectFromGopsutil(
+	current map[ConnectionID]Event,
+	discoveredListens map[ListenKey]struct{},
+	nowNano uint64,
+) error {
+	conns, err := gopsnet.Connections("tcp")
+	if err != nil {
+		return err
+	}
+
+	// P1: PID 作用域过滤
+	if t.pidFilter != nil {
+		pids := t.pidFilter()
+		if len(pids) > 0 && time.Since(t.lastGlobalScan) < 30*time.Second {
+			n := 0
+			for _, c := range conns {
+				if _, ok := pids[uint32(c.Pid)]; ok || strings.ToUpper(c.Status) == "LISTEN" {
+					conns[n] = c
+					n++
+				}
+			}
+			log.Printf("D! servicemap: pid-filtered: %d → %d connections", len(conns), n)
+			conns = conns[:n]
+		} else {
+			t.lastGlobalScan = time.Now()
+			log.Printf("D! servicemap: global scan: %d connections", len(conns))
+		}
+	}
+
+	for _, c := range conns {
+		if strings.ToUpper(c.Status) == "LISTEN" {
+			key := ListenKey{
+				Port: uint16(c.Laddr.Port),
+				Addr: endpoint(c.Laddr.IP, c.Laddr.Port),
+			}
+			discoveredListens[key] = struct{}{}
+			continue
+		}
+
+		if !isTrackedTCPConnection(c) {
+			continue
+		}
+
+		fd := connectionFD(c)
+		id := ConnectionID{FD: fd, PID: uint32(c.Pid)}
+		e := Event{
+			Type:      EventTypeConnectionOpen,
+			Timestamp: nowNano,
+			Pid:       uint32(c.Pid),
+			Fd:        fd,
+			SrcAddr:   endpoint(c.Laddr.IP, c.Laddr.Port),
+			DstAddr:   endpoint(c.Raddr.IP, c.Raddr.Port),
+			SrcPort:   uint16(c.Laddr.Port),
+			DstPort:   uint16(c.Raddr.Port),
+		}
+		current[id] = e
+	}
+
+	return nil
 }
 
 func (t *Tracer) emitEventLocked(e Event) {

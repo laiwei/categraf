@@ -131,6 +131,9 @@ func NewRegistry(ctx context.Context, tr *tracer.Tracer, config Config) (*Regist
 		r.launchBackground(r.discoverContainersByCgroup)
 	}
 
+	// P1: 注入 PID 过滤回调，用于轮询模式的连接作用域收窄
+	tr.SetPIDFilter(r.GetTrackedPIDs)
+
 	log.Println("I! servicemap: container registry initialized")
 	return r, nil
 }
@@ -603,6 +606,35 @@ func (r *Registry) GetContainers() []*Container {
 		containers = append(containers, container)
 	}
 	return containers
+}
+
+// GetTrackedPIDs 返回所有已解析到容器的进程 PID 集合。
+// 由轮询模式的 Tracer.pollConnections 调用，用于把无关系统进程过滤出去。
+// 返回集包含：
+//   - pidCache 中的全部已解析 PID（容器内所有已建连连的进程）
+//   - container.PID 非零的条目（在 proc_<pid> 兑退格式下有效）
+//
+// 注意：裸进程（proc_<comm>）不写入 pidCache（防 PID 复用污染），
+// 其连接靠 Tracer 每 30s 全量扫描覆盖。
+func (r *Registry) GetTrackedPIDs() map[uint32]struct{} {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	pids := make(map[uint32]struct{}, len(r.pidCache)+len(r.containers))
+
+	// pidCache 包含所有已通过 cgroup 解析到容器的进程 PID（含容器内子进程）
+	for pid := range r.pidCache {
+		pids[pid] = struct{}{}
+	}
+
+	// container.PID 仅在 proc_<pid> 兑退格式下非零（通常为 0，表示按进程名聚合）
+	for _, c := range r.containers {
+		if c.PID != 0 {
+			pids[c.PID] = struct{}{}
+		}
+	}
+
+	return pids
 }
 
 // Close 关闭注册表 (P1-8: 等待后台 goroutine 退出)
