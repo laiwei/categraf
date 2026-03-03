@@ -1,6 +1,6 @@
 # Coroot ServiceMap 插件使用场景手册
 
-> 本文档系统性地描述 `coroot_servicemap` 插件的典型使用场景，每个场景包含：背景说明、配置方式、关键指标、PromQL 查询示例及可视化建议。
+> 本文档系统性地描述 `servicemap` 插件的典型使用场景，每个场景包含：背景说明、配置方式、关键指标、PromQL 查询示例及可视化建议。
 
 ---
 
@@ -31,7 +31,7 @@
 - 维护手动绘制的架构图
 - 部署 APM Agent（侵入业务进程）
 
-`coroot_servicemap` 通过 **eBPF 在内核层** 捕获真实的 TCP 连接，**无需修改任何业务代码**，自动发现服务间调用关系。
+`servicemap` 通过 **eBPF 在内核层** 捕获真实的 TCP 连接，**无需修改任何业务代码**，自动发现服务间调用关系。
 
 ### 适用场景
 
@@ -43,7 +43,7 @@
 ### 配置示例
 
 ```toml
-# conf/input.coroot_servicemap/servicemap.toml
+# conf/input.servicemap/servicemap.toml
 [[instances]]
 interval = 30
 
@@ -66,7 +66,7 @@ api_addr = ":9099"
                 │
          eBPF hook (内核)
                 │
-         coroot_servicemap
+         servicemap
                 │
     ┌───────────┴────────────┐
     │  容器注册表（Registry）  │
@@ -85,31 +85,31 @@ api_addr = ":9099"
 
 | 指标 | 类型 | 说明 |
 |------|------|------|
-| `coroot_servicemap_edge_active_connections` | Gauge | A→B 当前活跃连接数 |
-| `coroot_servicemap_edge_connects_total` | Counter | A→B 累计连接次数 |
-| `coroot_servicemap_graph_nodes` | Gauge | 当前发现的服务节点数 |
-| `coroot_servicemap_graph_edges` | Gauge | 当前发现的服务调用边数 |
-| `coroot_servicemap_tracked_containers` | Gauge | 正在追踪的容器数量 |
+| `servicemap_edge_active_connections` | Gauge | A→B 当前活跃连接数 |
+| `servicemap_edge_connects_total` | Counter | A→B 累计连接次数 |
+| `servicemap_graph_nodes` | Gauge | 当前发现的服务节点数 |
+| `servicemap_graph_edges` | Gauge | 当前发现的服务调用边数 |
+| `servicemap_tracked_containers` | Gauge | 正在追踪的容器数量 |
 
 ### PromQL 查询
 
 ```promql
 # 当前活跃的服务调用边（非零连接）
-coroot_servicemap_edge_active_connections > 0
+servicemap_edge_active_connections > 0
 
 # 按来源服务分组，查看每个服务的出站连接数
 sum by (source_name, destination_host) (
-  coroot_servicemap_edge_active_connections
+  servicemap_edge_active_connections
 )
 
 # 近 5 分钟内有新连接建立的服务对
 sum by (source_name, destination_host, destination_port) (
-  increase(coroot_servicemap_edge_connects_total[5m])
+  increase(servicemap_edge_connects_total[5m])
 ) > 0
 
 # 当前拓扑图规模
-coroot_servicemap_graph_nodes
-coroot_servicemap_graph_edges
+servicemap_graph_nodes
+servicemap_graph_edges
 ```
 
 ### 拓扑 API 查询
@@ -153,28 +153,27 @@ curl http://localhost:9099/graph/text
 
 **详细行为说明：**
 
-1. **事件层**：当 eBPF 捕获到一个来自裸进程的 TCP 事件，Registry 尝试通过 `/proc/<pid>/cgroup` 提取容器 ID。裸进程的 cgroup 路径中没有 Docker/containerd 容器 ID，解析结果为空，事件会被归入 `container_id="unknown"` 的合成容器中——**不会丢失，但无业务语义标签**。
+1. **事件层**：当 eBPF 捕获到来自裸进程的 TCP 事件，Registry 通过 `/proc/<pid>/cgroup` 尝试提取容器 ID。裸进程的 cgroup 路径中无 Docker/containerd 容器 ID，插件改为读取 `/proc/<pid>/comm` 获取进程名，生成合成 ID `proc_<进程名>`（如 `proc_nginx`），以进程名为粒度聚合同类进程——**同名的多个进程实例共享一条时序**，保证时序稳定、基数可控。
 
-2. **流量统计层**（字节数）：在 `updateConnectionStats` 中，若 PID 无法映射到容器 ID，该连接的 `bytes_sent/received` 统计会被静默跳过。这是当前实现的**已知限制**。
+2. **流量统计层**（字节数）：裸进程合成 ID（`proc_<comm>` 或 `proc_<pid>`）已支持字节流量统计，与容器化进程同等对待。
 
-3. **主机聚合统计**：`collectHostStats` 会输出 `host_active_connections`、`host_bytes_sent_total`、`host_bytes_received_total`，但该函数**仅在容器列表为空时触发**。在容器与裸进程混合部署的机器上，裸进程的带宽不会单独汇总，而是被计入 tracer 层的全局连接数。
+3. **主机聚合统计**：`collectHostStats` 会输出 `host_active_connections`、`host_bytes_sent_total`、`host_bytes_received_total`，但该函数**仅在容器列表为空时触发**，作为兜底降级路径。
 
 **实际建议：**
 
 ```
-纯裸机部署（无容器）     →  collectHostStats 生效，可获得主机级聚合指标
+纯裸机部署（无容器）     →  裸进程以 proc_<进程名> 聚合，完整支持 TCP 追踪和字节统计
 纯容器部署              →  完整支持，推荐场景
-容器 + 裸进程混合部署   →  容器指标完整；裸进程仅有事件追踪（container_id=unknown），
-                            带宽统计不完整，建议将关键裸进程容器化后再部署
+容器 + 裸进程混合部署   →  两者均完整支持，source_type 标签区分来源
 ```
 
-> ✅ **已实现（v1.1）**：当 `getContainerIDByPID` 返回空时，插件通过读取 `/proc/<pid>/comm` 将裸进程以 `proc_<pid>_<comm>`（或 `proc_<pid>`）作为合成 container ID 注册，提供与容器同等的 TCP 连接追踪和字节流量统计，并在服务拓扑图中以进程名展示。相关实现见 [containers/registry.go](containers/registry.go)（`resolveContainerID` / `resolveProcID` / `enrichProcContainer`）。
+> ✅ **已实现**：当 `getContainerIDByPID` 返回空时，插件通过读取 `/proc/<pid>/comm` 将裸进程以 `proc_<进程名>`（或 `proc_<pid>` 兜底）作为合成 source ID 注册，提供与容器同等的 TCP 连接追踪和字节流量统计，并在指标中通过 `source_type="bare_process"` 标签加以区分。相关实现见 [containers/registry.go](containers/registry.go)（`resolveContainerID` / `resolveProcID` / `enrichProcContainer`）。
 
 ---
 
 ### 与传统方案对比
 
-| 维度 | 传统 APM 埋点 | Service Mesh Sidecar | coroot_servicemap |
+| 维度 | 传统 APM 埋点 | Service Mesh Sidecar | servicemap |
 |------|-------------|---------------------|-------------------|
 | 代码侵入 | ✗ 需要 | ✗ 需要配置 | ✅ 零侵入 |
 | 性能开销 | 中~高 | 中（额外进程） | 低（eBPF 内核级） |
@@ -195,7 +194,7 @@ Kubernetes 环境中，传统可观测方案面临以下问题：
 - **应用 APM**：需要各语言 SDK，跨语言兼容性差
 - **网络插件（CNI）**：只提供网络层，无法识别 L7 协议
 
-`coroot_servicemap` 以 **DaemonSet** 方式部署，每个节点一个 Pod，即可覆盖该节点上所有容器的网络流量，自动关联 Pod 名称、Namespace、Label 等 K8s 元数据。
+`servicemap` 以 **DaemonSet** 方式部署，每个节点一个 Pod，即可覆盖该节点上所有容器的网络流量，自动关联 Pod 名称、Namespace、Label 等 K8s 元数据。
 
 ### Kubernetes 部署配置
 
@@ -285,7 +284,7 @@ api_addr = ":9099"
 插件自动为每条指标附加 Kubernetes 元数据标签：
 
 ```
-coroot_servicemap_edge_active_connections{
+servicemap_edge_active_connections{
   source_id="abc123",
   source_name="api-gateway",
   namespace="production",
@@ -301,30 +300,30 @@ coroot_servicemap_edge_active_connections{
 ```promql
 # 按 Namespace 汇总活跃连接数
 sum by (namespace) (
-  coroot_servicemap_edge_active_connections
+  servicemap_edge_active_connections
 )
 
 # 查找 production namespace 中连接到数据库（3306）的服务
-coroot_servicemap_edge_active_connections{
+servicemap_edge_active_connections{
   namespace="production",
   destination_port="3306"
 } > 0
 
 # 某个 Pod 的出站 HTTP 错误率
 sum by (pod_name, destination) (
-  rate(coroot_servicemap_http_request_errors_total{
+  rate(servicemap_http_request_errors_total{
     namespace="production"
   }[5m])
 )
 /
 sum by (pod_name, destination) (
-  rate(coroot_servicemap_http_requests_total{
+  rate(servicemap_http_requests_total{
     namespace="production"
   }[5m])
 )
 
 # 跨 Namespace 调用（安全合规审计）
-coroot_servicemap_edge_active_connections{
+servicemap_edge_active_connections{
   namespace!="kube-system"
 } > 0
 ```
@@ -336,7 +335,7 @@ coroot_servicemap_edge_active_connections{
 ```promql
 # 发现来自 dev namespace 到 production namespace 的意外连接
 # （需要结合业务逻辑判断，指标本身不区分方向，但 source/destination 标签可以推断）
-coroot_servicemap_edge_connects_total{
+servicemap_edge_connects_total{
   namespace="dev",
   destination_port=~"8080|8443|3306"
 }
@@ -354,16 +353,16 @@ coroot_servicemap_edge_connects_total{
 - **哪条调用路径**产生了慢查询？
 - **数据库错误**是某个特定服务触发的吗？
 
-`coroot_servicemap` 通过 eBPF 在网络层解析 L7 协议，无需访问数据库本身，即可从**客户端视角**获取每条连接的请求量、错误率和延迟分布。
+`servicemap` 通过 eBPF 在网络层解析 L7 协议，无需访问数据库本身，即可从**客户端视角**获取每条连接的请求量、错误率和延迟分布。
 
 ### 支持的数据库协议
 
 | 协议 | 指标前缀 | 说明 |
 |------|---------|------|
-| MySQL | `coroot_servicemap_mysql_*` | 含错误响应识别 |
-| PostgreSQL | `coroot_servicemap_postgres_*` | 含错误响应识别 |
-| Redis | `coroot_servicemap_redis_*` | 含 WRONGTYPE 等错误 |
-| Kafka | `coroot_servicemap_kafka_*` | Producer/Consumer 请求 |
+| MySQL | `servicemap_mysql_*` | 含错误响应识别 |
+| PostgreSQL | `servicemap_postgres_*` | 含错误响应识别 |
+| Redis | `servicemap_redis_*` | 含 WRONGTYPE 等错误 |
+| Kafka | `servicemap_kafka_*` | Producer/Consumer 请求 |
 
 ### 配置示例
 
@@ -388,47 +387,47 @@ ignore_cidrs = ["127.0.0.0/8"]
 
 | 指标 | 说明 |
 |------|------|
-| `coroot_servicemap_mysql_requests_total` | 累计请求数 |
-| `coroot_servicemap_mysql_request_errors_total` | 累计错误数（如 SQL 语法错误、权限错误） |
-| `coroot_servicemap_mysql_request_duration_seconds_sum` | 请求总耗时（秒） |
-| `coroot_servicemap_mysql_request_duration_seconds_count` | 请求次数（同 requests_total） |
+| `servicemap_mysql_requests_total` | 累计请求数 |
+| `servicemap_mysql_request_errors_total` | 累计错误数（如 SQL 语法错误、权限错误） |
+| `servicemap_mysql_request_duration_seconds_sum` | 请求总耗时（秒） |
+| `servicemap_mysql_request_duration_seconds_count` | 请求次数（同 requests_total） |
 
-标签：`container_id`, `destination`（MySQL 服务地址 `ip:3306`）, `protocol`=`MySQL`, `status`（`ok`/`error`）
+标签：`source_id`, `source_name`, `source_type`, `destination`（MySQL 服务地址 `ip:3306`）, `protocol`=`MySQL`, `status`（`ok`/`error`）
 
 #### PromQL 查询
 
 ```promql
 # 各服务对 MySQL 的请求速率（QPS）
-sum by (container_id, destination) (
-  rate(coroot_servicemap_mysql_requests_total[5m])
+sum by (source_id, destination) (
+  rate(servicemap_mysql_requests_total[5m])
 )
 
 # MySQL 错误率（按来源服务和目标实例）
-sum by (container_id, destination) (
-  rate(coroot_servicemap_mysql_request_errors_total[5m])
+sum by (source_id, destination) (
+  rate(servicemap_mysql_request_errors_total[5m])
 )
 /
-sum by (container_id, destination) (
-  rate(coroot_servicemap_mysql_requests_total[5m])
+sum by (source_id, destination) (
+  rate(servicemap_mysql_requests_total[5m])
 )
 
 # MySQL 平均响应延迟（ms）
-sum by (container_id, destination) (
-  rate(coroot_servicemap_mysql_request_duration_seconds_sum[5m])
+sum by (source_id, destination) (
+  rate(servicemap_mysql_request_duration_seconds_sum[5m])
 )
 /
-sum by (container_id, destination) (
-  rate(coroot_servicemap_mysql_request_duration_seconds_count[5m])
+sum by (source_id, destination) (
+  rate(servicemap_mysql_request_duration_seconds_count[5m])
 ) * 1000
 
 # 告警：MySQL 平均延迟超过 100ms
 (
-  sum by (container_id, destination) (
-    rate(coroot_servicemap_mysql_request_duration_seconds_sum[5m])
+  sum by (source_id, destination) (
+    rate(servicemap_mysql_request_duration_seconds_sum[5m])
   )
   /
-  sum by (container_id, destination) (
-    rate(coroot_servicemap_mysql_request_duration_seconds_count[5m])
+  sum by (source_id, destination) (
+    rate(servicemap_mysql_request_duration_seconds_count[5m])
   )
 ) * 1000 > 100
 ```
@@ -438,19 +437,19 @@ sum by (container_id, destination) (
 ```promql
 # Postgres 请求 QPS，按目标数据库实例分组
 sum by (destination) (
-  rate(coroot_servicemap_postgres_requests_total[5m])
+  rate(servicemap_postgres_requests_total[5m])
 )
 
 # Postgres 连接失败（TCP 层）
-rate(coroot_servicemap_tcp_connect_failed_total{
+rate(servicemap_tcp_connect_failed_total{
   destination=~".*:5432"
 }[5m])
 
 # Postgres 高延迟告警（>200ms）
 (
-  rate(coroot_servicemap_postgres_request_duration_seconds_sum[5m])
+  rate(servicemap_postgres_request_duration_seconds_sum[5m])
   /
-  rate(coroot_servicemap_postgres_request_duration_seconds_count[5m])
+  rate(servicemap_postgres_request_duration_seconds_count[5m])
 ) * 1000 > 200
 ```
 
@@ -458,25 +457,25 @@ rate(coroot_servicemap_tcp_connect_failed_total{
 
 ```promql
 # Redis 请求总量（所有实例合计）
-sum(rate(coroot_servicemap_redis_requests_total[5m]))
+sum(rate(servicemap_redis_requests_total[5m]))
 
 # Redis 错误请求（WRONGTYPE、NOAUTH 等）
-sum by (container_id, destination, status) (
-  rate(coroot_servicemap_redis_request_errors_total[5m])
+sum by (source_id, destination, status) (
+  rate(servicemap_redis_request_errors_total[5m])
 )
 
 # Redis 平均响应时间（正常应 < 1ms）
 (
-  rate(coroot_servicemap_redis_request_duration_seconds_sum[5m])
+  rate(servicemap_redis_request_duration_seconds_sum[5m])
   /
-  rate(coroot_servicemap_redis_request_duration_seconds_count[5m])
+  rate(servicemap_redis_request_duration_seconds_count[5m])
 ) * 1000
 
 # 告警：Redis 响应时间超过 5ms（可能存在大 Key 或网络问题）
 (
-  rate(coroot_servicemap_redis_request_duration_seconds_sum[5m])
+  rate(servicemap_redis_request_duration_seconds_sum[5m])
   /
-  rate(coroot_servicemap_redis_request_duration_seconds_count[5m])
+  rate(servicemap_redis_request_duration_seconds_count[5m])
 ) * 1000 > 5
 ```
 
@@ -484,17 +483,17 @@ sum by (container_id, destination, status) (
 
 ```promql
 # Kafka 生产/消费请求速率
-sum by (container_id, destination) (
-  rate(coroot_servicemap_kafka_requests_total[5m])
+sum by (source_id, destination) (
+  rate(servicemap_kafka_requests_total[5m])
 )
 
 # Kafka 错误率
-sum by (container_id, destination) (
-  rate(coroot_servicemap_kafka_request_errors_total[5m])
+sum by (source_id, destination) (
+  rate(servicemap_kafka_request_errors_total[5m])
 )
 /
-sum by (container_id, destination) (
-  rate(coroot_servicemap_kafka_requests_total[5m])
+sum by (source_id, destination) (
+  rate(servicemap_kafka_requests_total[5m])
 )
 ```
 
@@ -504,8 +503,8 @@ sum by (container_id, destination) (
 
 ```promql
 # 通用模板（$protocol = mysql / postgres / redis / kafka）
-sum by (container_id, destination) (
-  rate(coroot_servicemap_${protocol}_requests_total[5m])
+sum by (source_id, destination) (
+  rate(servicemap_${protocol}_requests_total[5m])
 )
 ```
 
@@ -537,17 +536,17 @@ curl http://localhost:9099/graph/text | grep ":3306"
 - 连接延迟突增（DNS 解析慢、内核参数不当）
 - 连接数耗尽（连接池泄漏、慢查询持续占用连接）
 
-`coroot_servicemap` 从内核层直接观测 TCP 状态机，提供最接近"真相"的网络诊断数据。
+`servicemap` 从内核层直接观测 TCP 状态机，提供最接近"真相"的网络诊断数据。
 
 ### 关键诊断指标
 
 | 指标 | 类型 | 诊断意义 |
 |------|------|---------|
-| `coroot_servicemap_tcp_connect_failed_total` | Counter | 连接建立失败次数（目标不可达、拒绝连接） |
-| `coroot_servicemap_tcp_retransmits_total` | Counter | TCP 重传次数（丢包信号） |
-| `coroot_servicemap_tcp_connect_duration_seconds_sum/count` | Counter | 连接建立时延（SYN→SYN-ACK 耗时） |
-| `coroot_servicemap_tcp_active_connections` | Gauge | 当前活跃连接数（连接泄漏检测） |
-| `coroot_servicemap_tcp_connects_total` | Counter | 成功建立连接总数 |
+| `servicemap_tcp_connect_failed_total` | Counter | 连接建立失败次数（目标不可达、拒绝连接） |
+| `servicemap_tcp_retransmits_total` | Counter | TCP 重传次数（丢包信号） |
+| `servicemap_tcp_connect_duration_seconds_sum/count` | Counter | 连接建立时延（SYN→SYN-ACK 耗时） |
+| `servicemap_tcp_active_connections` | Gauge | 当前活跃连接数（连接泄漏检测） |
+| `servicemap_tcp_connects_total` | Counter | 成功建立连接总数 |
 
 ### 故障场景一：服务不可达（连接失败率飙升）
 
@@ -556,28 +555,28 @@ curl http://localhost:9099/graph/text | grep ":3306"
 **诊断查询**：
 ```promql
 # 连接失败率（按服务对）
-sum by (container_id, destination) (
-  rate(coroot_servicemap_tcp_connect_failed_total[5m])
+sum by (source_id, destination) (
+  rate(servicemap_tcp_connect_failed_total[5m])
 )
 /
 (
-  sum by (container_id, destination) (
-    rate(coroot_servicemap_tcp_connects_total[5m])
+  sum by (source_id, destination) (
+    rate(servicemap_tcp_connects_total[5m])
   )
   +
-  sum by (container_id, destination) (
-    rate(coroot_servicemap_tcp_connect_failed_total[5m])
+  sum by (source_id, destination) (
+    rate(servicemap_tcp_connect_failed_total[5m])
   )
 ) > 0.01
 
 # 绝对值：近 1 分钟新增连接失败数
-sum by (container_id, destination) (
-  increase(coroot_servicemap_tcp_connect_failed_total[1m])
+sum by (source_id, destination) (
+  increase(servicemap_tcp_connect_failed_total[1m])
 ) > 5
 
 # 对比：同目标的历史成功连接（判断是否从未连通过）
 sum by (destination) (
-  increase(coroot_servicemap_tcp_connects_total[10m])
+  increase(servicemap_tcp_connects_total[10m])
 )
 ```
 
@@ -588,14 +587,14 @@ groups:
     rules:
       - alert: TCPConnectFailureHigh
         expr: |
-          sum by (container_id, destination) (
-            rate(coroot_servicemap_tcp_connect_failed_total[5m])
+          sum by (source_id, destination) (
+            rate(servicemap_tcp_connect_failed_total[5m])
           ) > 0.5
         for: 2m
         labels:
           severity: warning
         annotations:
-          summary: "服务 {{ $labels.container_id }} 到 {{ $labels.destination }} 连接失败率高"
+          summary: "服务 {{ $labels.source_name }} 到 {{ $labels.destination }} 连接失败率高"
           description: "每秒连接失败 {{ $value | humanize }} 次，请检查目标服务和防火墙策略"
 ```
 
@@ -606,22 +605,22 @@ groups:
 **诊断查询**：
 ```promql
 # 重传速率（每秒）
-sum by (container_id, destination) (
-  rate(coroot_servicemap_tcp_retransmits_total[5m])
+sum by (source_id, destination) (
+  rate(servicemap_tcp_retransmits_total[5m])
 )
 
 # 重传比率 = 重传次数 / 成功连接次数（近似丢包率指标）
 sum by (destination) (
-  rate(coroot_servicemap_tcp_retransmits_total[5m])
+  rate(servicemap_tcp_retransmits_total[5m])
 )
 /
 sum by (destination) (
-  rate(coroot_servicemap_tcp_connects_total[5m])
+  rate(servicemap_tcp_connects_total[5m])
 )
 
 # 告警：某路径重传速率 > 10/s
-sum by (container_id, destination) (
-  rate(coroot_servicemap_tcp_retransmits_total[5m])
+sum by (source_id, destination) (
+  rate(servicemap_tcp_retransmits_total[5m])
 ) > 10
 ```
 
@@ -629,14 +628,14 @@ sum by (container_id, destination) (
 ```yaml
       - alert: TCPRetransmitHigh
         expr: |
-          sum by (container_id, destination) (
-            rate(coroot_servicemap_tcp_retransmits_total[5m])
+          sum by (source_id, destination) (
+            rate(servicemap_tcp_retransmits_total[5m])
           ) > 5
         for: 3m
         labels:
           severity: warning
         annotations:
-          summary: "{{ $labels.container_id }} → {{ $labels.destination }} 存在大量 TCP 重传"
+          summary: "{{ $labels.source_name }} → {{ $labels.destination }} 存在大量 TCP 重传"
           description: "重传速率 {{ $value | humanize }}/s，可能存在网络丢包，建议检查物理链路和网卡"
 ```
 
@@ -647,22 +646,22 @@ sum by (container_id, destination) (
 **诊断查询**：
 ```promql
 # 平均 TCP 连接建立时延（毫秒）
-sum by (container_id, destination) (
-  rate(coroot_servicemap_tcp_connect_duration_seconds_sum[5m])
+sum by (source_id, destination) (
+  rate(servicemap_tcp_connect_duration_seconds_sum[5m])
 )
 /
-sum by (container_id, destination) (
-  rate(coroot_servicemap_tcp_connect_duration_seconds_count[5m])
+sum by (source_id, destination) (
+  rate(servicemap_tcp_connect_duration_seconds_count[5m])
 ) * 1000
 
 # 告警：同机房连接时延 > 5ms
 (
-  sum by (container_id, destination) (
-    rate(coroot_servicemap_tcp_connect_duration_seconds_sum[5m])
+  sum by (source_id, destination) (
+    rate(servicemap_tcp_connect_duration_seconds_sum[5m])
   )
   /
-  sum by (container_id, destination) (
-    rate(coroot_servicemap_tcp_connect_duration_seconds_count[5m])
+  sum by (source_id, destination) (
+    rate(servicemap_tcp_connect_duration_seconds_count[5m])
   )
 ) * 1000 > 5
 ```
@@ -674,21 +673,21 @@ sum by (container_id, destination) (
 **诊断查询**：
 ```promql
 # 活跃连接数随时间的变化趋势
-sum by (container_id, destination) (
-  coroot_servicemap_tcp_active_connections
+sum by (source_id, destination) (
+  servicemap_tcp_active_connections
 )
 
 # 对比新建连接速率（如果新建 >> 关闭，说明泄漏）
 # 新建速率
-sum by (container_id) (
-  rate(coroot_servicemap_tcp_connects_total[5m])
+sum by (source_id) (
+  rate(servicemap_tcp_connects_total[5m])
 )
 
 # 如果 active_connections 持续线性增长而 connects_total 增速平稳 → 连接泄漏
 # 通过 deriv() 检测连接数是否持续增长
 deriv(
-  sum by (container_id, destination) (
-    coroot_servicemap_tcp_active_connections
+  sum by (source_id, destination) (
+    servicemap_tcp_active_connections
   )[10m:]
 ) > 1
 ```
@@ -731,51 +730,51 @@ deriv(
 - 下个季度业务翻倍，网络带宽够用吗？
 - 哪条调用链路的流量最大，需要优先优化？
 
-`coroot_servicemap` 提供字节级别的流量统计和连接数指标，是容量规划的重要数据来源。
+`servicemap` 提供字节级别的流量统计和连接数指标，是容量规划的重要数据来源。
 
 ### 关键指标
 
 | 指标 | 说明 |
 |------|------|
-| `coroot_servicemap_tcp_bytes_sent_total` | 容器维度：累计发送字节数 |
-| `coroot_servicemap_tcp_bytes_received_total` | 容器维度：累计接收字节数 |
-| `coroot_servicemap_edge_bytes_sent_total` | 边维度：A→B 累计发送字节数 |
-| `coroot_servicemap_edge_bytes_received_total` | 边维度：A→B 累计接收字节数 |
-| `coroot_servicemap_tcp_active_connections` | 当前活跃连接数 |
-| `coroot_servicemap_edge_active_connections` | 指定调用边的活跃连接数 |
-| `coroot_servicemap_host_bytes_sent_total` | 主机维度：总发送字节（无容器时） |
-| `coroot_servicemap_host_bytes_received_total` | 主机维度：总接收字节（无容器时） |
+| `servicemap_tcp_bytes_sent_total` | 容器维度：累计发送字节数 |
+| `servicemap_tcp_bytes_received_total` | 容器维度：累计接收字节数 |
+| `servicemap_edge_bytes_sent_total` | 边维度：A→B 累计发送字节数 |
+| `servicemap_edge_bytes_received_total` | 边维度：A→B 累计接收字节数 |
+| `servicemap_tcp_active_connections` | 当前活跃连接数 |
+| `servicemap_edge_active_connections` | 指定调用边的活跃连接数 |
+| `servicemap_host_bytes_sent_total` | 主机维度：总发送字节（无容器时） |
+| `servicemap_host_bytes_received_total` | 主机维度：总接收字节（无容器时） |
 
 ### 带宽消耗分析
 
 ```promql
 # 各服务对之间的出站带宽（bytes/s）
 sum by (source_name, destination_host, destination_port) (
-  rate(coroot_servicemap_edge_bytes_sent_total[5m])
+  rate(servicemap_edge_bytes_sent_total[5m])
 )
 
 # 各服务对之间的入站带宽（bytes/s）
 sum by (source_name, destination_host, destination_port) (
-  rate(coroot_servicemap_edge_bytes_received_total[5m])
+  rate(servicemap_edge_bytes_received_total[5m])
 )
 
 # Top 10 带宽消耗的调用边（出站）
 topk(10,
   sum by (source_name, destination) (
-    rate(coroot_servicemap_edge_bytes_sent_total[5m])
+    rate(servicemap_edge_bytes_sent_total[5m])
   )
 )
 
 # 单个容器的总带宽（发送+接收）
-sum by (container_id) (
-  rate(coroot_servicemap_tcp_bytes_sent_total[5m])
+sum by (source_id) (
+  rate(servicemap_tcp_bytes_sent_total[5m])
   +
-  rate(coroot_servicemap_tcp_bytes_received_total[5m])
+  rate(servicemap_tcp_bytes_received_total[5m])
 )
 
 # 以 MB/s 为单位显示
 sum by (source_name, destination) (
-  rate(coroot_servicemap_edge_bytes_sent_total[5m])
+  rate(servicemap_edge_bytes_sent_total[5m])
 ) / 1024 / 1024
 ```
 
@@ -783,29 +782,29 @@ sum by (source_name, destination) (
 
 ```promql
 # 当前全局活跃连接总数
-sum(coroot_servicemap_tcp_active_connections)
+sum(servicemap_tcp_active_connections)
 
 # 按目标服务分组，查看每个下游服务承受的连接压力
 sum by (destination) (
-  coroot_servicemap_edge_active_connections
+  servicemap_edge_active_connections
 )
 
 # 某数据库实例承受的客户端连接数
 sum by (destination) (
-  coroot_servicemap_tcp_active_connections{
+  servicemap_tcp_active_connections{
     destination=~".*:3306"
   }
 )
 
 # 告警：到某 MySQL 实例的连接数 > 80（接近连接池上限）
 sum by (destination) (
-  coroot_servicemap_tcp_active_connections{
+  servicemap_tcp_active_connections{
     destination=~".*:3306"
   }
 ) > 80
 
 # 当前 tracer 追踪的全局连接数（插件自身容量监控）
-coroot_servicemap_tracer_active_connections
+servicemap_tracer_active_connections
 ```
 
 ### 流量趋势与增长预测
@@ -813,18 +812,18 @@ coroot_servicemap_tracer_active_connections
 ```promql
 # 计算过去 7 天的日均带宽增长率（适用于 VictoriaMetrics 长期存储）
 (
-  sum(rate(coroot_servicemap_edge_bytes_sent_total[1d] offset 0d))
+  sum(rate(servicemap_edge_bytes_sent_total[1d] offset 0d))
   -
-  sum(rate(coroot_servicemap_edge_bytes_sent_total[1d] offset 7d))
+  sum(rate(servicemap_edge_bytes_sent_total[1d] offset 7d))
 )
 /
-sum(rate(coroot_servicemap_edge_bytes_sent_total[1d] offset 7d))
+sum(rate(servicemap_edge_bytes_sent_total[1d] offset 7d))
 * 100
 
 # 环比：本周 vs 上周同时段带宽
-sum(rate(coroot_servicemap_tcp_bytes_sent_total[1h]))
+sum(rate(servicemap_tcp_bytes_sent_total[1h]))
 /
-sum(rate(coroot_servicemap_tcp_bytes_sent_total[1h] offset 7d))
+sum(rate(servicemap_tcp_bytes_sent_total[1h] offset 7d))
 ```
 
 ### HTTP 流量分析
@@ -832,21 +831,21 @@ sum(rate(coroot_servicemap_tcp_bytes_sent_total[1h] offset 7d))
 ```promql
 # 各接口（method）的请求速率
 sum by (source_name, destination, method) (
-  rate(coroot_servicemap_http_requests_total[5m])
+  rate(servicemap_http_requests_total[5m])
 )
 
 # HTTP 响应体积（带宽消耗）
 sum by (source_name, destination) (
-  rate(coroot_servicemap_http_bytes_received_total[5m])
+  rate(servicemap_http_bytes_received_total[5m])
 ) / 1024 / 1024  # MB/s
 
 # 大请求体检测：平均每次请求接收字节数 > 1MB
 sum by (source_name, destination, method) (
-  rate(coroot_servicemap_http_bytes_received_total[5m])
+  rate(servicemap_http_bytes_received_total[5m])
 )
 /
 sum by (source_name, destination, method) (
-  rate(coroot_servicemap_http_requests_total[5m])
+  rate(servicemap_http_requests_total[5m])
 ) > 1048576
 ```
 
@@ -876,33 +875,33 @@ sum by (source_name, destination, method) (
 - **依赖蔓延**：某服务悄悄开始调用了不该调用的下游
 - **合规风险**：数据库被未授权服务访问
 
-`coroot_servicemap` 持续记录所有 TCP 连接，天然适合作为**东西向流量审计**的数据来源。
+`servicemap` 持续记录所有 TCP 连接，天然适合作为**东西向流量审计**的数据来源。
 
 ### 安全审计核心查询
 
 ```promql
 # 列出所有当前活跃的服务调用边（审计基线）
-coroot_servicemap_edge_active_connections > 0
+servicemap_edge_active_connections > 0
 
 # 发现连接到敏感端口的服务
-coroot_servicemap_edge_active_connections{
+servicemap_edge_active_connections{
   destination_port=~"3306|5432|6379|27017|9092"
 } > 0
 
 # 发现向外部 IP 建立连接的容器（目标不在内网段）
 # 需结合 ignore_cidrs 配置使用；内网 CIDR 外的连接即为潜在外连
-coroot_servicemap_edge_active_connections{
+servicemap_edge_active_connections{
   destination_host!~"^10\\.|^172\\.(1[6-9]|2[0-9]|3[01])\\.|^192\\.168\\."
 } > 0
 
 # 发现某时间段内新出现的连接（与基线对比）
 # 基线：过去 24 小时从未出现的服务对，当前却有连接
 (
-  coroot_servicemap_edge_active_connections > 0
+  servicemap_edge_active_connections > 0
 )
 unless
 (
-  sum_over_time(coroot_servicemap_edge_active_connections[24h]) > 0
+  sum_over_time(servicemap_edge_active_connections[24h]) > 0
 )
 ```
 
@@ -933,7 +932,7 @@ groups:
       - alert: UnexpectedDatabaseAccess
         expr: |
           sum by (source_name, destination, destination_port) (
-            coroot_servicemap_edge_active_connections{
+            servicemap_edge_active_connections{
               destination_port=~"3306|5432|6379|27017"
             }
           ) > 0
@@ -947,7 +946,7 @@ groups:
       # 连接到敏感管理端口
       - alert: SensitivePortAccess
         expr: |
-          coroot_servicemap_edge_active_connections{
+          servicemap_edge_active_connections{
             destination_port=~"22|2379|2380|10250|6443"
           } > 0
         for: 1m
@@ -960,7 +959,7 @@ groups:
       # 连接到外部 IP（非内网）
       - alert: ExternalOutboundConnection
         expr: |
-          coroot_servicemap_edge_active_connections{
+          servicemap_edge_active_connections{
             destination_host!~"^10\\.|^172\\.(1[6-9]|2[0-9]|3[01])\\.|^192\\.168\\.|^127\\."
           } > 0
         for: 2m
@@ -976,7 +975,7 @@ groups:
 ```promql
 # 检测 dev namespace 的服务是否在访问 prod 的数据库
 # （需要 Namespace 标签正确配置）
-coroot_servicemap_edge_active_connections{
+servicemap_edge_active_connections{
   namespace="dev",
   destination=~".*prod.*|10\\.0\\.1\\..+"
 } > 0
@@ -987,11 +986,11 @@ coroot_servicemap_edge_active_connections{
 ```promql
 # 过去 7 天出现过但今天消失的连接（可能是攻击者清理痕迹）
 (
-  sum_over_time(coroot_servicemap_edge_active_connections[7d] offset 1d) > 0
+  sum_over_time(servicemap_edge_active_connections[7d] offset 1d) > 0
 )
 unless
 (
-  coroot_servicemap_edge_active_connections > 0
+  servicemap_edge_active_connections > 0
 )
 
 # 某容器在深夜（0~6点）建立的连接次数（异常时间窗口活动）
@@ -1041,7 +1040,7 @@ curl http://localhost:9099/graph | \
 
 随着 AI Agent 和大语言模型（LLM）在运维领域的普及，工程师开始让 AI 自动分析系统状态、定位故障根因。但 LLM 需要**结构化的上下文输入**，而传统监控系统的数据（时序指标、日志）格式复杂，难以直接喂给模型。
 
-`coroot_servicemap` 内置 **Graph API**，提供两种 AI 友好的数据格式：
+`servicemap` 内置 **Graph API**，提供两种 AI 友好的数据格式：
 
 - **`/graph`**：标准 JSON，供程序化 AI Agent 解析
 - **`/graph/text`**：纯文本，直接嵌入 LLM Prompt，无需预处理
@@ -1281,7 +1280,7 @@ def diff_graphs(snapshot_before: str, snapshot_after: str):
 - 降级策略是否生效？
 - 故障恢复后拓扑是否恢复正常？
 
-`coroot_servicemap` 提供实时的连接状态和 L7 指标，是混沌实验的理想观测工具。
+`servicemap` 提供实时的连接状态和 L7 指标，是混沌实验的理想观测工具。
 
 ### 典型混沌实验观测流程
 
@@ -1303,20 +1302,20 @@ http_requests正常       http_5xx↑               基线对比一致
 ```promql
 # 立即检测到连接失败
 sum by (source_name, destination) (
-  rate(coroot_servicemap_tcp_connect_failed_total[1m])
+  rate(servicemap_tcp_connect_failed_total[1m])
 ) > 0
 
 # HTTP 错误率飙升（调用方视角）
 sum by (source_name, destination) (
-  rate(coroot_servicemap_http_request_errors_total[1m])
+  rate(servicemap_http_request_errors_total[1m])
 )
 /
 sum by (source_name, destination) (
-  rate(coroot_servicemap_http_requests_total[1m])
+  rate(servicemap_http_requests_total[1m])
 ) > 0.5
 
 # 活跃连接数下降到 0
-coroot_servicemap_edge_active_connections{
+servicemap_edge_active_connections{
   destination=~".*:8080"   # user-service 端口
 } == 0
 ```
@@ -1324,7 +1323,7 @@ coroot_servicemap_edge_active_connections{
 **验证熔断器**：
 ```promql
 # 熔断后调用方应停止发起连接（connects_total 不再增加）
-increase(coroot_servicemap_tcp_connects_total{
+increase(servicemap_tcp_connects_total{
   destination=~".*:8080"
 }[1m]) == 0
 ```
@@ -1342,22 +1341,22 @@ tc qdisc add dev eth0 root netem delay 200ms
 ```promql
 # TCP 连接建立时延应升高
 (
-  rate(coroot_servicemap_tcp_connect_duration_seconds_sum[1m])
+  rate(servicemap_tcp_connect_duration_seconds_sum[1m])
   /
-  rate(coroot_servicemap_tcp_connect_duration_seconds_count[1m])
+  rate(servicemap_tcp_connect_duration_seconds_count[1m])
 ) * 1000 > 150
 
 # HTTP 请求平均延迟应升高
 (
-  rate(coroot_servicemap_http_request_duration_seconds_sum[1m])
+  rate(servicemap_http_request_duration_seconds_sum[1m])
   /
-  rate(coroot_servicemap_http_request_duration_seconds_count[1m])
+  rate(servicemap_http_request_duration_seconds_count[1m])
 ) * 1000
 
 # 超时导致的 HTTP 5xx 比例
-rate(coroot_servicemap_http_request_errors_total{status_class="5xx"}[1m])
+rate(servicemap_http_request_errors_total{status_class="5xx"}[1m])
 /
-rate(coroot_servicemap_http_requests_total[1m])
+rate(servicemap_http_requests_total[1m])
 ```
 
 ### 实验三：网络丢包注入
@@ -1371,12 +1370,12 @@ tc qdisc add dev eth0 root netem loss 10%
 **观测查询**：
 ```promql
 # 重传率应显著上升
-sum by (container_id, destination) (
-  rate(coroot_servicemap_tcp_retransmits_total[1m])
+sum by (source_id, destination) (
+  rate(servicemap_tcp_retransmits_total[1m])
 )
 
 # 吞吐量下降（bytes/s）
-rate(coroot_servicemap_tcp_bytes_sent_total[1m])
+rate(servicemap_tcp_bytes_sent_total[1m])
 ```
 
 ### 实验四：数据库连接池耗尽
@@ -1387,22 +1386,22 @@ rate(coroot_servicemap_tcp_bytes_sent_total[1m])
 ```promql
 # 到 MySQL 的活跃连接数持续增长
 sum by (destination) (
-  coroot_servicemap_tcp_active_connections{
+  servicemap_tcp_active_connections{
     destination=~".*:3306"
   }
 )
 
 # MySQL 请求延迟飙升（等待连接）
 (
-  rate(coroot_servicemap_mysql_request_duration_seconds_sum[1m])
+  rate(servicemap_mysql_request_duration_seconds_sum[1m])
   /
-  rate(coroot_servicemap_mysql_request_duration_seconds_count[1m])
+  rate(servicemap_mysql_request_duration_seconds_count[1m])
 ) * 1000 > 500
 
 # MySQL 错误率上升（连接超时）
-rate(coroot_servicemap_mysql_request_errors_total[1m])
+rate(servicemap_mysql_request_errors_total[1m])
 /
-rate(coroot_servicemap_mysql_requests_total[1m]) > 0.1
+rate(servicemap_mysql_requests_total[1m]) > 0.1
 ```
 
 ### 混沌实验自动化检查脚本
@@ -1450,7 +1449,7 @@ fi
 
 ### 背景
 
-eBPF 仅支持 Linux，但开发团队通常在 macOS 或 Windows 上工作。`coroot_servicemap` 在非 Linux 平台上会自动降级为**轮询模式**，使用 `gopsutil` 从 `/proc` 或系统 API 获取网络连接信息，保持大部分功能可用。
+eBPF 仅支持 Linux，但开发团队通常在 macOS 或 Windows 上工作。`servicemap` 在非 Linux 平台上会自动降级为**轮询模式**，使用 `gopsutil` 从 `/proc` 或系统 API 获取网络连接信息，保持大部分功能可用。
 
 ### 轮询模式 vs eBPF 模式对比
 
@@ -1495,11 +1494,11 @@ cd /path/to/categraf
 go build -o categraf .
 
 # 运行（无需 root，但 Docker socket 可能需要权限）
-./categraf --inputs coroot_servicemap
+./categraf --inputs servicemap
 
 # 日志中会看到：
-# I! coroot_servicemap: netns is unsupported on darwin, running with polling fallback
-# I! coroot_servicemap: graph API listening on http://:9099/graph
+# I! servicemap: netns is unsupported on darwin, running with polling fallback
+# I! servicemap: graph API listening on http://:9099/graph
 ```
 
 ### 本地开发调试工作流
@@ -1509,7 +1508,7 @@ go build -o categraf .
 docker compose up -d
 
 # 2. 启动 categraf（轮询模式自动生效）
-./categraf --inputs coroot_servicemap
+./categraf --inputs servicemap
 
 # 3. 查看本地服务拓扑
 curl http://localhost:9099/graph/text
@@ -1534,7 +1533,7 @@ wsl
 
 # 进入 WSL2 后按 Linux 方式操作
 uname -r   # 检查内核版本（WSL2 通常 >= 5.15）
-sudo ./categraf --inputs coroot_servicemap
+sudo ./categraf --inputs servicemap
 ```
 
 ---
@@ -1544,7 +1543,7 @@ sudo ./categraf --inputs coroot_servicemap
 ### 架构概览
 
 ```
-categraf (coroot_servicemap)
+categraf (servicemap)
         │
         │ remote_write / scrape
         ▼
@@ -1653,9 +1652,10 @@ Row 5: 容量
 #### 关键 Grafana 变量
 
 ```
-$namespace   = label_values(coroot_servicemap_edge_active_connections, namespace)
-$source      = label_values(coroot_servicemap_edge_active_connections, source_name)
-$destination = label_values(coroot_servicemap_edge_active_connections, destination_host)
+$namespace   = label_values(servicemap_edge_active_connections, namespace)
+$source      = label_values(servicemap_edge_active_connections, source_name)
+$destination = label_values(servicemap_edge_active_connections, destination_host)
+$source_type = [bare_process, container]
 $protocol    = [mysql, postgres, redis, kafka]
 $interval    = [1m, 5m, 15m, 1h]
 ```
@@ -1664,14 +1664,14 @@ $interval    = [1m, 5m, 15m, 1h]
 
 ```yaml
 groups:
-  - name: coroot_servicemap
+  - name: servicemap
     interval: 30s
     rules:
       # ── TCP 层 ──────────────────────────────────────────
       - alert: TCPConnectFailureHigh
         expr: |
           sum by (source_name, destination) (
-            rate(coroot_servicemap_tcp_connect_failed_total[5m])
+            rate(servicemap_tcp_connect_failed_total[5m])
           ) > 1
         for: 2m
         labels:
@@ -1682,8 +1682,8 @@ groups:
 
       - alert: TCPRetransmitHigh
         expr: |
-          sum by (container_id, destination) (
-            rate(coroot_servicemap_tcp_retransmits_total[5m])
+          sum by (source_id, destination) (
+            rate(servicemap_tcp_retransmits_total[5m])
           ) > 5
         for: 3m
         labels:
@@ -1694,11 +1694,11 @@ groups:
       - alert: HTTPErrorRateHigh
         expr: |
           sum by (source_name, destination, method) (
-            rate(coroot_servicemap_http_request_errors_total[5m])
+            rate(servicemap_http_request_errors_total[5m])
           )
           /
           sum by (source_name, destination, method) (
-            rate(coroot_servicemap_http_requests_total[5m])
+            rate(servicemap_http_requests_total[5m])
           ) > 0.05
         for: 2m
         labels:
@@ -1709,11 +1709,11 @@ groups:
         expr: |
           (
             sum by (source_name, destination) (
-              rate(coroot_servicemap_http_request_duration_seconds_sum[5m])
+              rate(servicemap_http_request_duration_seconds_sum[5m])
             )
             /
             sum by (source_name, destination) (
-              rate(coroot_servicemap_http_request_duration_seconds_count[5m])
+              rate(servicemap_http_request_duration_seconds_count[5m])
             )
           ) * 1000 > 500
         for: 5m
@@ -1725,9 +1725,9 @@ groups:
       - alert: MySQLLatencyHigh
         expr: |
           (
-            rate(coroot_servicemap_mysql_request_duration_seconds_sum[5m])
+            rate(servicemap_mysql_request_duration_seconds_sum[5m])
             /
-            rate(coroot_servicemap_mysql_request_duration_seconds_count[5m])
+            rate(servicemap_mysql_request_duration_seconds_count[5m])
           ) * 1000 > 100
         for: 5m
         labels:
@@ -1737,9 +1737,9 @@ groups:
       - alert: RedisLatencyHigh
         expr: |
           (
-            rate(coroot_servicemap_redis_request_duration_seconds_sum[5m])
+            rate(servicemap_redis_request_duration_seconds_sum[5m])
             /
-            rate(coroot_servicemap_redis_request_duration_seconds_count[5m])
+            rate(servicemap_redis_request_duration_seconds_count[5m])
           ) * 1000 > 10
         for: 3m
         labels:
@@ -1749,7 +1749,7 @@ groups:
       # ── 插件自身健康 ──────────────────────────────────────
       - alert: ServiceMapTrackerOverload
         expr: |
-          coroot_servicemap_tracer_active_connections > 40000
+          servicemap_tracer_active_connections > 40000
         for: 5m
         labels:
           severity: warning
@@ -1774,31 +1774,31 @@ groups:
       - record: job:servicemap_http_error_rate:5m
         expr: |
           sum by (source_name, destination) (
-            rate(coroot_servicemap_http_request_errors_total[5m])
+            rate(servicemap_http_request_errors_total[5m])
           )
           /
           sum by (source_name, destination) (
-            rate(coroot_servicemap_http_requests_total[5m])
+            rate(servicemap_http_requests_total[5m])
           )
 
       - record: job:servicemap_http_latency_ms:5m
         expr: |
           (
             sum by (source_name, destination) (
-              rate(coroot_servicemap_http_request_duration_seconds_sum[5m])
+              rate(servicemap_http_request_duration_seconds_sum[5m])
             )
             /
             sum by (source_name, destination) (
-              rate(coroot_servicemap_http_request_duration_seconds_count[5m])
+              rate(servicemap_http_request_duration_seconds_count[5m])
             )
           ) * 1000
 
       - record: job:servicemap_edge_bandwidth_mbps:5m
         expr: |
           sum by (source_name, destination_host, destination_port) (
-            rate(coroot_servicemap_edge_bytes_sent_total[5m])
+            rate(servicemap_edge_bytes_sent_total[5m])
             +
-            rate(coroot_servicemap_edge_bytes_received_total[5m])
+            rate(servicemap_edge_bytes_received_total[5m])
           ) / 1048576
 ```
 
@@ -1809,7 +1809,7 @@ groups:
 ### 完整 TOML 配置模板
 
 ```toml
-# conf/input.coroot_servicemap/servicemap.toml
+# conf/input.servicemap/servicemap.toml
 
 # 采集间隔（秒）
 # 推荐：生产环境 60s，调试时可缩短到 15s
@@ -1838,6 +1838,10 @@ ignore_ports = [22, 9100, 10250, 10255, 2379, 2380]
 # 忽略的 CIDR（不追踪这些网段的连接）
 # 建议至少忽略本地回环
 ignore_cidrs = ["127.0.0.0/8", "169.254.0.0/16"]
+
+# Docker label 白名单：只有列出的 label key 才会透传为 Prometheus 标签
+# 留空则不透传任何 Docker label（推荐，防止高基数标签导致时序爆炸）
+# label_allowlist = ["app", "version", "team"]
 
 # ── 容器发现 ───────────────────────────────────────────────
 # Docker socket 路径（留空使用默认 /var/run/docker.sock）
@@ -1873,42 +1877,44 @@ api_addr = ":9099"
 
 | 指标名 | 类型 | 维度标签 |
 |--------|------|---------|
-| `coroot_servicemap_tcp_connects_total` | Counter | `container_id`, `destination` |
-| `coroot_servicemap_tcp_connect_failed_total` | Counter | `container_id`, `destination` |
-| `coroot_servicemap_tcp_retransmits_total` | Counter | `container_id`, `destination` |
-| `coroot_servicemap_tcp_bytes_sent_total` | Counter | `container_id`, `destination` |
-| `coroot_servicemap_tcp_bytes_received_total` | Counter | `container_id`, `destination` |
-| `coroot_servicemap_tcp_connect_duration_seconds_sum` | Counter | `container_id`, `destination` |
-| `coroot_servicemap_tcp_connect_duration_seconds_count` | Counter | `container_id`, `destination` |
-| `coroot_servicemap_tcp_active_connections` | Gauge | `container_id`, `destination` |
-| `coroot_servicemap_http_requests_total` | Counter | `container_id`, `destination`, `method`, `status_code`, `status_class` |
-| `coroot_servicemap_http_request_errors_total` | Counter | 同上 |
-| `coroot_servicemap_http_request_duration_seconds_sum` | Counter | 同上 |
-| `coroot_servicemap_http_request_duration_seconds_count` | Counter | 同上 |
-| `coroot_servicemap_http_bytes_sent_total` | Counter | 同上 |
-| `coroot_servicemap_http_bytes_received_total` | Counter | 同上 |
-| `coroot_servicemap_mysql_requests_total` | Counter | `container_id`, `destination`, `protocol`, `status` |
-| `coroot_servicemap_mysql_request_errors_total` | Counter | 同上 |
-| `coroot_servicemap_mysql_request_duration_seconds_sum` | Counter | 同上 |
-| `coroot_servicemap_mysql_request_duration_seconds_count` | Counter | 同上 |
-| `coroot_servicemap_postgres_*` | 同 MySQL | 同上 |
-| `coroot_servicemap_redis_*` | 同 MySQL | 同上 |
-| `coroot_servicemap_kafka_*` | 同 MySQL | 同上 |
-| `coroot_servicemap_edge_connects_total` | Counter | `source_id`, `source_name`, `destination`, `destination_host`, `destination_port`, `namespace`, `pod_name` |
-| `coroot_servicemap_edge_connect_failed_total` | Counter | 同上 |
-| `coroot_servicemap_edge_retransmits_total` | Counter | 同上 |
-| `coroot_servicemap_edge_bytes_sent_total` | Counter | 同上 |
-| `coroot_servicemap_edge_bytes_received_total` | Counter | 同上 |
-| `coroot_servicemap_edge_active_connections` | Gauge | 同上 |
-| `coroot_servicemap_graph_nodes` | Gauge | （无） |
-| `coroot_servicemap_graph_edges` | Gauge | （无） |
-| `coroot_servicemap_tracer_active_connections` | Gauge | （无） |
-| `coroot_servicemap_tracer_listen_ports` | Gauge | （无） |
-| `coroot_servicemap_tracked_containers` | Gauge | （无） |
-| `coroot_servicemap_host_active_connections` | Gauge | `host` |
-| `coroot_servicemap_host_bytes_sent_total` | Counter | `host` |
-| `coroot_servicemap_host_bytes_received_total` | Counter | `host` |
+| `servicemap_tcp_connects_total` | Counter | `source_id`, `source_name`, `source_type`, `destination` |
+| `servicemap_tcp_connect_failed_total` | Counter | 同上 |
+| `servicemap_tcp_retransmits_total` | Counter | 同上 |
+| `servicemap_tcp_bytes_sent_total` | Counter | 同上 |
+| `servicemap_tcp_bytes_received_total` | Counter | 同上 |
+| `servicemap_tcp_connect_duration_seconds_sum` | Counter | 同上 |
+| `servicemap_tcp_connect_duration_seconds_count` | Counter | 同上 |
+| `servicemap_tcp_active_connections` | Gauge | 同上 |
+| `servicemap_http_requests_total` | Counter | `source_id`, `source_name`, `source_type`, `destination`, `method`, `status_code`, `status_class` |
+| `servicemap_http_request_errors_total` | Counter | 同上 |
+| `servicemap_http_request_duration_seconds_sum` | Counter | 同上 |
+| `servicemap_http_request_duration_seconds_count` | Counter | 同上 |
+| `servicemap_http_bytes_sent_total` | Counter | 同上 |
+| `servicemap_http_bytes_received_total` | Counter | 同上 |
+| `servicemap_mysql_requests_total` | Counter | `source_id`, `source_name`, `source_type`, `destination`, `protocol`, `status` |
+| `servicemap_mysql_request_errors_total` | Counter | 同上 |
+| `servicemap_mysql_request_duration_seconds_sum` | Counter | 同上 |
+| `servicemap_mysql_request_duration_seconds_count` | Counter | 同上 |
+| `servicemap_postgres_*` | 同 MySQL | 同上 |
+| `servicemap_redis_*` | 同 MySQL | 同上 |
+| `servicemap_kafka_*` | 同 MySQL | 同上 |
+| `servicemap_edge_connects_total` | Counter | `source_id`, `source_name`, `source_type`, `destination`, `destination_host`, `destination_port`, `namespace`*, `pod_name`* |
+| `servicemap_edge_connect_failed_total` | Counter | 同上 |
+| `servicemap_edge_retransmits_total` | Counter | 同上 |
+| `servicemap_edge_bytes_sent_total` | Counter | 同上 |
+| `servicemap_edge_bytes_received_total` | Counter | 同上 |
+| `servicemap_edge_active_connections` | Gauge | 同上 |
+| `servicemap_graph_nodes` | Gauge | `source_type`, `kube_node`* |
+| `servicemap_graph_edges` | Gauge | `source_type`, `kube_node`* |
+| `servicemap_tracer_active_connections` | Gauge | （无） |
+| `servicemap_tracer_listen_ports` | Gauge | （无） |
+| `servicemap_tracked_containers` | Gauge | （无） |
+| `servicemap_host_active_connections` | Gauge | `host` |
+| `servicemap_host_bytes_sent_total` | Counter | `host` |
+| `servicemap_host_bytes_received_total` | Counter | `host` |
+
+> *标有 `*` 的标签为条件输出：`namespace`/`pod_name` 仅在 K8s 场景输出；`kube_node` 仅在环境变量 `NODE_NAME` 存在时输出。`cluster` 标签通过 `[instances.labels]` 配置注入，框架自动附加到所有指标，无需插件特殊处理。
 
 ---
 
-*文档版本：v1.0 · 2026-03-02 · 覆盖场景一～十，含完整配置参考与指标速查表*
+*文档版本：v1.2 · 2026-03-03 · 标签命名统一（source_id/source_name/source_type）；graph_nodes/edges 增加 source_type/kube_node；新增 label_allowlist 配置；裸进程格式更新为 proc_<进程名>*

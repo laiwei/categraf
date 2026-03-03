@@ -7,7 +7,7 @@ import (
 	"net"
 	"time"
 
-	"flashcat.cloud/categraf/inputs/coroot_servicemap/l7"
+	"flashcat.cloud/categraf/inputs/servicemap/l7"
 )
 
 // rawEvent 对应 eBPF C 端的 struct event

@@ -1,4 +1,4 @@
-package coroot_servicemap
+package servicemap
 
 import (
 	"fmt"
@@ -6,9 +6,9 @@ import (
 	"testing"
 	"time"
 
-	"flashcat.cloud/categraf/inputs/coroot_servicemap/containers"
-	"flashcat.cloud/categraf/inputs/coroot_servicemap/l7"
-	"flashcat.cloud/categraf/inputs/coroot_servicemap/tracer"
+	"flashcat.cloud/categraf/inputs/servicemap/containers"
+	"flashcat.cloud/categraf/inputs/servicemap/l7"
+	"flashcat.cloud/categraf/inputs/servicemap/tracer"
 	"flashcat.cloud/categraf/types"
 )
 
@@ -47,6 +47,26 @@ func assertMetric(t *testing.T, m map[string][]*types.Sample, metric string, wan
 	if val != wantValue {
 		t.Errorf("metric %q: value=%.4f, want %.4f", metric, val, wantValue)
 	}
+}
+
+// assertMetricByTag 按指定标签键值过滤，断言匹配的第一条 sample 的値。
+func assertMetricByTag(t *testing.T, m map[string][]*types.Sample, metric, tagKey, tagValue string, wantValue float64) {
+	t.Helper()
+	samples, ok := m[metric]
+	if !ok {
+		t.Errorf("metric %q not found", metric)
+		return
+	}
+	for _, s := range samples {
+		if s.Labels[tagKey] == tagValue {
+			val := toFloat(s.Value)
+			if val != wantValue {
+				t.Errorf("metric %q{%s=%q}: value=%.4f, want %.4f", metric, tagKey, tagValue, val, wantValue)
+			}
+			return
+		}
+	}
+	t.Errorf("metric %q with %s=%q not found", metric, tagKey, tagValue)
 }
 
 func toFloat(v interface{}) float64 {
@@ -451,8 +471,8 @@ func TestCollectServiceMapStats_NodesAndEdges(t *testing.T) {
 	ins.collectServiceMapStats([]*containers.Container{c1, c2}, slist)
 	m := sampleMap(slist)
 
-	assertMetric(t, m, inputName+"_graph_nodes", 2)
-	assertMetric(t, m, inputName+"_graph_edges", 2)
+	assertMetricByTag(t, m, inputName+"_graph_nodes", "source_type", "container", 2)
+	assertMetricByTag(t, m, inputName+"_graph_edges", "source_type", "container", 2)
 }
 
 func TestCollectServiceMapStats_EdgeLabels(t *testing.T) {
@@ -640,8 +660,8 @@ func TestGather_FullPipeline(t *testing.T) {
 	}
 
 	// service map: 1 容器 → 1 个 TCP 目标 = 1 条边
-	assertMetric(t, m, inputName+"_graph_nodes", 1)
-	assertMetric(t, m, inputName+"_graph_edges", 1)
+	assertMetricByTag(t, m, inputName+"_graph_nodes", "source_type", "container", 1)
+	assertMetricByTag(t, m, inputName+"_graph_edges", "source_type", "container", 1)
 
 	// HTTP: 1 次成功
 	assertMetric(t, m, inputName+"_http_requests_total", 1)
@@ -944,7 +964,7 @@ func TestConfig_MaxContainers(t *testing.T) {
 	m := sampleMap(slist)
 
 	// graph_nodes 应为 2（MaxContainers 限制）
-	assertMetric(t, m, inputName+"_graph_nodes", 2)
+	assertMetricByTag(t, m, inputName+"_graph_nodes", "source_type", "container", 2)
 	// graph_edges 应为 2（每个容器 1 条边）
-	assertMetric(t, m, inputName+"_graph_edges", 2)
+	assertMetricByTag(t, m, inputName+"_graph_edges", "source_type", "container", 2)
 }

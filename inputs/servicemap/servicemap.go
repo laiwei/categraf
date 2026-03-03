@@ -1,11 +1,11 @@
-package coroot_servicemap
+package servicemap
 
 import (
 	"flashcat.cloud/categraf/config"
 	"flashcat.cloud/categraf/inputs"
 )
 
-const inputName = "coroot_servicemap"
+const inputName = "servicemap"
 
 type ServiceMapPlugin struct {
 	config.PluginConfig

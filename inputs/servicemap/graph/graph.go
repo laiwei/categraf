@@ -1,19 +1,18 @@
-package servicemap
+package graph
 
 import (
 	"net"
 	"strconv"
 	"strings"
 
-	"flashcat.cloud/categraf/inputs/coroot_servicemap/containers"
+	"flashcat.cloud/categraf/inputs/servicemap/containers"
 )
 
 type Node struct {
-	ID          string
-	Name        string
-	Namespace   string
-	PodName     string
-	ContainerID string
+	ID        string
+	Name      string
+	Namespace string
+	PodName   string
 }
 
 type Edge struct {
@@ -83,11 +82,10 @@ func sourceNode(c *containers.Container) Node {
 		name = id
 	}
 	return Node{
-		ID:          id,
-		Name:        name,
-		Namespace:   c.Namespace,
-		PodName:     c.PodName,
-		ContainerID: c.ID,
+		ID:        id,
+		Name:      name,
+		Namespace: c.Namespace,
+		PodName:   c.PodName,
 	}
 }
 

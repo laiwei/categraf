@@ -23,7 +23,7 @@ import (
 	_ "flashcat.cloud/categraf/inputs/cloudwatch"
 	_ "flashcat.cloud/categraf/inputs/conntrack"
 	_ "flashcat.cloud/categraf/inputs/consul"
-	_ "flashcat.cloud/categraf/inputs/coroot_servicemap"
+	_ "flashcat.cloud/categraf/inputs/servicemap"
 	_ "flashcat.cloud/categraf/inputs/cpu"
 	_ "flashcat.cloud/categraf/inputs/dcgm"
 	_ "flashcat.cloud/categraf/inputs/disk"

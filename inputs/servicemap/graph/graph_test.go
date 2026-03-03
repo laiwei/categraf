@@ -1,9 +1,9 @@
-package servicemap
+package graph
 
 import (
 	"testing"
 
-	"flashcat.cloud/categraf/inputs/coroot_servicemap/containers"
+	"flashcat.cloud/categraf/inputs/servicemap/containers"
 )
 
 func TestBuild_EmptyContainers(t *testing.T) {

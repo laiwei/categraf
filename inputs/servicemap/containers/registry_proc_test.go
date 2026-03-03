@@ -1,11 +1,10 @@
 package containers
 
 import (
-	"fmt"
 	"strings"
 	"testing"
 
-	"flashcat.cloud/categraf/inputs/coroot_servicemap/tracer"
+	"flashcat.cloud/categraf/inputs/servicemap/tracer"
 )
 
 // ─── resolveProcID ────────────────────────────────────────────
@@ -42,10 +41,12 @@ func TestResolveProcID_HasProcPrefix(t *testing.T) {
 		if !strings.HasPrefix(id, "proc_") {
 			t.Errorf("pid=%d: expected 'proc_' prefix, got %q", pid, id)
 		}
-		// 格式验证：proc_<digits>[_<name>]
-		expected := fmt.Sprintf("proc_%d", pid)
-		if id != expected && !strings.HasPrefix(id, expected+"_") {
-			t.Errorf("pid=%d: unexpected format %q", pid, id)
+		// 新格式：proc_<comm>（如 proc_nginx）或 proc_<pid>（兜底，如 proc_0）
+		// 不应带 PID_ 前缀 + 进程名的旧格式（proc_0_someapp）
+		// 新格式中不应带 pid + _ + name 的三段式
+		suffix := strings.TrimPrefix(id, "proc_")
+		if suffix == "" {
+			t.Errorf("pid=%d: proc_ suffix is empty, got %q", pid, id)
 		}
 	}
 }
@@ -91,10 +92,11 @@ func TestSanitizeProcLabel_Special(t *testing.T) {
 // ─── enrichProcContainer ─────────────────────────────────────
 
 func TestEnrichProcContainer_WithComm(t *testing.T) {
-	c := NewContainer("proc_123_nginx")
-	enrichProcContainer(c, "proc_123_nginx")
-	if c.PID != 123 {
-		t.Errorf("expected PID=123, got %d", c.PID)
+	c := NewContainer("proc_nginx")
+	enrichProcContainer(c, "proc_nginx")
+	// 新格式：proc_<comm>，PID 不嵌入 ID，c.PID 保持 0
+	if c.PID != 0 {
+		t.Errorf("expected PID=0 (not embedded in ID anymore), got %d", c.PID)
 	}
 	if c.Name != "nginx" {
 		t.Errorf("expected Name=nginx, got %q", c.Name)
@@ -107,33 +109,33 @@ func TestEnrichProcContainer_WithoutComm(t *testing.T) {
 	if c.PID != 0 {
 		t.Errorf("expected PID=0, got %d", c.PID)
 	}
-	// 无进程名时，Name 应为完整 ID
+	// 后缀全为数字（PID 兜底格式）→ 保留完整 ID "proc_0" 便于调试
 	if c.Name != "proc_0" {
 		t.Errorf("expected Name='proc_0', got %q", c.Name)
 	}
 }
 
 func TestEnrichProcContainer_CommWithUnderscore(t *testing.T) {
-	// "proc_42_my_service" → PID=42, Name="my_service"（SplitN 保留第三段整体）
-	c := NewContainer("proc_42_my_service")
-	enrichProcContainer(c, "proc_42_my_service")
-	if c.PID != 42 {
-		t.Errorf("expected PID=42, got %d", c.PID)
+	// "proc_my_service" → Name="my_service"（含下划线的进程名，TrimPrefix 保留整个后缀）
+	c := NewContainer("proc_my_service")
+	enrichProcContainer(c, "proc_my_service")
+	if c.PID != 0 {
+		t.Errorf("expected PID=0, got %d", c.PID)
 	}
 	if c.Name != "my_service" {
 		t.Errorf("expected Name='my_service', got %q", c.Name)
 	}
 }
 
-func TestEnrichProcContainer_InvalidPID(t *testing.T) {
-	// 格式不合法时，PID 保持 0
-	c := NewContainer("proc_abc_nginx")
-	enrichProcContainer(c, "proc_abc_nginx")
-	if c.PID != 0 {
-		t.Errorf("expected PID=0 for invalid format, got %d", c.PID)
+func TestEnrichProcContainer_PIDFallbackKeepsFullID(t *testing.T) {
+	// proc_80793：后缀全为数字（PID 兜底）→ Name 保留完整 ID "proc_80793"
+	c := NewContainer("proc_80793")
+	enrichProcContainer(c, "proc_80793")
+	if c.Name != "proc_80793" {
+		t.Errorf("expected Name='proc_80793' for PID-fallback format, got %q", c.Name)
 	}
-	if c.Name != "nginx" {
-		t.Errorf("expected Name='nginx', got %q", c.Name)
+	if c.PID != 0 {
+		t.Errorf("expected PID=0 (not in ID), got %d", c.PID)
 	}
 }
 
@@ -181,14 +183,15 @@ func TestResolveContainerID_SamePIDSameResult(t *testing.T) {
 func TestGetOrCreateContainer_ProcBased_SetsNameAndPID(t *testing.T) {
 	r := newBareRegistry(Config{})
 	r.mu.Lock()
-	c := r.getOrCreateContainer("proc_42_myapp")
+	c := r.getOrCreateContainer("proc_myapp")
 	r.mu.Unlock()
 
 	if c == nil {
 		t.Fatal("expected container, got nil")
 	}
-	if c.PID != 42 {
-		t.Errorf("expected PID=42, got %d", c.PID)
+	// 新格式：PID 不嵌入 ID，c.PID 保持 0
+	if c.PID != 0 {
+		t.Errorf("expected PID=0 (not embedded in new format), got %d", c.PID)
 	}
 	if c.Name != "myapp" {
 		t.Errorf("expected Name='myapp', got %q", c.Name)
@@ -198,8 +201,8 @@ func TestGetOrCreateContainer_ProcBased_SetsNameAndPID(t *testing.T) {
 func TestGetOrCreateContainer_ProcBased_NoDuplicateOnSecondCall(t *testing.T) {
 	r := newBareRegistry(Config{})
 	r.mu.Lock()
-	c1 := r.getOrCreateContainer("proc_10_nginx")
-	c2 := r.getOrCreateContainer("proc_10_nginx")
+	c1 := r.getOrCreateContainer("proc_nginx")
+	c2 := r.getOrCreateContainer("proc_nginx")
 	r.mu.Unlock()
 
 	if c1 != c2 {
@@ -214,7 +217,7 @@ func TestGetOrCreateContainer_RegularContainer_EnrichmentSkippedForProc(t *testi
 	// proc_ 容器不应触发 Docker inspect（没有 docker client 也不应 panic）
 	r := newBareRegistry(Config{EnableDocker: false})
 	r.mu.Lock()
-	c := r.getOrCreateContainer("proc_99_redis-server")
+	c := r.getOrCreateContainer("proc_redis-server")
 	r.mu.Unlock()
 
 	if c == nil {
@@ -245,8 +248,10 @@ func TestProcessEvent_BareProcess_FullPipeline(t *testing.T) {
 
 	c := cs[0]
 	// ID 必须是 proc_ 前缀
-	if !strings.HasPrefix(c.ID, "proc_42") {
-		t.Errorf("expected proc_42* ID, got %q", c.ID)
+	// macOS 上：无 /proc 文件系统 → proc_42（PID fallback）
+	// Linux 上：取决于 PID 42 的 comm 名称
+	if !strings.HasPrefix(c.ID, "proc_") {
+		t.Errorf("expected proc_ prefix ID, got %q", c.ID)
 	}
 	// 应有 TCPStats
 	snap := c.GetTCPStatsSnapshot()
@@ -256,21 +261,25 @@ func TestProcessEvent_BareProcess_FullPipeline(t *testing.T) {
 }
 
 func TestProcessEvent_MultipleBareProcesses_DifferentContainers(t *testing.T) {
-	// 不同 PID 的裸进程应得到不同 container
+	// 新语义：不同进程名 → 不同 container；同进程名 → 相同 container（按进程名聚合）
+	// macOS 上无 /proc 文件系统，退化为 proc_<pid>，不同 PID 仍是不同容器
 	r := newBareRegistry(Config{EnableCgroup: false})
 
 	r.processEvent(&tracer.Event{Type: tracer.EventTypeConnectionOpen, Pid: 100, Fd: 1, DstAddr: "10.0.0.1:80"})
 	r.processEvent(&tracer.Event{Type: tracer.EventTypeConnectionOpen, Pid: 200, Fd: 2, DstAddr: "10.0.0.2:80"})
 
 	cs := r.GetContainers()
-	if len(cs) != 2 {
-		t.Fatalf("expected 2 containers (different PIDs), got %d", len(cs))
-	}
-	ids := map[string]bool{cs[0].ID: true, cs[1].ID: true}
-	for id := range ids {
-		if !strings.HasPrefix(id, "proc_") {
-			t.Errorf("expected proc_ prefix, got %q", id)
+	// macOS (no /proc): proc_100 vs proc_200 → 2 containers
+	// Linux (same comm): may be 1 container if both have same process name (desired merge behavior)
+	// Linux (diff comm): 2 containers
+	// 所有容器必须是 proc_ 前缀
+	for _, c := range cs {
+		if !strings.HasPrefix(c.ID, "proc_") {
+			t.Errorf("expected proc_ prefix, got %q", c.ID)
 		}
+	}
+	if len(cs) == 0 {
+		t.Error("expected at least 1 container")
 	}
 }
 

@@ -1,16 +1,18 @@
-package coroot_servicemap
+package servicemap
 
 import (
 	"context"
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"runtime"
+	"strings"
 
 	"flashcat.cloud/categraf/config"
-	"flashcat.cloud/categraf/inputs/coroot_servicemap/containers"
-	"flashcat.cloud/categraf/inputs/coroot_servicemap/servicemap"
-	"flashcat.cloud/categraf/inputs/coroot_servicemap/tracer"
+	"flashcat.cloud/categraf/inputs/servicemap/containers"
+	"flashcat.cloud/categraf/inputs/servicemap/graph"
+	"flashcat.cloud/categraf/inputs/servicemap/tracer"
 	"flashcat.cloud/categraf/types"
 	"github.com/vishvananda/netns"
 )
@@ -33,6 +35,10 @@ type Instance struct {
 	MaxTrackedConnections int `toml:"max_tracked_connections"`
 	MaxContainers         int `toml:"max_containers"`
 
+	// Docker label 白名单：只有在此列表中的 label key 才会被输出为 Prometheus 标签。
+	// 留空则不透传任何 Docker label（推荐，避免高基数标签导致时序爆炸）。
+	LabelAllowlist []string `toml:"label_allowlist"`
+
 	// Graph API 服务地址，例如 ":9099"；为空时不启动
 	APIAddr string `toml:"api_addr"`
 
@@ -46,7 +52,7 @@ type Instance struct {
 
 // Init 初始化实例
 func (ins *Instance) Init() error {
-	log.Printf("I! coroot_servicemap: initializing instance")
+	log.Printf("I! servicemap: initializing instance")
 
 	// P1-8: 创建 context 用于优雅退出
 	ins.ctx, ins.cancel = context.WithCancel(context.Background())
@@ -65,19 +71,19 @@ func (ins *Instance) Init() error {
 	// 非 Linux 平台不支持 netns，直接使用 polling 回退模式。
 	if runtime.GOOS == "linux" {
 		if h, err := netns.Get(); err != nil {
-			log.Printf("W! coroot_servicemap: failed to get host network namespace, continue without netns: %v", err)
+			log.Printf("W! servicemap: failed to get host network namespace, continue without netns: %v", err)
 		} else {
 			hostNetNs = h
 			selfNetNs = h
 		}
 
 		if s, err := netns.GetFromPid(1); err != nil {
-			log.Printf("W! coroot_servicemap: failed to get self network namespace from pid 1, fallback to host namespace: %v", err)
+			log.Printf("W! servicemap: failed to get self network namespace from pid 1, fallback to host namespace: %v", err)
 		} else {
 			selfNetNs = s
 		}
 	} else {
-		log.Printf("I! coroot_servicemap: netns is unsupported on %s, running with polling fallback", runtime.GOOS)
+		log.Printf("I! servicemap: netns is unsupported on %s, running with polling fallback", runtime.GOOS)
 	}
 
 	// 创建 Tracer
@@ -114,14 +120,14 @@ func (ins *Instance) Init() error {
 	// 启动内嵌 Graph API server
 	ins.startAPIServer()
 
-	log.Printf("I! coroot_servicemap: instance initialized successfully")
+	log.Printf("I! servicemap: instance initialized successfully")
 	return nil
 }
 
 // Gather 采集数据
 func (ins *Instance) Gather(slist *types.SampleList) {
 	if ins.registry == nil {
-		log.Println("E! coroot_servicemap: registry not initialized")
+		log.Println("E! servicemap: registry not initialized")
 		return
 	}
 
@@ -138,11 +144,18 @@ func (ins *Instance) Gather(slist *types.SampleList) {
 	for _, container := range containers {
 		// 构建基础标签
 		tags := map[string]string{
-			"container_id": container.ID,
+			"source_id": container.ID,
+		}
+
+		// 区分裸进程与容器化进程，便于过滤和告警分组
+		if strings.HasPrefix(container.ID, "proc_") {
+			tags["source_type"] = "bare_process"
+		} else {
+			tags["source_type"] = "container"
 		}
 
 		if container.Name != "" {
-			tags["container_name"] = container.Name
+			tags["source_name"] = container.Name
 		}
 		if container.PodName != "" {
 			tags["pod_name"] = container.PodName
@@ -154,9 +167,17 @@ func (ins *Instance) Gather(slist *types.SampleList) {
 			tags["image"] = container.Image
 		}
 
-		// 添加标签
-		for k, v := range container.Labels {
-			tags[k] = v
+		// 按白名单透传 Docker label，避免高基数标签导致时序爆炸
+		if len(ins.LabelAllowlist) > 0 {
+			allowed := make(map[string]struct{}, len(ins.LabelAllowlist))
+			for _, k := range ins.LabelAllowlist {
+				allowed[k] = struct{}{}
+			}
+			for k, v := range container.Labels {
+				if _, ok := allowed[k]; ok {
+					tags[k] = v
+				}
+			}
 		}
 
 		// TCP连接统计
@@ -200,7 +221,7 @@ func (ins *Instance) Drop() {
 		ins.tracer.Close()
 	}
 
-	log.Println("I! coroot_servicemap: instance dropped")
+	log.Println("I! servicemap: instance dropped")
 }
 
 // collectHostStats 收集主机级别的统计（当没有容器时）
@@ -340,7 +361,7 @@ func httpStatusClass(code uint16) string {
 
 // collectServiceMapStats 输出服务拓扑图聚合指标 (P1-7)
 func (ins *Instance) collectServiceMapStats(cs []*containers.Container, slist *types.SampleList) {
-	g := servicemap.Build(cs)
+	g := graph.Build(cs)
 
 	for _, edge := range g.Edges {
 		tags := map[string]string{
@@ -349,9 +370,13 @@ func (ins *Instance) collectServiceMapStats(cs []*containers.Container, slist *t
 			"destination": edge.Destination,
 		}
 
-		if edge.Source.ContainerID != "" {
-			tags["container_id"] = edge.Source.ContainerID
+		// 区分裸进程与容器化进程
+		if strings.HasPrefix(edge.Source.ID, "proc_") {
+			tags["source_type"] = "bare_process"
+		} else {
+			tags["source_type"] = "container"
 		}
+
 		if edge.Source.Namespace != "" {
 			tags["namespace"] = edge.Source.Namespace
 		}
@@ -376,9 +401,43 @@ func (ins *Instance) collectServiceMapStats(cs []*containers.Container, slist *t
 		slist.PushFront(types.NewSample(inputName, "edge_active_connections", float64(edge.ActiveConnections), tags))
 	}
 
-	// 拓扑概要
-	slist.PushFront(types.NewSample(inputName, "graph_nodes", float64(len(g.Nodes)), map[string]string{}))
-	slist.PushFront(types.NewSample(inputName, "graph_edges", float64(len(g.Edges)), map[string]string{}))
+	// 拓扑概要：按 source_type 分拆，区分裸进程与容器的拓扑规模
+	//
+	// 标签设计：
+	//   source_type — bare_process / container，语义自洽的分组维度
+	//   kube_node   — 来自 NODE_NAME 环境变量（K8s downward API），非 K8s 时省略
+	//   cluster     — 由 [instances.labels] 配置注入，框架自动附加，插件无需处理
+	var nodeBareProcess, nodeContainer int
+	var edgeBareProcess, edgeContainer int
+	for id := range g.Nodes {
+		if strings.HasPrefix(id, "proc_") {
+			nodeBareProcess++
+		} else {
+			nodeContainer++
+		}
+	}
+	for _, edge := range g.Edges {
+		if strings.HasPrefix(edge.Source.ID, "proc_") {
+			edgeBareProcess++
+		} else {
+			edgeContainer++
+		}
+	}
+
+	// 构建上下文标签（kube_node 仅在 K8s 环境下存在）
+	graphBaseTags := map[string]string{}
+	if kubeNode := os.Getenv("NODE_NAME"); kubeNode != "" {
+		graphBaseTags["kube_node"] = kubeNode
+	}
+
+	slist.PushFront(types.NewSample(inputName, "graph_nodes", float64(nodeBareProcess),
+		mergeTags(graphBaseTags, map[string]string{"source_type": "bare_process"})))
+	slist.PushFront(types.NewSample(inputName, "graph_nodes", float64(nodeContainer),
+		mergeTags(graphBaseTags, map[string]string{"source_type": "container"})))
+	slist.PushFront(types.NewSample(inputName, "graph_edges", float64(edgeBareProcess),
+		mergeTags(graphBaseTags, map[string]string{"source_type": "bare_process"})))
+	slist.PushFront(types.NewSample(inputName, "graph_edges", float64(edgeContainer),
+		mergeTags(graphBaseTags, map[string]string{"source_type": "container"})))
 }
 
 // mergeTags 合并标签

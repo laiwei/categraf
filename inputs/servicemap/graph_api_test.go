@@ -1,4 +1,4 @@
-package coroot_servicemap
+package servicemap
 
 import (
 	"encoding/json"
@@ -8,9 +8,9 @@ import (
 	"testing"
 	"time"
 
-	"flashcat.cloud/categraf/inputs/coroot_servicemap/containers"
-	"flashcat.cloud/categraf/inputs/coroot_servicemap/l7"
-	"flashcat.cloud/categraf/inputs/coroot_servicemap/tracer"
+	"flashcat.cloud/categraf/inputs/servicemap/containers"
+	"flashcat.cloud/categraf/inputs/servicemap/l7"
+	"flashcat.cloud/categraf/inputs/servicemap/tracer"
 )
 
 // ─── BuildGraph 结构测试 ───────────────────────────────────────

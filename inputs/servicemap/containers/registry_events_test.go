@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"flashcat.cloud/categraf/inputs/coroot_servicemap/tracer"
+	"flashcat.cloud/categraf/inputs/servicemap/tracer"
 )
 
 // ─── Registry.launchBackground ───────────────────────────────

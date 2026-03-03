@@ -17,7 +17,7 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 
-	"flashcat.cloud/categraf/inputs/coroot_servicemap/tracer"
+	"flashcat.cloud/categraf/inputs/servicemap/tracer"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/client"
 )
@@ -104,7 +104,7 @@ func NewRegistry(ctx context.Context, tr *tracer.Tracer, config Config) (*Regist
 			client.WithAPIVersionNegotiation(),
 		)
 		if err != nil {
-			log.Printf("W! coroot_servicemap: init docker client failed: %v", err)
+			log.Printf("W! servicemap: init docker client failed: %v", err)
 		} else {
 			r.docker = cli
 		}
@@ -113,7 +113,7 @@ func NewRegistry(ctx context.Context, tr *tracer.Tracer, config Config) (*Regist
 	if config.EnableK8s {
 		kubeClient, err := newKubeClient(config.KubeConfig)
 		if err != nil {
-			log.Printf("W! coroot_servicemap: init kubernetes client failed: %v", err)
+			log.Printf("W! servicemap: init kubernetes client failed: %v", err)
 		} else {
 			r.kube = kubeClient
 			r.refreshK8sContainerMeta()
@@ -131,7 +131,7 @@ func NewRegistry(ctx context.Context, tr *tracer.Tracer, config Config) (*Regist
 		r.launchBackground(r.discoverContainersByCgroup)
 	}
 
-	log.Println("I! coroot_servicemap: container registry initialized")
+	log.Println("I! servicemap: container registry initialized")
 	return r, nil
 }
 
@@ -170,7 +170,8 @@ func (r *Registry) handleEvents() {
 // 优先级：
 //  1. pidCache（仅含 cgroup-based 稳定 ID）
 //  2. cgroup-based 容器发现（Docker / K8s 容器）→ 结果写入 pidCache
-//  3. 裸进程兜底："proc_<pid>[_<comm>]"（不缓存，防止 PID 复用污染）
+//  3. 裸进程兜底："proc_<comm>"（按进程名聚合，不缓存防 PID 复用污染）
+//     fallback："proc_<pid>"（/proc/<pid>/comm 不可读时，如非 Linux 平台）
 func (r *Registry) resolveContainerID(pid uint32) string {
 	if id, ok := r.pidCache[pid]; ok {
 		return id
@@ -184,18 +185,23 @@ func (r *Registry) resolveContainerID(pid uint32) string {
 
 // resolveProcID 为裸进程（非容器化）生成合成 container ID。
 // 格式：
-//   - "proc_<pid>_<comm>"（/proc/<pid>/comm 可读时）
-//   - "proc_<pid>"（否则，包括非 Linux 平台）
+//   - "proc_<comm>"（/proc/<pid>/comm 可读时）← 稳定，按进程名聚合同类进程
+//   - "proc_<pid>"（否则，包括非 Linux 平台）← 兜底，保留 PID 以便调试
+//
+// 设计选择：以进程名而非 PID 作为主标识，原因：
+//  1. 时间序列稳定：进程重启 PID 变化，进程名不变，Grafana 曲线不断裂
+//  2. 基数可控：N 个同名进程实例共享 1 个时间序列，避免 cardinality 爆炸
+//  3. 服务拓扑语义：关心「nginx 与谁通信」而非「PID 80793 与谁通信」
 func resolveProcID(pid uint32) string {
 	commPath := filepath.Join("/proc", fmt.Sprintf("%d", pid), "comm")
 	if b, err := os.ReadFile(commPath); err == nil {
 		comm := strings.TrimSpace(string(b))
 		comm = sanitizeProcLabel(comm)
 		if comm != "" {
-			return fmt.Sprintf("proc_%d_%s", pid, comm)
+			return fmt.Sprintf("proc_%s", comm) // proc_nginx, proc_python3, ...
 		}
 	}
-	return fmt.Sprintf("proc_%d", pid)
+	return fmt.Sprintf("proc_%d", pid) // fallback: proc_80793
 }
 
 // sanitizeProcLabel 将进程名中的非法字符替换为下划线，使其适合作为 Prometheus 标签值。
@@ -209,23 +215,33 @@ func sanitizeProcLabel(s string) string {
 	}, s)
 }
 
-// enrichProcContainer 从合成 ID（proc_<pid>[_<comm>]）中提取 PID 和进程名，
+// enrichProcContainer 从合成 ID（proc_<comm> 或 proc_<pid>）中提取进程名，
 // 填充裸进程容器的元数据，跳过 Docker / K8s API 查询。
+//
+// 注意：新格式 proc_<comm> 不含 PID，c.PID 保持 0（代表一类进程而非单个实例）。
+// 当 /proc/<pid>/comm 不可读时（非 Linux 或 PID 已消亡），ID 退化为 proc_<pid>，
+// 此时 c.Name 保留完整 ID（如 "proc_80793"）以便调试定位。
 func enrichProcContainer(c *Container, id string) {
-	// id 格式: "proc_<pid>" 或 "proc_<pid>_<comm>"
-	// SplitN(..., 3) 最多切 3 段，第 3 段保留含下划线的完整进程名
-	parts := strings.SplitN(id, "_", 3)
-	if len(parts) >= 2 {
-		var pid uint32
-		if _, err := fmt.Sscanf(parts[1], "%d", &pid); err == nil {
-			c.PID = pid
+	suffix := strings.TrimPrefix(id, "proc_")
+	if suffix == "" {
+		c.Name = id
+		return
+	}
+	// 若后缀全为数字（proc_<pid> 兜底格式），保留完整 ID 作为显示名（便于调试）；
+	// 否则取后缀作为进程名（如 "nginx"、"my_service"）。
+	allDigits := true
+	for _, ch := range suffix {
+		if ch < '0' || ch > '9' {
+			allDigits = false
+			break
 		}
 	}
-	if len(parts) >= 3 && parts[2] != "" {
-		c.Name = parts[2]
+	if allDigits {
+		c.Name = id // "proc_80793" — 保留 proc_ 前缀，与 container_id 一致
 	} else {
-		c.Name = id // 无进程名时用完整 ID 作为名称
+		c.Name = suffix // "nginx"、"my_service" 等
 	}
+	// PID 不嵌入 ID（proc_<comm> 聚合同名进程），c.PID 保持默认值 0
 }
 
 // processEvent 处理单个事件
@@ -235,7 +251,7 @@ func (r *Registry) processEvent(event *tracer.Event) {
 
 	// resolveContainerID 始终返回非空 ID：
 	//   容器化进程 → cgroup-based container ID
-	//   裸进程     → "proc_<pid>[_<comm>]"
+	//   裸进程     → "proc_<comm>"（按进程名聚合）或 "proc_<pid>"（兜底）
 	containerID := r.resolveContainerID(event.Pid)
 
 	container := r.getOrCreateContainer(containerID)
@@ -253,7 +269,7 @@ func (r *Registry) updateConnectionStats() {
 	defer r.mu.Unlock()
 
 	r.tracer.ForEachActiveConnection(func(connID tracer.ConnectionID, conn tracer.Connection) {
-		// resolveContainerID 对裸进程同样返回有效 ID（proc_<pid>[_<comm>]），
+		// resolveContainerID 对裸进程同样返回有效 ID（proc_<comm> 或 proc_<pid>），
 		// 从而修复了裸进程字节流量统计被静默丢弃的问题。
 		containerID := r.resolveContainerID(connID.PID)
 
@@ -273,7 +289,7 @@ func (r *Registry) getOrCreateContainer(id string) *Container {
 
 	// P1-6: 检查容器数上限
 	if r.config.MaxContainers > 0 && len(r.containers) >= r.config.MaxContainers {
-		log.Printf("W! coroot_servicemap: max containers limit (%d) reached, skipping container %s", r.config.MaxContainers, id)
+		log.Printf("W! servicemap: max containers limit (%d) reached, skipping container %s", r.config.MaxContainers, id)
 		return nil
 	}
 
@@ -476,7 +492,7 @@ func (r *Registry) refreshK8sContainerMeta() {
 
 	pods, err := r.kube.CoreV1().Pods("").List(ctx, metav1.ListOptions{})
 	if err != nil {
-		log.Printf("W! coroot_servicemap: list kubernetes pods failed: %v", err)
+		log.Printf("W! servicemap: list kubernetes pods failed: %v", err)
 		return
 	}
 
@@ -530,7 +546,7 @@ func (r *Registry) discoverContainersByCgroup() {
 				r.refreshK8sContainerMeta()
 				r.mu.Unlock()
 			}
-			log.Println("D! coroot_servicemap: discovering containers and refreshing metadata...")
+			log.Println("D! servicemap: discovering containers and refreshing metadata...")
 		}
 	}
 }
@@ -571,7 +587,7 @@ func (r *Registry) gcContainers() {
 	}
 
 	if expired > 0 {
-		log.Printf("D! coroot_servicemap: container GC cleaned %d expired containers, %d remaining", expired, len(r.containers))
+		log.Printf("D! servicemap: container GC cleaned %d expired containers, %d remaining", expired, len(r.containers))
 		// 清空 PID 缓存，防止 PID 复用后继续映射到已退出容器的旧 container ID
 		r.pidCache = make(map[uint32]string)
 	}
@@ -601,5 +617,5 @@ func (r *Registry) Close() {
 	if r.docker != nil {
 		_ = r.docker.Close()
 	}
-	log.Println("I! coroot_servicemap: container registry closed")
+	log.Println("I! servicemap: container registry closed")
 }

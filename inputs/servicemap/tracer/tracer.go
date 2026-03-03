@@ -18,7 +18,7 @@ import (
 	"sync"
 	"time"
 
-	"flashcat.cloud/categraf/inputs/coroot_servicemap/l7"
+	"flashcat.cloud/categraf/inputs/servicemap/l7"
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/perf"
@@ -138,7 +138,7 @@ type Tracer struct {
 // NewTracer 创建新的Tracer
 func NewTracer(ctx context.Context, hostNetNs, selfNetNs netns.NsHandle, disableL7Tracing bool, maxActiveConns int) (*Tracer, error) {
 	if disableL7Tracing {
-		log.Println("I! coroot_servicemap: L7 tracing is disabled")
+		log.Println("I! servicemap: L7 tracing is disabled")
 	}
 
 	t := &Tracer{
@@ -184,12 +184,12 @@ func (t *Tracer) Start() error {
 	}
 
 	if runtime.GOOS != "linux" {
-		log.Printf("I! coroot_servicemap: eBPF is unsupported on %s, fallback to polling tracer", runtime.GOOS)
+		log.Printf("I! servicemap: eBPF is unsupported on %s, fallback to polling tracer", runtime.GOOS)
 		t.startFallbackMode()
 		return nil
 	}
 
-	log.Println("I! coroot_servicemap: loading eBPF programs...")
+	log.Println("I! servicemap: loading eBPF programs...")
 
 	// 检查架构支持
 	if runtime.GOARCH != "amd64" && runtime.GOARCH != "arm64" {
@@ -206,25 +206,25 @@ func (t *Tracer) Start() error {
 		}
 	}
 	if traceFsPath == "" {
-		log.Println("W! coroot_servicemap: tracefs unavailable, fallback to polling tracer")
+		log.Println("W! servicemap: tracefs unavailable, fallback to polling tracer")
 		t.startFallbackMode()
 		return nil
 	}
 
 	if err := checkKernelVersion(); err != nil {
-		log.Printf("W! coroot_servicemap: kernel check failed, fallback to polling tracer: %v", err)
+		log.Printf("W! servicemap: kernel check failed, fallback to polling tracer: %v", err)
 		t.startFallbackMode()
 		return nil
 	}
 
 	if err := t.loadEBPF(); err != nil {
-		log.Printf("W! coroot_servicemap: load eBPF failed, fallback to polling tracer: %v", err)
+		log.Printf("W! servicemap: load eBPF failed, fallback to polling tracer: %v", err)
 		t.startFallbackMode()
 		return nil
 	}
 
 	t.launchBackground(t.startConnectionGC)
-	log.Println("I! coroot_servicemap: eBPF tracer started")
+	log.Println("I! servicemap: eBPF tracer started")
 	t.started = true
 	return nil
 }
@@ -344,7 +344,7 @@ func (t *Tracer) initPerfReaders() error {
 		if l7m, ok := t.collection.Maps["l7_events"]; ok {
 			l7r, err := perf.NewReader(l7m, os.Getpagesize()*16)
 			if err != nil {
-				log.Printf("W! coroot_servicemap: create L7 perf reader failed: %v", err)
+				log.Printf("W! servicemap: create L7 perf reader failed: %v", err)
 			} else {
 				t.readers["l7_events"] = l7r
 				t.wg.Add(1)
@@ -352,7 +352,7 @@ func (t *Tracer) initPerfReaders() error {
 					defer t.wg.Done()
 					t.runL7EventReader(l7r)
 				}()
-				log.Println("I! coroot_servicemap: L7 perf reader started")
+				log.Println("I! servicemap: L7 perf reader started")
 			}
 		}
 	}
@@ -368,20 +368,20 @@ func (t *Tracer) runEventReader(r *perf.Reader) {
 			case <-t.closeChan:
 				return
 			default:
-				log.Printf("W! coroot_servicemap: read perf event failed: %v", err)
+				log.Printf("W! servicemap: read perf event failed: %v", err)
 				continue
 			}
 		}
 
 		if rec.LostSamples > 0 {
-			log.Printf("W! coroot_servicemap: perf events lost samples=%d", rec.LostSamples)
+			log.Printf("W! servicemap: perf events lost samples=%d", rec.LostSamples)
 			continue
 		}
 
 		// 解析原始事件数据
 		event, err := parseRawEvent(rec.RawSample)
 		if err != nil {
-			log.Printf("W! coroot_servicemap: parse event failed: %v", err)
+			log.Printf("W! servicemap: parse event failed: %v", err)
 			continue
 		}
 
@@ -413,19 +413,19 @@ func (t *Tracer) runL7EventReader(r *perf.Reader) {
 			case <-t.closeChan:
 				return
 			default:
-				log.Printf("W! coroot_servicemap: read L7 perf event failed: %v", err)
+				log.Printf("W! servicemap: read L7 perf event failed: %v", err)
 				continue
 			}
 		}
 
 		if rec.LostSamples > 0 {
-			log.Printf("W! coroot_servicemap: L7 perf events lost samples=%d", rec.LostSamples)
+			log.Printf("W! servicemap: L7 perf events lost samples=%d", rec.LostSamples)
 			continue
 		}
 
 		event, err := parseRawL7Event(rec.RawSample)
 		if err != nil {
-			log.Printf("W! coroot_servicemap: parse L7 event failed: %v", err)
+			log.Printf("W! servicemap: parse L7 event failed: %v", err)
 			continue
 		}
 
@@ -550,11 +550,11 @@ func (t *Tracer) Close() {
 	t.listenPorts = nil
 	t.listenMu.Unlock()
 
-	log.Println("I! coroot_servicemap: tracer closed")
+	log.Println("I! servicemap: tracer closed")
 }
 
 func (t *Tracer) startPollingTracer() {
-	log.Println("I! coroot_servicemap: polling tracer started")
+	log.Println("I! servicemap: polling tracer started")
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 
@@ -605,18 +605,18 @@ func (t *Tracer) gcConnections() {
 	}
 
 	if expired > 0 {
-		log.Printf("D! coroot_servicemap: GC cleaned %d expired connections, %d remaining", expired, len(t.activeConns))
+		log.Printf("D! servicemap: GC cleaned %d expired connections, %d remaining", expired, len(t.activeConns))
 	}
 }
 
 func (t *Tracer) pollConnections() {
 	conns, err := gopsnet.Connections("tcp")
 	if err != nil {
-		log.Printf("W! coroot_servicemap: polling tcp connections failed: %v", err)
+		log.Printf("W! servicemap: polling tcp connections failed: %v", err)
 		return
 	}
 
-	log.Printf("D! coroot_servicemap: polled %d tcp connections", len(conns))
+	log.Printf("D! servicemap: polled %d tcp connections", len(conns))
 
 	now := time.Now()
 	nowNano := uint64(now.UnixNano())
@@ -776,7 +776,7 @@ func checkKernelVersion() error {
 	}
 
 	release := string(bytes.Split(uname.Release[:], []byte{0})[0])
-	log.Printf("I! coroot_servicemap: kernel version: %s", release)
+	log.Printf("I! servicemap: kernel version: %s", release)
 
 	// 简单检查：至少需要 4.16
 	parts := strings.Split(release, ".")
@@ -804,7 +804,7 @@ func checkKernelVersion() error {
 	}
 
 	// 这里应该做更详细的版本检查
-	log.Printf("I! coroot_servicemap: kernel version check passed")
+	log.Printf("I! servicemap: kernel version check passed")
 
 	return nil
 }

@@ -1,5 +1,5 @@
 #!/bin/bash
-# 集成测试脚本 - 验证 coroot_servicemap 插件的完整流程
+# 集成测试脚本 - 验证 servicemap 插件的完整流程
 
 set -e
 
@@ -21,7 +21,7 @@ fi
 echo ""
 echo "[2/6] Running unit tests..."
 cd "$PROJECT_ROOT"
-go test -v ./inputs/coroot_servicemap/containers ./inputs/coroot_servicemap/servicemap ./inputs/coroot_servicemap/tracer || {
+go test -v ./inputs/servicemap/containers ./inputs/servicemap/graph ./inputs/servicemap/tracer || {
     echo "❌ Unit tests failed"
     exit 1
 }
@@ -30,7 +30,7 @@ echo "✅ Unit tests passed"
 # 3. 编译插件
 echo ""
 echo "[3/6] Building plugin..."
-go build ./inputs/coroot_servicemap/... || {
+go build ./inputs/servicemap/... || {
     echo "❌ Build failed"
     exit 1
 }
@@ -75,13 +75,13 @@ fi
 # 5. 验证配置文件
 echo ""
 echo "[5/6] Validating configuration..."
-CONFIG_FILE="$PROJECT_ROOT/conf/input.coroot_servicemap/coroot_servicemap.toml"
+CONFIG_FILE="$PROJECT_ROOT/conf/input.servicemap/servicemap.toml"
 if [[ -f "$CONFIG_FILE" ]]; then
     echo "✅ Configuration file exists: $CONFIG_FILE"
 else
     echo "⚠️  Configuration file not found at expected location, but example exists in plugin directory"
-    if [[ -f "$SCRIPT_DIR/coroot_servicemap.toml" ]]; then
-        echo "✅ Example configuration found: $SCRIPT_DIR/coroot_servicemap.toml"
+    if [[ -f "$SCRIPT_DIR/servicemap.toml" ]]; then
+        echo "✅ Example configuration found: $SCRIPT_DIR/servicemap.toml"
     fi
 fi
 
@@ -107,13 +107,13 @@ echo "======================================"
 echo ""
 echo "Next steps:"
 echo "1. On Linux with kernel >= 4.14:"
-echo "   - Compile eBPF: cd inputs/coroot_servicemap/tracer && make"
+echo "   - Compile eBPF: cd inputs/servicemap/tracer && make"
 echo "   - Run with sudo for eBPF capabilities"
 echo ""
 echo "2. On other systems:"
 echo "   - Plugin will use polling fallback (gopsutil)"
 echo ""
 echo "3. Configure in categraf:"
-echo "   - Edit conf/input.coroot_servicemap/coroot_servicemap.toml"
+echo "   - Edit conf/input.servicemap/servicemap.toml"
 echo "   - Enable docker/kubernetes integration if needed"
 echo ""

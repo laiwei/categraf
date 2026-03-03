@@ -1,4 +1,4 @@
-package coroot_servicemap
+package servicemap
 
 // graph_api_extra_test.go — 补充对 handleGraph、handleGraphText、
 // stopAPIServer 的直接覆盖，确保这几条路径不再是 0%。
@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"flashcat.cloud/categraf/inputs/coroot_servicemap/containers"
+	"flashcat.cloud/categraf/inputs/servicemap/containers"
 )
 
 // ─── handleGraph（实际 HTTP handler）────────────────────────

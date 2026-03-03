@@ -5,8 +5,8 @@ import (
 	"sync"
 	"time"
 
-	"flashcat.cloud/categraf/inputs/coroot_servicemap/l7"
-	"flashcat.cloud/categraf/inputs/coroot_servicemap/tracer"
+	"flashcat.cloud/categraf/inputs/servicemap/l7"
+	"flashcat.cloud/categraf/inputs/servicemap/tracer"
 )
 
 // TCPStats TCP连接统计

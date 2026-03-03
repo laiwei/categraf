@@ -1,4 +1,4 @@
-package coroot_servicemap
+package servicemap
 
 import (
 	"context"
@@ -11,8 +11,8 @@ import (
 	"strings"
 	"time"
 
-	"flashcat.cloud/categraf/inputs/coroot_servicemap/containers"
-	"flashcat.cloud/categraf/inputs/coroot_servicemap/servicemap"
+	"flashcat.cloud/categraf/inputs/servicemap/containers"
+	"flashcat.cloud/categraf/inputs/servicemap/graph"
 )
 
 // ─────────────────────────────────────────────────────────────
@@ -142,7 +142,7 @@ func (ins *Instance) buildGraphWithContainers(cs []*containers.Container) GraphR
 	}
 
 	// 构建 TCP 拓扑图
-	g := servicemap.Build(cs)
+	g := graph.Build(cs)
 
 	// 构建 containerID → *Container 索引，用于查找 HTTP/L7 统计
 	containerByID := make(map[string]*containers.Container, len(cs))
@@ -162,7 +162,7 @@ func (ins *Instance) buildGraphWithContainers(cs []*containers.Container) GraphR
 			PodName:   n.PodName,
 		}
 		// 从容器对象补充 Image / Labels
-		if c, ok := containerByID[n.ContainerID]; ok {
+		if c, ok := containerByID[n.ID]; ok {
 			nj.Image = c.Image
 			if len(c.Labels) > 0 {
 				nj.Labels = make(map[string]string, len(c.Labels))
@@ -200,7 +200,7 @@ func (ins *Instance) buildGraphWithContainers(cs []*containers.Container) GraphR
 		}
 		if edge.SuccessfulConnects > 0 {
 			// TotalTime 存储在容器的 TCPStats 中；需从 container 快照读取
-			if c, ok := containerByID[edge.Source.ContainerID]; ok {
+			if c, ok := containerByID[edge.Source.ID]; ok {
 				tcpSnapshot := c.GetTCPStatsSnapshot()
 				if ts, ok := tcpSnapshot[edge.Destination]; ok && ts.SuccessfulConnects > 0 {
 					tcpJSON.AvgConnectDurationMs = float64(ts.TotalTime) / float64(ts.SuccessfulConnects)
@@ -210,7 +210,7 @@ func (ins *Instance) buildGraphWithContainers(cs []*containers.Container) GraphR
 		ej.TCP = tcpJSON
 
 		// HTTP / L7 统计 — 按目标地址过滤
-		if c, ok := containerByID[edge.Source.ContainerID]; ok {
+		if c, ok := containerByID[edge.Source.ID]; ok {
 			// HTTP
 			httpSnapshot := c.GetHTTPStatsSnapshot()
 			var httpEntries []HTTPEntryJSON
@@ -323,9 +323,9 @@ func (ins *Instance) startAPIServer() {
 	}
 
 	go func() {
-		log.Printf("I! coroot_servicemap: graph API listening on http://%s/graph", ins.APIAddr)
+		log.Printf("I! servicemap: graph API listening on http://%s/graph", ins.APIAddr)
 		if err := ins.apiServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Printf("E! coroot_servicemap: API server error: %v", err)
+			log.Printf("E! servicemap: API server error: %v", err)
 		}
 	}()
 }
@@ -338,7 +338,7 @@ func (ins *Instance) stopAPIServer() {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := ins.apiServer.Shutdown(ctx); err != nil {
-		log.Printf("W! coroot_servicemap: API server shutdown error: %v", err)
+		log.Printf("W! servicemap: API server shutdown error: %v", err)
 	}
 }
 
