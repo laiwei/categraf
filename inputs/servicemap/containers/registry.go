@@ -66,6 +66,12 @@ type Registry struct {
 	// 仅存储容器化进程的稳定 ID；裸进程不缓存（防止 PID 复用产生错误映射）。
 	// 由 r.mu 保护（所有访问路径均已持有 r.mu）。
 	pidCache map[uint32]string
+
+	// commCache 缓存 PID → 进程名（comm），由 eBPF ProcessStart 事件预热。
+	// 目的：fork 时进程一定存活，可可靠读取 /proc/<pid>/comm；
+	// 后续 ConnectionOpen 事件到达时进程可能已退出，直接查缓存即可。
+	// ProcessExit 时清理。由 r.mu 保护。
+	commCache map[uint32]string
 }
 
 // NewRegistry 创建新的容器注册表
@@ -78,6 +84,7 @@ func NewRegistry(ctx context.Context, tr *tracer.Tracer, config Config) (*Regist
 		k8sContainerMeta: make(map[string]k8sContainerMeta),
 		stopChan:         make(chan struct{}),
 		pidCache:         make(map[uint32]string),
+		commCache:        make(map[uint32]string),
 	}
 
 	// P1-8: 监听 context 取消，自动触发关闭
@@ -132,7 +139,9 @@ func NewRegistry(ctx context.Context, tr *tracer.Tracer, config Config) (*Regist
 	}
 
 	// P1: 注入 PID 过滤回调，用于轮询模式的连接作用域收窄
-	tr.SetPIDFilter(r.GetTrackedPIDs)
+	if tr != nil {
+		tr.SetPIDFilter(r.GetTrackedPIDs)
+	}
 
 	log.Println("I! servicemap: container registry initialized")
 	return r, nil
@@ -149,6 +158,20 @@ func (r *Registry) launchBackground(fn func()) {
 
 // handleEvents 处理eBPF事件
 func (r *Registry) handleEvents() {
+	if r.tracer == nil {
+		// 没有 tracer 时只做定期连接统计
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-r.stopChan:
+				return
+			case <-ticker.C:
+				r.updateConnectionStats()
+			}
+		}
+	}
+
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 
@@ -182,6 +205,10 @@ func (r *Registry) resolveContainerID(pid uint32) string {
 	if id := r.getContainerIDByPID(pid); id != "" {
 		r.pidCache[pid] = id
 		return id
+	}
+	// 裸进程路径：优先使用 commCache（eBPF fork 事件预热），再实时读 /proc
+	if comm, ok := r.commCache[pid]; ok {
+		return fmt.Sprintf("proc_%s", comm)
 	}
 	return resolveProcID(pid)
 }
@@ -251,6 +278,36 @@ func enrichProcContainer(c *Container, id string) {
 func (r *Registry) processEvent(event *tracer.Event) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+
+	switch event.Type {
+	case tracer.EventTypeProcessStart:
+		// fork 时进程一定存活 → 预热 commCache，供后续连接事件查询。
+		// 不创建容器（fork 不代表有 TCP 活动）。
+		if event.Pid > 0 {
+			commPath := filepath.Join("/proc", fmt.Sprintf("%d", event.Pid), "comm")
+			if b, err := os.ReadFile(commPath); err == nil {
+				comm := strings.TrimSpace(string(b))
+				comm = sanitizeProcLabel(comm)
+				if comm != "" {
+					r.commCache[event.Pid] = comm
+				}
+			}
+		}
+		return
+
+	case tracer.EventTypeProcessExit:
+		// 清理该 PID 在所有缓存中的条目，防止 PID 复用后映射错误。
+		delete(r.pidCache, event.Pid)
+		delete(r.commCache, event.Pid)
+		return
+
+	case tracer.EventTypeConnectionOpen, tracer.EventTypeConnectionClose,
+		tracer.EventTypeTCPRetransmit, tracer.EventTypeL7Request:
+		// 仅连接相关事件需要创建/查找容器
+
+	default:
+		return
+	}
 
 	// resolveContainerID 始终返回非空 ID：
 	//   容器化进程 → cgroup-based container ID

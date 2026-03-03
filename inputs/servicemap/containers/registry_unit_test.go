@@ -21,6 +21,7 @@ func newBareRegistry(cfg Config) *Registry {
 		k8sContainerMeta: make(map[string]k8sContainerMeta),
 		stopChan:         make(chan struct{}),
 		pidCache:         make(map[uint32]string),
+		commCache:        make(map[uint32]string),
 	}
 }
 

@@ -2,6 +2,7 @@ package containers
 
 import (
 	"context"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -329,4 +330,112 @@ func TestUpdateConnectionStats_CallbackInvoked(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 
 	r.updateConnectionStats()
+}
+
+// ─── processEvent — 事件类型过滤 ─────────────────────────────
+
+func TestProcessEvent_ProcessStart_DoesNotCreateContainer(t *testing.T) {
+	r := newBareRegistry(Config{EnableCgroup: false})
+
+	// ProcessStart 事件不应创建容器
+	r.processEvent(&tracer.Event{
+		Type: tracer.EventTypeProcessStart,
+		Pid:  99999,
+	})
+
+	cs := r.GetContainers()
+	if len(cs) != 0 {
+		t.Errorf("ProcessStart should not create container, got %d containers", len(cs))
+	}
+}
+
+func TestProcessEvent_ProcessExit_DoesNotCreateContainer(t *testing.T) {
+	r := newBareRegistry(Config{EnableCgroup: false})
+
+	r.processEvent(&tracer.Event{
+		Type: tracer.EventTypeProcessExit,
+		Pid:  88888,
+	})
+
+	cs := r.GetContainers()
+	if len(cs) != 0 {
+		t.Errorf("ProcessExit should not create container, got %d containers", len(cs))
+	}
+}
+
+func TestProcessEvent_ProcessExit_CleansPidCache(t *testing.T) {
+	r := newBareRegistry(Config{EnableCgroup: false})
+
+	// 手动注入 pidCache 和 commCache 条目
+	r.mu.Lock()
+	r.pidCache[12345] = "some-container-id"
+	r.commCache[12345] = "nginx"
+	r.mu.Unlock()
+
+	// ProcessExit 应清理缓存
+	r.processEvent(&tracer.Event{
+		Type: tracer.EventTypeProcessExit,
+		Pid:  12345,
+	})
+
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if _, ok := r.pidCache[12345]; ok {
+		t.Error("pidCache should be cleaned after ProcessExit")
+	}
+	if _, ok := r.commCache[12345]; ok {
+		t.Error("commCache should be cleaned after ProcessExit")
+	}
+}
+
+func TestProcessEvent_ProcessStart_PrewarmsCommCache(t *testing.T) {
+	if _, err := os.Stat("/proc/self/comm"); err != nil {
+		t.Skip("skipping: /proc/<pid>/comm not available on this platform")
+	}
+
+	r := newBareRegistry(Config{EnableCgroup: false})
+
+	// 用当前进程的 PID（一定存活，comm 可读）
+	pid := uint32(os.Getpid())
+	r.processEvent(&tracer.Event{
+		Type: tracer.EventTypeProcessStart,
+		Pid:  pid,
+	})
+
+	r.mu.RLock()
+	comm, ok := r.commCache[pid]
+	r.mu.RUnlock()
+
+	if !ok || comm == "" {
+		t.Errorf("ProcessStart should pre-warm commCache for living PID %d, got ok=%v comm=%q", pid, ok, comm)
+	}
+}
+
+func TestResolveContainerID_UsesCommCache(t *testing.T) {
+	r := newBareRegistry(Config{EnableCgroup: false})
+
+	// 注入 commCache 条目
+	r.commCache[77777] = "myapp"
+
+	r.mu.Lock()
+	id := r.resolveContainerID(77777)
+	r.mu.Unlock()
+
+	if id != "proc_myapp" {
+		t.Errorf("expected proc_myapp from commCache, got %q", id)
+	}
+}
+
+func TestProcessEvent_UnknownType_Ignored(t *testing.T) {
+	r := newBareRegistry(Config{EnableCgroup: false})
+
+	r.processEvent(&tracer.Event{
+		Type: tracer.EventType(255), // 未知类型
+		Pid:  11111,
+	})
+
+	cs := r.GetContainers()
+	if len(cs) != 0 {
+		t.Errorf("unknown event type should not create container, got %d", len(cs))
+	}
 }

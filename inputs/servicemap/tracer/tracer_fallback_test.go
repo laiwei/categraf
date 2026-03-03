@@ -257,6 +257,7 @@ func TestSetPIDFilter_NilFilter_NoEffect(t *testing.T) {
 func TestSetPIDFilter_EmptySet_ForcesGlobalScan(t *testing.T) {
 	tr := newTestTracer(t)
 	defer tr.Close()
+	tr.disableNetlink = true // 强制 gopsutil 路径以测试 PID 过滤逻辑
 
 	// 过滤回调返回空集合：应走全量扫描分支，不过滤任何连接
 	tr.SetPIDFilter(func() map[uint32]struct{} {
@@ -275,6 +276,7 @@ func TestSetPIDFilter_EmptySet_ForcesGlobalScan(t *testing.T) {
 func TestSetPIDFilter_WithPIDs_SkipsGlobalScanWithinWindow(t *testing.T) {
 	tr := newTestTracer(t)
 	defer tr.Close()
+	tr.disableNetlink = true // 强制 gopsutil 路径以测试 PID 过滤逻辑
 
 	// 设置一个返回非空 PID 集的过滤器
 	calledCount := 0
@@ -300,6 +302,7 @@ func TestSetPIDFilter_WithPIDs_SkipsGlobalScanWithinWindow(t *testing.T) {
 func TestSetPIDFilter_GlobalScanAfterWindow(t *testing.T) {
 	tr := newTestTracer(t)
 	defer tr.Close()
+	tr.disableNetlink = true // 强制 gopsutil 路径以测试 PID 过滤逻辑
 
 	tr.SetPIDFilter(func() map[uint32]struct{} {
 		return map[uint32]struct{}{99999: {}}

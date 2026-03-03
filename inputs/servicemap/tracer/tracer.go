@@ -131,6 +131,7 @@ type Tracer struct {
 	pidFilter      func() map[uint32]struct{} // P1: PID 作用域过滤回调，由 Registry 初始化时注入
 	pollBuf        map[ConnectionID]Event     // P0-D: 双缓冲复用，避免每轮 poll 重新分配 map
 	lastGlobalScan time.Time                  // P1: 上次全量扫描时间戳，控制强制全量扫描频率
+	disableNetlink bool                       // 测试用：强制走 gopsutil 路径以验证 PID 过滤逻辑
 
 	started  bool
 	stopOnce sync.Once
@@ -667,7 +668,13 @@ func (t *Tracer) pollConnections() int {
 	discoveredListens := make(map[ListenKey]struct{})
 
 	// ─── 数据采集层：netlink 优先，gopsutil 兜底 ───────────
-	diagConns, netlinkErr := netlinkConnections()
+	var diagConns []DiagConnection
+	var netlinkErr error
+	if !t.disableNetlink {
+		diagConns, netlinkErr = netlinkConnections()
+	} else {
+		netlinkErr = fmt.Errorf("netlink disabled for testing")
+	}
 	if netlinkErr == nil {
 		t.collectFromNetlink(diagConns, current, discoveredListens, nowNano)
 	} else {
