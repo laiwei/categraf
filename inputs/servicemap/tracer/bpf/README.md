@@ -98,10 +98,10 @@ var embeddedPrograms = map[string][]EmbeddedProgram{
 ```bash
 # 编译整个插件
 cd /path/to/categraf
-go build ./inputs/coroot_servicemap/...
+go build ./inputs/servicemap/...
 
 # 运行测试
-go test -v ./inputs/coroot_servicemap/tracer
+go test -v ./inputs/servicemap/tracer
 ```
 
 ## 故障排除

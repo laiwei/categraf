@@ -333,6 +333,13 @@ func (r *Registry) processEvent(event *tracer.Event) {
 		return
 	}
 
+	// 诊断日志：记录连接事件及其容器归属（含 proc_ 和 Docker 容器）。
+	// 使用 D! 级别避免正常运行时日志洪泛。
+	if event.Type == tracer.EventTypeConnectionOpen || event.Type == tracer.EventTypeConnectionAccepted {
+		log.Printf("D! servicemap: %s pid=%d → container=%s dst=%s (fd=%d)",
+			event.Type, event.Pid, containerID, event.DstAddr, event.Fd)
+	}
+
 	// 处理事件（包括 L4 和 L7 事件类型）
 	// ConnectionAccepted 仅创建容器节点，不记录 TCPStats（避免生成反向边）
 	if event.Type == tracer.EventTypeConnectionAccepted {

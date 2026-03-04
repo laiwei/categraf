@@ -336,3 +336,133 @@ func TestBuildGraph_SummaryCounters(t *testing.T) {
 		t.Errorf("expected 0 tracer conns, got %d", gr.Summary.TracerActiveConnections)
 	}
 }
+
+// ─── filterGraph 测试 ─────────────────────────────────────
+
+func TestFilterGraph_ByKeyword(t *testing.T) {
+	c1 := containers.NewContainer("proc_nc")
+	c1.Name = "nc"
+	c1.TCPStats["10.0.0.1:8080"] = &containers.TCPStats{SuccessfulConnects: 1}
+
+	c2 := containers.NewContainer("proc_sshd")
+	c2.Name = "sshd"
+	c2.TCPStats["10.0.0.2:22"] = &containers.TCPStats{SuccessfulConnects: 5}
+
+	c3 := containers.NewContainer("proc_systemd")
+	c3.Name = "systemd"
+	// no TCPStats
+
+	ins := &Instance{}
+	full := ins.buildGraphWithContainers([]*containers.Container{c1, c2, c3})
+
+	if full.Summary.Nodes != 3 {
+		t.Fatalf("full graph should have 3 nodes, got %d", full.Summary.Nodes)
+	}
+	if full.Summary.Edges != 2 {
+		t.Fatalf("full graph should have 2 edges, got %d", full.Summary.Edges)
+	}
+
+	// filter=nc → only proc_nc node and its edge
+	req := httptest.NewRequest("GET", "/graph?filter=nc", nil)
+	filtered := ins.filterGraph(full, req)
+
+	if filtered.Summary.Nodes != 1 {
+		t.Errorf("filtered nodes: want 1, got %d", filtered.Summary.Nodes)
+	}
+	if filtered.Nodes[0].ID != "proc_nc" {
+		t.Errorf("filtered node ID: want proc_nc, got %s", filtered.Nodes[0].ID)
+	}
+	if filtered.Summary.Edges != 1 {
+		t.Errorf("filtered edges: want 1, got %d", filtered.Summary.Edges)
+	}
+}
+
+func TestFilterGraph_EdgesOnly(t *testing.T) {
+	c1 := containers.NewContainer("proc_nc")
+	c1.Name = "nc"
+	c1.TCPStats["10.0.0.1:8080"] = &containers.TCPStats{SuccessfulConnects: 1}
+
+	c2 := containers.NewContainer("proc_systemd")
+	c2.Name = "systemd"
+	// no TCPStats — listen-only process
+
+	ins := &Instance{}
+	full := ins.buildGraphWithContainers([]*containers.Container{c1, c2})
+
+	if full.Summary.Nodes != 2 {
+		t.Fatalf("full graph should have 2 nodes, got %d", full.Summary.Nodes)
+	}
+
+	// edges_only=true → only proc_nc (has edge), proc_systemd filtered out
+	req := httptest.NewRequest("GET", "/graph?edges_only=true", nil)
+	filtered := ins.filterGraph(full, req)
+
+	if filtered.Summary.Nodes != 1 {
+		t.Errorf("edges_only nodes: want 1, got %d", filtered.Summary.Nodes)
+	}
+	if len(filtered.Nodes) > 0 && filtered.Nodes[0].ID != "proc_nc" {
+		t.Errorf("edges_only node ID: want proc_nc, got %s", filtered.Nodes[0].ID)
+	}
+}
+
+func TestFilterGraph_CombinedFilterAndEdgesOnly(t *testing.T) {
+	c1 := containers.NewContainer("proc_nc")
+	c1.Name = "nc"
+	c1.TCPStats["10.0.0.1:8080"] = &containers.TCPStats{SuccessfulConnects: 1}
+
+	c2 := containers.NewContainer("proc_ncat")
+	c2.Name = "ncat"
+	// ncat is listening but has no outgoing TCPStats
+
+	c3 := containers.NewContainer("proc_sshd")
+	c3.Name = "sshd"
+	c3.TCPStats["10.0.0.2:22"] = &containers.TCPStats{SuccessfulConnects: 5}
+
+	ins := &Instance{}
+	full := ins.buildGraphWithContainers([]*containers.Container{c1, c2, c3})
+
+	// filter=nc + edges_only → only proc_nc (matches "nc" AND has edges)
+	// proc_ncat matches "nc" but has no edges → filtered out by edges_only
+	req := httptest.NewRequest("GET", "/graph?filter=nc&edges_only=true", nil)
+	filtered := ins.filterGraph(full, req)
+
+	if filtered.Summary.Nodes != 1 {
+		t.Errorf("combined filter nodes: want 1, got %d", filtered.Summary.Nodes)
+	}
+	if len(filtered.Nodes) > 0 && filtered.Nodes[0].ID != "proc_nc" {
+		t.Errorf("combined filter node ID: want proc_nc, got %s", filtered.Nodes[0].ID)
+	}
+}
+
+func TestFilterGraph_NoFilter(t *testing.T) {
+	c1 := containers.NewContainer("proc_a")
+	c1.Name = "a"
+
+	ins := &Instance{}
+	full := ins.buildGraphWithContainers([]*containers.Container{c1})
+
+	// No filter params → return as-is
+	req := httptest.NewRequest("GET", "/graph", nil)
+	result := ins.filterGraph(full, req)
+
+	if result.Summary.Nodes != full.Summary.Nodes {
+		t.Errorf("no-filter should pass through, got nodes %d vs %d",
+			result.Summary.Nodes, full.Summary.Nodes)
+	}
+}
+
+func TestHandleGraphDebug_Search(t *testing.T) {
+	ins := &Instance{EnableTCP: true, EnableHTTP: true}
+
+	req := httptest.NewRequest("GET", "/graph/debug?search=nc", nil)
+	rec := httptest.NewRecorder()
+	ins.handleGraphDebug(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Errorf("status: want 200, got %d", rec.Code)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "registry is nil") {
+		t.Errorf("expected nil registry message, got: %s", body)
+	}
+}

@@ -117,6 +117,7 @@ func (ins *Instance) BuildGraph() GraphResponse {
 	}
 
 	cs := ins.registry.GetContainers()
+	log.Printf("D! servicemap: BuildGraph: %d containers from registry", len(cs))
 	resp := ins.buildGraphWithContainers(cs)
 
 	// 收集 tracer 层面的摘要数据（在 buildGraphWithContainers 之后设置，避免被覆盖）
@@ -344,11 +345,16 @@ func (ins *Instance) stopAPIServer() {
 }
 
 // handleGraph 返回 JSON 格式的 service map graph
+//
+// 查询参数：
+//   - filter=<keyword>    按节点 ID/Name 模糊过滤（大小写不敏感），多个关键词用逗号分隔
+//   - edges_only=true     仅返回有 TCP 边的节点（隐藏无连接的监听进程）
 func (ins *Instance) handleGraph(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 
 	graph := ins.BuildGraph()
+	graph = ins.filterGraph(graph, r)
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
 	if err := enc.Encode(graph); err != nil {
@@ -357,12 +363,98 @@ func (ins *Instance) handleGraph(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleGraphText 返回人类可读 / AI 友好的纯文本格式
+//
+// 查询参数与 /graph 相同：filter=<keyword>, edges_only=true
 func (ins *Instance) handleGraphText(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 
 	graph := ins.BuildGraph()
+	graph = ins.filterGraph(graph, r)
 	ins.writeGraphText(w, graph)
+}
+
+// filterGraph 根据 HTTP 查询参数过滤 GraphResponse。
+// - filter: 逗号分隔的关键词列表，节点 ID 或 Name 包含任一关键词即保留（大小写不敏感）
+// - edges_only: 为 "true" 时仅保留作为边 Source 或 Target 出现的节点
+func (ins *Instance) filterGraph(g GraphResponse, r *http.Request) GraphResponse {
+	filterStr := r.URL.Query().Get("filter")
+	edgesOnly := r.URL.Query().Get("edges_only") == "true"
+
+	if filterStr == "" && !edgesOnly {
+		return g
+	}
+
+	// 解析 filter 关键词
+	var keywords []string
+	if filterStr != "" {
+		for _, kw := range strings.Split(filterStr, ",") {
+			kw = strings.TrimSpace(kw)
+			if kw != "" {
+				keywords = append(keywords, strings.ToLower(kw))
+			}
+		}
+	}
+
+	matchNode := func(n NodeJSON) bool {
+		if len(keywords) == 0 {
+			return true
+		}
+		id := strings.ToLower(n.ID)
+		name := strings.ToLower(n.Name)
+		for _, kw := range keywords {
+			if strings.Contains(id, kw) || strings.Contains(name, kw) {
+				return true
+			}
+		}
+		return false
+	}
+
+	// edges_only: 收集所有出现在边中的节点 ID
+	edgeNodeIDs := make(map[string]struct{})
+	if edgesOnly {
+		for _, e := range g.Edges {
+			edgeNodeIDs[e.Source] = struct{}{}
+			// Target 是 host:port，不是节点 ID，不加入
+		}
+	}
+
+	// 过滤节点
+	keptNodes := make(map[string]struct{})
+	var nodes []NodeJSON
+	for _, n := range g.Nodes {
+		if !matchNode(n) {
+			continue
+		}
+		if edgesOnly {
+			if _, ok := edgeNodeIDs[n.ID]; !ok {
+				continue
+			}
+		}
+		nodes = append(nodes, n)
+		keptNodes[n.ID] = struct{}{}
+	}
+
+	// 过滤边：只保留 Source 在保留节点中的边
+	var edges []EdgeJSON
+	for _, e := range g.Edges {
+		if _, ok := keptNodes[e.Source]; ok {
+			edges = append(edges, e)
+		}
+	}
+
+	if nodes == nil {
+		nodes = []NodeJSON{}
+	}
+	if edges == nil {
+		edges = []EdgeJSON{}
+	}
+
+	g.Nodes = nodes
+	g.Edges = edges
+	g.Summary.Nodes = len(nodes)
+	g.Summary.Edges = len(edges)
+	return g
 }
 
 // writeGraphText 将 GraphResponse 渲染为纯文本写入 w，便于测试复用。
@@ -436,17 +528,23 @@ func (ins *Instance) writeGraphText(w io.Writer, graph GraphResponse) {
 // ─────────────────────────────────────────────────────────────
 
 // handleGraphDebug 返回原始 registry 状态，用于排查 /graph 与 Gather 数据不一致的问题。
+//
+// 查询参数：
+//   - search=<keyword>  仅显示 ID/Name 包含关键词的容器（大小写不敏感），不传则全量
 func (ins *Instance) handleGraphDebug(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 
-	var sb strings.Builder
+	search := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("search")))
 
-	sb.WriteString("=== Service Map Debug ===\n\n")
+	var sb strings.Builder
+	now := time.Now()
+
+	sb.WriteString(fmt.Sprintf("=== Service Map Debug @ %s ===\n\n", now.Format(time.RFC3339)))
 
 	// 1) 实例状态
-	sb.WriteString(fmt.Sprintf("Instance: registry=%v tracer=%v\n",
-		ins.registry != nil, ins.tracer != nil))
+	sb.WriteString(fmt.Sprintf("Instance: registry=%v tracer=%v EnableTCP=%v EnableHTTP=%v\n",
+		ins.registry != nil, ins.tracer != nil, ins.EnableTCP, ins.EnableHTTP))
 
 	if ins.registry == nil {
 		sb.WriteString("ERROR: registry is nil, no data available\n")
@@ -456,54 +554,115 @@ func (ins *Instance) handleGraphDebug(w http.ResponseWriter, r *http.Request) {
 
 	// 2) 容器快照
 	cs := ins.registry.GetContainers()
-	sb.WriteString(fmt.Sprintf("Containers: %d\n\n", len(cs)))
 
+	// 统计分类
+	var withEdges, withoutEdges, procContainers int
 	for _, c := range cs {
 		if c == nil {
-			sb.WriteString("  <nil container>\n")
 			continue
 		}
-		sb.WriteString(fmt.Sprintf("  Container ID=%s Name=%q PID=%d LastActivity=%s\n",
-			c.ID, c.Name, c.PID, c.LastActivity.Format("15:04:05")))
+		tcp := c.GetTCPStatsSnapshot()
+		if len(tcp) > 0 {
+			withEdges++
+		} else {
+			withoutEdges++
+		}
+		if strings.HasPrefix(c.ID, "proc_") {
+			procContainers++
+		}
+	}
 
-		tcpStats := c.GetTCPStatsSnapshot()
-		sb.WriteString(fmt.Sprintf("    TCPStats entries: %d\n", len(tcpStats)))
-		for dest, s := range tcpStats {
-			sb.WriteString(fmt.Sprintf("      → %s  connects=%d failed=%d active=%d retx=%d sent=%d recv=%d\n",
-				dest, s.SuccessfulConnects, s.FailedConnects,
-				s.ActiveConnections, s.Retransmissions,
-				s.BytesSent, s.BytesReceived))
+	sb.WriteString(fmt.Sprintf("Containers total=%d  with_tcp_edges=%d  without_edges=%d  proc_*=%d\n",
+		len(cs), withEdges, withoutEdges, procContainers))
+	if search != "" {
+		sb.WriteString(fmt.Sprintf("Search filter: %q\n", search))
+	}
+	sb.WriteString("\n")
+
+	// 排序
+	sort.Slice(cs, func(i, j int) bool {
+		if cs[i] == nil || cs[j] == nil {
+			return cs[i] != nil
+		}
+		return cs[i].ID < cs[j].ID
+	})
+
+	// 3) 容器详情
+	shown := 0
+	for _, c := range cs {
+		if c == nil {
+			continue
 		}
 
-		sb.WriteString(fmt.Sprintf("    ActiveConnections: %d\n", c.ActiveConnectionCount()))
+		// 如果有搜索过滤，跳过不匹配的
+		if search != "" {
+			if !strings.Contains(strings.ToLower(c.ID), search) &&
+				!strings.Contains(strings.ToLower(c.Name), search) {
+				continue
+			}
+		}
+
+		age := now.Sub(c.LastActivity).Truncate(time.Second)
+		sb.WriteString(fmt.Sprintf("  [%s] name=%q pid=%d age=%s\n",
+			c.ID, c.Name, c.PID, age))
+
+		tcpStats := c.GetTCPStatsSnapshot()
+		if len(tcpStats) > 0 {
+			for dest, s := range tcpStats {
+				sb.WriteString(fmt.Sprintf("    TCP → %s  conn=%d fail=%d active=%d retx=%d sent=%dB recv=%dB\n",
+					dest, s.SuccessfulConnects, s.FailedConnects,
+					s.ActiveConnections, s.Retransmissions,
+					s.BytesSent, s.BytesReceived))
+			}
+		} else {
+			sb.WriteString("    TCP → (none)\n")
+		}
 
 		httpStats := c.GetHTTPStatsSnapshot()
 		if len(httpStats) > 0 {
-			sb.WriteString(fmt.Sprintf("    HTTPStats entries: %d\n", len(httpStats)))
+			sb.WriteString(fmt.Sprintf("    HTTP entries: %d\n", len(httpStats)))
 		}
 		l7Stats := c.GetL7StatsSnapshot()
 		if len(l7Stats) > 0 {
-			sb.WriteString(fmt.Sprintf("    L7Stats entries: %d\n", len(l7Stats)))
+			sb.WriteString(fmt.Sprintf("    L7 entries: %d\n", len(l7Stats)))
 		}
-		sb.WriteString("\n")
+
+		sb.WriteString(fmt.Sprintf("    ActiveConns(tracker): %d\n", c.ActiveConnectionCount()))
+		shown++
 	}
 
-	// 3) 从相同快照构建图，验证图构建结果
+	if search != "" && shown == 0 {
+		sb.WriteString(fmt.Sprintf("  (no containers match %q)\n", search))
+	}
+	sb.WriteString("\n")
+
+	// 4) Graph 构建验证
 	g := ins.buildGraphWithContainers(cs)
-	sb.WriteString(fmt.Sprintf("Graph from same snapshot: nodes=%d edges=%d\n",
-		g.Summary.Nodes, g.Summary.Edges))
-	for _, n := range g.Nodes {
-		sb.WriteString(fmt.Sprintf("  Node: %s (%s)\n", n.ID, n.Name))
-	}
-	for _, e := range g.Edges {
-		sb.WriteString(fmt.Sprintf("  Edge: %s -> %s\n", e.Source, e.Target))
+	sb.WriteString(fmt.Sprintf("Graph: nodes=%d edges=%d\n", g.Summary.Nodes, g.Summary.Edges))
+
+	// 如果有搜索条件，展示匹配的边
+	if search != "" {
+		for _, e := range g.Edges {
+			src := strings.ToLower(e.Source)
+			tgt := strings.ToLower(e.Target)
+			if strings.Contains(src, search) || strings.Contains(tgt, search) {
+				sb.WriteString(fmt.Sprintf("  Edge: %s -> %s\n", e.Source, e.Target))
+			}
+		}
 	}
 
-	// 4) Tracer 状态
+	// 5) Tracer 状态
 	if ins.tracer != nil {
 		sb.WriteString(fmt.Sprintf("\nTracer: activeConns=%d listenPorts=%d\n",
 			ins.tracer.ActiveConnectionCount(), len(ins.tracer.GetListenPorts())))
 	}
+
+	sb.WriteString("\n--- Usage ---\n")
+	sb.WriteString("  /graph/debug                  全量诊断\n")
+	sb.WriteString("  /graph/debug?search=nc        搜索含 'nc' 的容器\n")
+	sb.WriteString("  /graph?filter=nc              仅输出含 'nc' 的节点和边\n")
+	sb.WriteString("  /graph?edges_only=true        仅输出有 TCP 边的节点\n")
+	sb.WriteString("  /graph/text?filter=nc         文本格式 + 过滤\n")
 
 	_, _ = fmt.Fprint(w, sb.String())
 }
