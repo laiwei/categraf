@@ -25,10 +25,12 @@ type Instance struct {
 	EnableTCP        bool     `toml:"enable_tcp"`
 	EnableHTTP       bool     `toml:"enable_http"`
 	EnableCgroup     bool     `toml:"enable_cgroup"`
+	EnableDocker     bool     `toml:"enable_docker"`
+	EnableK8s        bool     `toml:"enable_k8s"`
 	DisableL7Tracing bool     `toml:"disable_l7_tracing"`
 	IgnorePorts      []int    `toml:"ignore_ports"`
 	IgnoreCIDRs      []string `toml:"ignore_cidrs"`
-	DockerSocketPath string   `toml:"docker_socket_path"`
+	DockerSocketPath string   `toml:"docker_socket"`
 	KubeConfigPath   string   `toml:"kubeconfig_path"`
 
 	// P1-6: 资源限制
@@ -101,8 +103,8 @@ func (ins *Instance) Init() error {
 
 	// 创建容器注册表
 	regConfig := containers.Config{
-		EnableDocker:  true,
-		EnableK8s:     ins.KubeConfigPath != "",
+		EnableDocker:  ins.EnableDocker,
+		EnableK8s:     ins.EnableK8s && ins.KubeConfigPath != "",
 		EnableCgroup:  ins.EnableCgroup,
 		DockerSocket:  ins.DockerSocketPath,
 		KubeConfig:    ins.KubeConfigPath,

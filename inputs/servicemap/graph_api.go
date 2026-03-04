@@ -108,6 +108,7 @@ type SummaryJSON struct {
 // 此方法线程安全（所有读取均通过快照方法）。
 func (ins *Instance) BuildGraph() GraphResponse {
 	if ins.registry == nil {
+		log.Println("D! servicemap: BuildGraph called but registry is nil")
 		return GraphResponse{
 			GeneratedAt: time.Now(),
 			Nodes:       []NodeJSON{},
@@ -308,6 +309,7 @@ func (ins *Instance) startAPIServer() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/graph", ins.handleGraph)
 	mux.HandleFunc("/graph/text", ins.handleGraphText)
+	mux.HandleFunc("/graph/debug", ins.handleGraphDebug)
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = fmt.Fprintln(w, "ok")
@@ -424,6 +426,83 @@ func (ins *Instance) writeGraphText(w io.Writer, graph GraphResponse) {
 				l.RequestsTotal, l.ErrorsTotal, l.AvgDurationMs,
 			))
 		}
+	}
+
+	_, _ = fmt.Fprint(w, sb.String())
+}
+
+// ─────────────────────────────────────────────────────────────
+// /graph/debug 诊断端点
+// ─────────────────────────────────────────────────────────────
+
+// handleGraphDebug 返回原始 registry 状态，用于排查 /graph 与 Gather 数据不一致的问题。
+func (ins *Instance) handleGraphDebug(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+
+	var sb strings.Builder
+
+	sb.WriteString("=== Service Map Debug ===\n\n")
+
+	// 1) 实例状态
+	sb.WriteString(fmt.Sprintf("Instance: registry=%v tracer=%v\n",
+		ins.registry != nil, ins.tracer != nil))
+
+	if ins.registry == nil {
+		sb.WriteString("ERROR: registry is nil, no data available\n")
+		_, _ = fmt.Fprint(w, sb.String())
+		return
+	}
+
+	// 2) 容器快照
+	cs := ins.registry.GetContainers()
+	sb.WriteString(fmt.Sprintf("Containers: %d\n\n", len(cs)))
+
+	for _, c := range cs {
+		if c == nil {
+			sb.WriteString("  <nil container>\n")
+			continue
+		}
+		sb.WriteString(fmt.Sprintf("  Container ID=%s Name=%q PID=%d LastActivity=%s\n",
+			c.ID, c.Name, c.PID, c.LastActivity.Format("15:04:05")))
+
+		tcpStats := c.GetTCPStatsSnapshot()
+		sb.WriteString(fmt.Sprintf("    TCPStats entries: %d\n", len(tcpStats)))
+		for dest, s := range tcpStats {
+			sb.WriteString(fmt.Sprintf("      → %s  connects=%d failed=%d active=%d retx=%d sent=%d recv=%d\n",
+				dest, s.SuccessfulConnects, s.FailedConnects,
+				s.ActiveConnections, s.Retransmissions,
+				s.BytesSent, s.BytesReceived))
+		}
+
+		sb.WriteString(fmt.Sprintf("    ActiveConnections: %d\n", c.ActiveConnectionCount()))
+
+		httpStats := c.GetHTTPStatsSnapshot()
+		if len(httpStats) > 0 {
+			sb.WriteString(fmt.Sprintf("    HTTPStats entries: %d\n", len(httpStats)))
+		}
+		l7Stats := c.GetL7StatsSnapshot()
+		if len(l7Stats) > 0 {
+			sb.WriteString(fmt.Sprintf("    L7Stats entries: %d\n", len(l7Stats)))
+		}
+		sb.WriteString("\n")
+	}
+
+	// 3) 从相同快照构建图，验证图构建结果
+	g := ins.buildGraphWithContainers(cs)
+	sb.WriteString(fmt.Sprintf("Graph from same snapshot: nodes=%d edges=%d\n",
+		g.Summary.Nodes, g.Summary.Edges))
+	for _, n := range g.Nodes {
+		sb.WriteString(fmt.Sprintf("  Node: %s (%s)\n", n.ID, n.Name))
+	}
+	for _, e := range g.Edges {
+		sb.WriteString(fmt.Sprintf("  Edge: %s -> %s\n", e.Source, e.Target))
+	}
+
+	// 4) Tracer 状态
+	if ins.tracer != nil {
+		sb.WriteString(fmt.Sprintf("\nTracer: activeConns=%d listenPorts=%d\n",
+			ins.tracer.ActiveConnectionCount(), len(ins.tracer.GetListenPorts())))
 	}
 
 	_, _ = fmt.Fprint(w, sb.String())
