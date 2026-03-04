@@ -350,13 +350,14 @@ func TestFilterGraph_ByKeyword(t *testing.T) {
 
 	c3 := containers.NewContainer("proc_systemd")
 	c3.Name = "systemd"
-	// no TCPStats
+	// no TCPStats — pure listening process, excluded by graph.Build()
 
 	ins := &Instance{}
 	full := ins.buildGraphWithContainers([]*containers.Container{c1, c2, c3})
 
-	if full.Summary.Nodes != 3 {
-		t.Fatalf("full graph should have 3 nodes, got %d", full.Summary.Nodes)
+	// c3 has no outgoing connections, graph.Build() filters it out before this point
+	if full.Summary.Nodes != 2 {
+		t.Fatalf("full graph should have 2 nodes (c3 orphan excluded by Build), got %d", full.Summary.Nodes)
 	}
 	if full.Summary.Edges != 2 {
 		t.Fatalf("full graph should have 2 edges, got %d", full.Summary.Edges)
@@ -384,16 +385,18 @@ func TestFilterGraph_EdgesOnly(t *testing.T) {
 
 	c2 := containers.NewContainer("proc_systemd")
 	c2.Name = "systemd"
-	// no TCPStats — listen-only process
+	// no TCPStats — listen-only process; graph.Build() excludes it before buildGraphWithContainers returns
 
 	ins := &Instance{}
 	full := ins.buildGraphWithContainers([]*containers.Container{c1, c2})
 
-	if full.Summary.Nodes != 2 {
-		t.Fatalf("full graph should have 2 nodes, got %d", full.Summary.Nodes)
+	// c2 has no outgoing connections → Build() filters it; full already has only proc_nc
+	if full.Summary.Nodes != 1 {
+		t.Fatalf("full graph should have 1 node (proc_systemd excluded by Build), got %d", full.Summary.Nodes)
 	}
 
-	// edges_only=true → only proc_nc (has edge), proc_systemd filtered out
+	// edges_only=true is a no-op here since Build already excluded the orphan;
+	// validate the filter API still returns correct results
 	req := httptest.NewRequest("GET", "/graph?edges_only=true", nil)
 	filtered := ins.filterGraph(full, req)
 
@@ -422,7 +425,7 @@ func TestFilterGraph_CombinedFilterAndEdgesOnly(t *testing.T) {
 	full := ins.buildGraphWithContainers([]*containers.Container{c1, c2, c3})
 
 	// filter=nc + edges_only → only proc_nc (matches "nc" AND has edges)
-	// proc_ncat matches "nc" but has no edges → filtered out by edges_only
+	// proc_ncat (c2) has no TCPStats → already excluded by graph.Build(), not in full graph
 	req := httptest.NewRequest("GET", "/graph?filter=nc&edges_only=true", nil)
 	filtered := ins.filterGraph(full, req)
 

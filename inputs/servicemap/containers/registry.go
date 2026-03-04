@@ -459,10 +459,12 @@ func (r *Registry) processEvent(event *tracer.Event) {
 		tracer.EventTypeTCPRetransmit, tracer.EventTypeL7Request,
 		tracer.EventTypeListenOpen, tracer.EventTypeListenClose,
 		tracer.EventTypeConnectionAccepted:
-		// 连接相关事件 + 监听事件 + 被动连接事件均需要创建/查找容器
-		// ListenOpen 使服务端进程在开始监听时即可见于拓扑图
-		// ConnectionAccepted 使服务端可见但不生成反向边
-		// 维护 listenPorts 集合（用于重传方向性判断）
+		// 连接相关事件 + 监听事件 + 被动连接事件均需要创建/查找容器。
+		// ListenOpen 触发容器创建，但不写入 TCPStats，因此不会产生拓扑边；
+		//   纯监听进程（如 sshd）在 graph.Build() 阶段因 TCPStats 为空而被过滤，
+		//   不会出现在 Nodes 列表中。
+		// ConnectionAccepted 使服务端容器存活（刷新 LastActivity），但不生成出站边。
+		// 维护 listenPorts 集合（用于重传方向性判断）。
 		if event.Type == tracer.EventTypeListenOpen && event.SrcPort > 0 {
 			r.listenPorts[event.SrcPort] = struct{}{}
 		} else if event.Type == tracer.EventTypeListenClose && event.SrcPort > 0 {

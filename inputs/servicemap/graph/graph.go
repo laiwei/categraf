@@ -44,11 +44,21 @@ func Build(cs []*containers.Container) Graph {
 		if c == nil {
 			continue
 		}
+
+		// P0-3: 使用快照方法避免并发读写竞争
+		// 必须先获取 tcpStats：
+		//   - 无出站连接记录（tcpStats 为空）的容器为孤立节点，不加入拓扑图。
+		//   - 典型场景：sshd、nginx 等纯监听进程仅有 ListenOpen / ConnectionAccepted
+		//     事件，TCPStats 始终为空，不应出现在 Nodes 列表中。
+		//   - 拓扑图语义：节点代表"服务调用方"，没有出站连接的纯服务端不参与拓扑。
+		tcpStats := c.GetTCPStatsSnapshot()
+		if len(tcpStats) == 0 {
+			continue
+		}
+
 		src := sourceNode(c)
 		g.Nodes[src.ID] = src
 
-		// P0-3: 使用快照方法避免并发读写竞争
-		tcpStats := c.GetTCPStatsSnapshot()
 		for dest, s := range tcpStats {
 			if s == nil {
 				continue
