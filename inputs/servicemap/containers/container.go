@@ -454,6 +454,23 @@ func (c *Container) ActiveConnectionCount() int {
 	return len(c.activeConnections)
 }
 
+// RefreshLiveConnections 批量刷新仍在系统中存活的连接的 LastSeen 时间戳。
+// liveDests 是通过 netlink/gopsutil 获取的当前 ESTABLISHED 连接目标地址集合。
+// 返回刷新的连接数。
+func (c *Container) RefreshLiveConnections(liveDests map[string]struct{}, now time.Time) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	refreshed := 0
+	for _, conn := range c.activeConnections {
+		if _, live := liveDests[conn.Destination]; live {
+			conn.LastSeen = now
+			refreshed++
+		}
+	}
+	return refreshed
+}
+
 // GCStaleConnections 清理长时间没有任何流量更新的「僵尸」连接。
 // 场景：eBPF ConnectionClose 事件丢失（perf buffer 溢出）或 seed 阶段创建的连接
 // 与 eBPF 的 FD（sk_ptr）不匹配，导致 activeConnections 永远无法通过 onConnectionClose 清除。

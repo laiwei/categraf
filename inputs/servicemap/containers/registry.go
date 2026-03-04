@@ -38,6 +38,12 @@ const (
 	// P0-5: 容器 GC 参数
 	containerGCInterval = 60 * time.Second
 	containerTimeout    = 10 * time.Minute
+
+	// 周期性活跃连接刷新间隔
+	// 长期空闲但仍然存活的 TCP 连接（如 sshd、持久数据库连接）不会产生任何 eBPF 事件，
+	// 导致 container.LastActivity 和 conn.LastSeen 过期，最终被 GC 误杀。
+	// 每 3 分钟扫描一次系统 TCP 连接表，对仍然存活的连接刷新时间戳。
+	connectionRefreshInterval = 3 * time.Minute
 )
 
 type k8sContainerMeta struct {
@@ -139,6 +145,9 @@ func NewRegistry(ctx context.Context, tr *tracer.Tracer, config Config) (*Regist
 
 	// P0-5: 启动容器 GC
 	r.launchBackground(r.containerGCLoop)
+
+	// 启动周期性活跃连接刷新（防止长期空闲连接被 GC 误杀）
+	r.launchBackground(r.refreshLiveConnectionsLoop)
 
 	// 启动容器发现
 	if config.EnableCgroup {
@@ -668,6 +677,65 @@ func (r *Registry) discoverContainersByCgroup() {
 			}
 			log.Println("D! servicemap: discovering containers and refreshing metadata...")
 		}
+	}
+}
+
+// refreshLiveConnectionsLoop 定期刷新仍然存活的长期空闲连接，防止被 GC 误杀。
+func (r *Registry) refreshLiveConnectionsLoop() {
+	ticker := time.NewTicker(connectionRefreshInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-r.stopChan:
+			return
+		case <-ticker.C:
+			r.refreshLiveConnections()
+		}
+	}
+}
+
+// refreshLiveConnections 扫描当前系统 TCP 连接，刷新仍然存活的连接的时间戳。
+//
+// 解决的问题：
+// 长期空闲的 ESTABLISHED 连接（如 sshd、nc 持久连接、数据库连接池）不会触发任何
+// eBPF 事件（connect/close/retransmit），导致：
+//   - container.LastActivity 过期 → gcContainers 删除容器
+//   - conn.LastSeen 过期 → GCStaleConnections 删除 activeConnections 条目
+//
+// 实现：
+//  1. tracer.ScanLiveDestinations() 优先使用 NETLINK_INET_DIAG（~5ms / 10k 连接），
+//     仅获取 ESTABLISHED 连接的目标地址集合，不需要 PID（避免昂贵的 /proc/*/fd/ 遍历）
+//  2. 遍历所有已知容器，按 destination 匹配刷新时间戳
+func (r *Registry) refreshLiveConnections() {
+	if r.tracer == nil {
+		return
+	}
+
+	liveDests := r.tracer.ScanLiveDestinations()
+	if len(liveDests) == 0 {
+		return
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	now := time.Now()
+	refreshedContainers := 0
+	refreshedConns := 0
+
+	for _, container := range r.containers {
+		n := container.RefreshLiveConnections(liveDests, now)
+		if n > 0 {
+			container.LastActivity = now
+			refreshedContainers++
+			refreshedConns += n
+		}
+	}
+
+	if refreshedContainers > 0 {
+		log.Printf("D! servicemap: refreshed %d containers with %d live connections",
+			refreshedContainers, refreshedConns)
 	}
 }
 

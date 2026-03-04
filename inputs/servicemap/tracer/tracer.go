@@ -611,6 +611,56 @@ func (t *Tracer) IsListening(port uint16) bool {
 	return false
 }
 
+// ScanLiveDestinations 扫描当前系统 TCP ESTABLISHED 连接，返回存活目标地址集合。
+// 用于 registry 周期性刷新长期空闲连接的 LastActivity / LastSeen，
+// 防止 GC 误杀仍然存活的连接和容器。
+//
+// 优先使用 NETLINK_INET_DIAG（~5ms / 10k 连接，无需遍历 /proc/*/fd/），
+// 非 Linux 平台回退到 gopsutil。不需要 PID，因此 netlink 完全满足需求。
+func (t *Tracer) ScanLiveDestinations() map[string]struct{} {
+	// 优先 netlink（快，但仅 Linux）
+	if !t.disableNetlink {
+		diagConns, err := netlinkConnections()
+		if err == nil {
+			dests := make(map[string]struct{}, len(diagConns))
+			for i := range diagConns {
+				dc := &diagConns[i]
+				if dc.State != 1 { // tcpEstablished = 1
+					continue
+				}
+				if dc.DstIP == "" || dc.DstPort == 0 {
+					continue
+				}
+				dest := net.JoinHostPort(dc.DstIP, strconv.Itoa(int(dc.DstPort)))
+				dests[dest] = struct{}{}
+			}
+			return dests
+		}
+		// netlink 失败，fallback
+	}
+
+	// gopsutil 兜底（macOS / 旧内核）
+	conns, err := gopsnet.Connections("tcp")
+	if err != nil {
+		log.Printf("D! servicemap: scan live destinations failed: %v", err)
+		return nil
+	}
+
+	dests := make(map[string]struct{}, len(conns))
+	for _, c := range conns {
+		status := strings.ToUpper(c.Status)
+		if status != "ESTABLISHED" && status != "ESTAB" {
+			continue
+		}
+		if c.Raddr.IP == "" || c.Raddr.Port == 0 {
+			continue
+		}
+		dest := endpoint(c.Raddr.IP, uint32(c.Raddr.Port))
+		dests[dest] = struct{}{}
+	}
+	return dests
+}
+
 // GetListenPorts 返回所有监听端口的快照 (P0-4)
 func (t *Tracer) GetListenPorts() map[uint16]struct{} {
 	t.listenMu.RLock()
