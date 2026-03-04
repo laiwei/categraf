@@ -83,6 +83,12 @@ type Event struct {
 	// 提前读取可最大化成功率。若为空表示读取失败或 PID=0。
 	Comm string
 
+	// NetnsInum 是事件所属的 network namespace inode。
+	// 由 eBPF 在内核侧从 sock->skc_net 或 task->nsproxy->net_ns 读取。
+	// 用于 Go 侧二次过滤：跳过与本 VM/容器 netns 不匹配的事件（OrbStack 等共享内核环境）。
+	// 值为 0 表示 eBPF 未提供（如轮询模式），不过滤。
+	NetnsInum uint32
+
 	// P2-9: L7 请求数据（仅当 Type == EventTypeL7Request 时有效）
 	L7Request *l7.RequestData
 }
@@ -118,6 +124,7 @@ type Tracer struct {
 	ctx              context.Context // P1-8: 生命周期 context
 	hostNetNs        netns.NsHandle
 	selfNetNs        netns.NsHandle
+	selfNetnsInum    uint32 // 本 VM/容器的 network namespace inode（用于过滤跨 namespace 事件）
 	disableL7Tracing bool
 	maxActiveConns   int // P1-6: 活跃连接数上限，0 = 不限制
 
@@ -198,6 +205,56 @@ func (t *Tracer) SetPIDFilter(fn func() map[uint32]struct{}) {
 	t.pidFilter = fn
 }
 
+// SelfNetnsInum 返回 categraf 所属的 network namespace inode。
+// 用于 Go 端二次过滤（registry processEvent 对比事件的 NetnsInum）。
+// 返回 0 表示未能获取（非 Linux 或获取失败），此时不进行过滤。
+func (t *Tracer) SelfNetnsInum() uint32 {
+	return t.selfNetnsInum
+}
+
+// readSelfNetnsInum 通过 stat /proc/1/ns/net（或 /proc/self/ns/net）获取
+// 当前 VM / 容器的 network namespace inode。
+// 在 OrbStack 等共享内核环境中，每个 VM 有独立的 network namespace。
+func readSelfNetnsInum() (uint32, error) {
+	// 优先 PID 1（VM init 进程的 netns，确保在任何 mount namespace 中都正确）
+	for _, path := range []string{"/proc/1/ns/net", "/proc/self/ns/net"} {
+		var st unix.Stat_t
+		if err := unix.Stat(path, &st); err == nil {
+			return uint32(st.Ino), nil
+		}
+	}
+	return 0, fmt.Errorf("cannot stat /proc/1/ns/net or /proc/self/ns/net")
+}
+
+// initNetnsFilter 读取本 VM 的 netns inode 并写入 eBPF config_map，
+// 使内核侧 kprobe 在事件产生时直接丢弃跨 namespace 的事件。
+func (t *Tracer) initNetnsFilter() error {
+	inum, err := readSelfNetnsInum()
+	if err != nil {
+		return fmt.Errorf("read self netns inode: %w", err)
+	}
+	t.selfNetnsInum = inum
+
+	if t.collection == nil {
+		return nil
+	}
+
+	configMap, ok := t.collection.Maps["config_map"]
+	if !ok {
+		log.Println("W! servicemap: config_map not found in eBPF collection, netns filtering disabled")
+		return nil
+	}
+
+	// config_map[0] = target netns inode
+	key := uint32(0)
+	if err := configMap.Put(key, inum); err != nil {
+		return fmt.Errorf("write config_map[0]=%d failed: %w", inum, err)
+	}
+
+	log.Printf("I! servicemap: netns filter enabled, self netns inode=%d", inum)
+	return nil
+}
+
 // adaptiveInterval 根据上次快照连接数动态返回下次轮询间隔。
 // 连接数越多，轮询间隔越长，避免高连接密度下 procfs 扫描开销持续积累。
 func adaptiveInterval(connCount int) time.Duration {
@@ -257,6 +314,13 @@ func (t *Tracer) Start() error {
 		return nil
 	}
 
+	// 初始化 network namespace 过滤：读取本 VM 的 netns inode 并写入 BPF config_map。
+	// OrbStack 等共享内核环境中，kprobe 是全局 hook，会触发所有 VM/容器的事件。
+	// 此过滤在内核侧直接丢弃跨 namespace 的事件，大幅减少 perf buffer 和 Go 端开销。
+	if err := t.initNetnsFilter(); err != nil {
+		log.Printf("W! servicemap: netns filter init failed (all events will be accepted): %v", err)
+	}
+
 	// 初始扫描：捕获 eBPF 加载前已存在的 TCP 连接和监听端口。
 	// eBPF kprobe 只能捕获 attach 之后发生的事件，预存连接对 kprobe 不可见。
 	// 使用 gopsutil （而非 netlink）因为需要 PID 信息。
@@ -270,6 +334,11 @@ func (t *Tracer) Start() error {
 
 // startFallbackMode 启动轮询回退模式
 func (t *Tracer) startFallbackMode() {
+	// 轮询模式也初始化 netns inode（供 Go 端二次过滤使用）
+	if inum, err := readSelfNetnsInum(); err == nil {
+		t.selfNetnsInum = inum
+		log.Printf("I! servicemap: polling mode netns inode=%d (Go-side filter only)", inum)
+	}
 	t.launchBackground(t.startPollingTracer)
 	t.launchBackground(t.startConnectionGC)
 	t.started = true

@@ -8,6 +8,54 @@
 #define AF_INET 2
 #define AF_INET6 10
 
+// ─── Network Namespace 过滤 ────────────────────────────────
+// OrbStack / 容器环境共享内核，kprobe 是全局 hook，会触发所有 VM/容器的事件。
+// 通过比较 socket 所属的 network namespace inode 与 categraf 自身的 namespace，
+// 在内核侧直接丢弃跨 namespace 的事件，避免 perf buffer 和 Go 端不必要的开销。
+//
+// config_map[0] = 目标 network namespace inode（由 Go 端在 eBPF 加载后写入）。
+// 值为 0 表示禁用过滤（兼容无法获取 netns inode 的环境）。
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, __u32);
+} config_map SEC(".maps");
+
+// 从 sock 读取 network namespace inode
+static __always_inline __u32 get_netns_from_sock(struct sock *sk) {
+	// sock->__sk_common.skc_net -> net->ns.inum
+	struct net *net = BPF_CORE_READ(sk, __sk_common.skc_net.net);
+	if (!net)
+		return 0;
+	return BPF_CORE_READ(net, ns.inum);
+}
+
+// 从当前 task_struct 读取 network namespace inode（用于无 sock 的 hook）
+static __always_inline __u32 get_netns_from_task(void) {
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+	if (!task)
+		return 0;
+	// task->nsproxy->net_ns->ns.inum
+	struct nsproxy *nsproxy = BPF_CORE_READ(task, nsproxy);
+	if (!nsproxy)
+		return 0;
+	struct net *net = BPF_CORE_READ(nsproxy, net_ns);
+	if (!net)
+		return 0;
+	return BPF_CORE_READ(net, ns.inum);
+}
+
+// 检查 netns inode 是否匹配 config_map 中的目标值。
+// 返回 true 表示匹配（应处理），false 表示不匹配（应丢弃）。
+static __always_inline bool match_netns(__u32 netns) {
+	__u32 key = 0;
+	__u32 *target = bpf_map_lookup_elem(&config_map, &key);
+	if (!target || *target == 0)
+		return true;  // 目标值为 0 或未设置 → 禁用过滤，全部放行
+	return netns == *target;
+}
+
 // 事件类型
 enum event_type {
 	EVENT_PROCESS_START = 1,
@@ -35,6 +83,8 @@ struct event {
 	__u64 bytes_sent;
 	__u64 bytes_received;
 	char comm[16];      // 进程名（bpf_get_current_comm），避免用户态竞态读取失败
+	__u32 netns_inum;   // network namespace inode，Go 端用于二次过滤
+	__u32 _pad2;        // 8 字节对齐填充
 };
 
 // Perf event buffer
@@ -60,6 +110,7 @@ struct conn_info {
 	__u64 bytes_sent;
 	__u64 bytes_received;
 	char comm[16];     // 进程名，从 tcp_connect 保存，供 close/retransmit 取回
+	__u32 netns_inum;  // 连接所属 network namespace inode
 };
 
 struct {
@@ -98,11 +149,17 @@ static __always_inline int fill_addr_from_sock(struct sock *sk, struct event *e)
 // Hook tcp_connect - 连接建立
 SEC("kprobe/tcp_connect")
 int BPF_KPROBE(tcp_connect, struct sock *sk) {
+	// Network namespace 过滤：丢弃非本 VM/容器的事件
+	__u32 netns = get_netns_from_sock(sk);
+	if (!match_netns(netns))
+		return 0;
+
 	struct event e = {};
 	e.type = EVENT_CONNECTION_OPEN;
 	e.pid = bpf_get_current_pid_tgid() >> 32;
-	e.fd = (__u64)sk;  // sock 指针作为唯一连接标识
-	bpf_get_current_comm(e.comm, sizeof(e.comm));  // 内核侧读取进程名，避免用户态竞态
+	e.fd = (__u64)sk;
+	e.netns_inum = netns;
+	bpf_get_current_comm(e.comm, sizeof(e.comm));
 
 	fill_addr_from_sock(sk, &e);
 
@@ -118,6 +175,7 @@ int BPF_KPROBE(tcp_connect, struct sock *sk) {
 	info.dst_port = e.dst_port;
 	info.family = e.family;
 	__builtin_memcpy(info.comm, e.comm, sizeof(info.comm));
+	info.netns_inum = netns;
 	bpf_map_update_elem(&active_connections, &key, &info, BPF_ANY);
 
 	send_event(ctx, &e);
@@ -136,20 +194,20 @@ int BPF_KPROBE(tcp_set_state, struct sock *sk, int state) {
 
 	if (state == 1) {
 		// TCP_ESTABLISHED — 仅处理被动接受的连接（服务端）。
-		// tcp_connect 发起的主动连接已经在 kprobe/tcp_connect 中写入了 active_connections，
-		// 如果 map 中已有此 sk_ptr 则说明是主动连接，跳过以避免重复 Open 事件。
 		struct conn_info *existing = bpf_map_lookup_elem(&active_connections, &key);
 		if (existing)
 			return 0;  // 主动连接，已由 tcp_connect 处理
 
-		// 被动连接（accept）：创建 Accepted 事件（与主动 Open 区分方向）
-		// 注意：tcp_set_state 可能在 softirq 上下文中被调用，
-		// bpf_get_current_pid_tgid() 可能返回 0 或无关进程的 PID。
-		// Go 端会跳过 PID=0 的事件。
+		// Network namespace 过滤
+		__u32 netns = get_netns_from_sock(sk);
+		if (!match_netns(netns))
+			return 0;
+
 		struct event e = {};
 		e.type = EVENT_CONNECTION_ACCEPTED;
 		e.pid = bpf_get_current_pid_tgid() >> 32;
 		e.fd = (__u64)sk;
+		e.netns_inum = netns;
 		bpf_get_current_comm(e.comm, sizeof(e.comm));
 
 		fill_addr_from_sock(sk, &e);
@@ -163,6 +221,7 @@ int BPF_KPROBE(tcp_set_state, struct sock *sk, int state) {
 		info.dst_port = e.dst_port;
 		info.family = e.family;
 		__builtin_memcpy(info.comm, e.comm, sizeof(info.comm));
+		info.netns_inum = netns;
 		bpf_map_update_elem(&active_connections, &key, &info, BPF_ANY);
 
 		send_event(ctx, &e);
@@ -171,14 +230,23 @@ int BPF_KPROBE(tcp_set_state, struct sock *sk, int state) {
 
 	if (state == 7) {
 		// TCP_CLOSE — 连接关闭
+		// 对于 close 事件，先尝试从 active_connections 获取 netns；
+		// 如果没有（未跟踪的连接），用 sock 读取。
+		struct conn_info *info = bpf_map_lookup_elem(&active_connections, &key);
+		__u32 netns = info ? info->netns_inum : get_netns_from_sock(sk);
+		if (!match_netns(netns)) {
+			if (info)
+				bpf_map_delete_elem(&active_connections, &key);
+			return 0;
+		}
+
 		struct event e = {};
 		e.type = EVENT_CONNECTION_CLOSE;
-		e.fd = key.sk_ptr;  // 与 Open/Accepted 事件的 fd 一致
+		e.fd = key.sk_ptr;
+		e.netns_inum = netns;
 
 		fill_addr_from_sock(sk, &e);
 
-		// 查找并删除活跃连接（从 map 中取回 connect/accept 时保存的 PID 和 comm）
-		struct conn_info *info = bpf_map_lookup_elem(&active_connections, &key);
 		if (info) {
 			e.pid = info->pid;
 			e.bytes_sent = info->bytes_sent;
@@ -186,7 +254,6 @@ int BPF_KPROBE(tcp_set_state, struct sock *sk, int state) {
 			__builtin_memcpy(e.comm, info->comm, sizeof(e.comm));
 			bpf_map_delete_elem(&active_connections, &key);
 		} else {
-			// map 中找不到，fallback 到当前上下文 PID（可能不准确）
 			e.pid = bpf_get_current_pid_tgid() >> 32;
 		}
 
@@ -207,15 +274,21 @@ int BPF_KPROBE(tcp_retransmit_skb, struct sock *sk) {
 		.sk_ptr = (__u64)sk,
 	};
 
+	// Network namespace 过滤：优先从 active_connections 获取，fallback 到 sock
+	struct conn_info *_info = bpf_map_lookup_elem(&active_connections, &key);
+	__u32 netns = _info ? _info->netns_inum : get_netns_from_sock(sk);
+	if (!match_netns(netns))
+		return 0;
+
 	struct event e = {};
 	e.type = EVENT_TCP_RETRANSMIT;
 	e.fd = (__u64)sk;
+	e.netns_inum = netns;
 
-	// 优先从 active_connections 取回正确的 PID 和 comm
-	struct conn_info *info = bpf_map_lookup_elem(&active_connections, &key);
-	if (info) {
-		e.pid = info->pid;
-		__builtin_memcpy(e.comm, info->comm, sizeof(e.comm));
+	// 从 active_connections 取回正确的 PID 和 comm（已在上方查过 _info）
+	if (_info) {
+		e.pid = _info->pid;
+		__builtin_memcpy(e.comm, _info->comm, sizeof(e.comm));
 	} else {
 		// map 中找不到，fallback（可能不准确，Go 端会跳过 PID=0）
 		e.pid = bpf_get_current_pid_tgid() >> 32;
@@ -229,12 +302,21 @@ int BPF_KPROBE(tcp_retransmit_skb, struct sock *sk) {
 // Hook inet_listen - 监听端口
 SEC("kprobe/inet_listen")
 int BPF_KPROBE(inet_listen, struct socket *sock, int backlog) {
+	struct sock *sk = BPF_CORE_READ(sock, sk);
+	if (!sk)
+		return 0;
+
+	// Network namespace 过滤
+	__u32 netns = get_netns_from_sock(sk);
+	if (!match_netns(netns))
+		return 0;
+
 	struct event e = {};
 	e.type = EVENT_LISTEN_OPEN;
 	e.pid = bpf_get_current_pid_tgid() >> 32;
-	bpf_get_current_comm(e.comm, sizeof(e.comm));  // 进程上下文，comm 可靠
+	e.netns_inum = netns;
+	bpf_get_current_comm(e.comm, sizeof(e.comm));
 
-	struct sock *sk = BPF_CORE_READ(sock, sk);
 	if (sk) {
 		e.family = BPF_CORE_READ(sk, __sk_common.skc_family);
 		if (e.family == AF_INET) {
@@ -253,9 +335,15 @@ int BPF_KPROBE(inet_listen, struct socket *sock, int backlog) {
 // Hook fork/exec - 进程启动
 SEC("tracepoint/sched/sched_process_fork")
 int handle_fork(struct trace_event_raw_sched_process_fork *ctx) {
+	// Network namespace 过滤（使用当前 task 的 netns）
+	__u32 netns = get_netns_from_task();
+	if (!match_netns(netns))
+		return 0;
+
 	struct event e = {};
 	e.type = EVENT_PROCESS_START;
 	e.pid = ctx->child_pid;
+	e.netns_inum = netns;
 
 	send_event(ctx, &e);
 	return 0;
@@ -264,9 +352,15 @@ int handle_fork(struct trace_event_raw_sched_process_fork *ctx) {
 // Hook exit - 进程退出
 SEC("tracepoint/sched/sched_process_exit")
 int handle_exit(struct trace_event_raw_sched_process_template *ctx) {
+	// Network namespace 过滤
+	__u32 netns = get_netns_from_task();
+	if (!match_netns(netns))
+		return 0;
+
 	struct event e = {};
 	e.type = EVENT_PROCESS_EXIT;
 	e.pid = bpf_get_current_pid_tgid() >> 32;
+	e.netns_inum = netns;
 
 	send_event(ctx, &e);
 	return 0;

@@ -291,9 +291,22 @@ func (r *Registry) processEvent(event *tracer.Event) {
 	//   （如 tcp_retransmit_skb、tcp_set_state 处理 accept 的被动连接）
 	// - seed 扫描到 TIME_WAIT 等无归属进程的连接时 PID=0
 	// 这些事件无法关联到正确的进程，只会产生 proc_0 垃圾容器。
-	// 例外：ProcessStart/ProcessExit 的 PID=0 理论上不应出现，但也安全跳过。
 	if event.Pid == 0 {
 		return
+	}
+
+	// Network namespace 二次过滤：
+	// eBPF 侧已通过 config_map 做了一次过滤，但以下情况需要 Go 端兜底：
+	//   1) config_map 写入失败 → eBPF 放行所有事件
+	//   2) seed 扫描产生的事件不经过 eBPF
+	//   3) 轮询模式不经过 eBPF
+	// 如果事件携带了 NetnsInum（>0）且 tracer 有 selfNetnsInum（>0），
+	// 不匹配时静默丢弃，避免跨 VM/容器的进程污染 graph。
+	if event.NetnsInum > 0 && r.tracer != nil {
+		selfNs := r.tracer.SelfNetnsInum()
+		if selfNs > 0 && event.NetnsInum != selfNs {
+			return
+		}
 	}
 
 	// 所有事件类型：如果携带了进程名（tracer 层尽早读取），更新 commCache。

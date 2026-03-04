@@ -28,6 +28,8 @@ type rawEvent struct {
 	BytesSent uint64
 	BytesRecv uint64
 	Comm      [16]byte // 进程名（由 eBPF bpf_get_current_comm 填充）
+	NetnsInum uint32   // network namespace inode（用于过滤跨 VM/容器的事件）
+	Padding2  uint32   // 8 字节对齐填充（_pad2）
 }
 
 const (
@@ -54,6 +56,7 @@ func parseRawEvent(data []byte) (*Event, error) {
 		Fd:        raw.Fd,
 		SrcPort:   raw.SrcPort,
 		DstPort:   ntohs(raw.DstPort), // eBPF 端存储为网络字节序
+		NetnsInum: raw.NetnsInum,
 	}
 
 	// 提取 eBPF 侧填充的进程名（null-terminated C string）
