@@ -6,26 +6,28 @@ import (
 	"fmt"
 	"net"
 	"strconv"
+	"strings"
 	"time"
 
 	"flashcat.cloud/categraf/inputs/servicemap/l7"
 )
 
 // rawEvent 对应 eBPF C 端的 struct event
-// 必须与 tcp_tracer.bpf.c 中的定义保持一致
+// 必须与 tcp_tracer.bpf.c 中的定义保持一致（修改时同步两边）
 type rawEvent struct {
 	Timestamp uint64
 	Type      uint32
 	Pid       uint32
-	Fd        uint64
+	Fd        uint64    // sock 指针作为唯一连接标识
 	SrcAddr   [4]uint32 // IPv4 只用第一个元素，IPv6 用全部
 	DstAddr   [4]uint32
 	SrcPort   uint16
 	DstPort   uint16
 	Family    uint16 // AF_INET=2 or AF_INET6=10
-	Padding   uint16 // C struct 对齐填充（Family 后到 BytesSent 的 8 字节边界）
+	Padding   uint16 // C struct 显式对齐填充（_pad）
 	BytesSent uint64
 	BytesRecv uint64
+	Comm      [16]byte // 进程名（由 eBPF bpf_get_current_comm 填充）
 }
 
 const (
@@ -52,6 +54,14 @@ func parseRawEvent(data []byte) (*Event, error) {
 		Fd:        raw.Fd,
 		SrcPort:   raw.SrcPort,
 		DstPort:   ntohs(raw.DstPort), // eBPF 端存储为网络字节序
+	}
+
+	// 提取 eBPF 侧填充的进程名（null-terminated C string）
+	if idx := bytes.IndexByte(raw.Comm[:], 0); idx > 0 {
+		event.Comm = string(raw.Comm[:idx])
+	} else if idx < 0 {
+		// 无 null 终止符，使用完整 buffer
+		event.Comm = strings.TrimSpace(string(raw.Comm[:]))
 	}
 
 	// 解析地址 — 格式化为 "ip:port"，与轮询模式 endpoint() 格式一致

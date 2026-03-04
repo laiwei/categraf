@@ -436,10 +436,15 @@ func (t *Tracer) runEventReader(r *perf.Reader) {
 			continue
 		}
 
-		// 尽早读取进程名：此时距内核事件发生仅有极短延迟，进程大概率仍然存活。
-		// 等事件通过 eventChan 传递到 registry 时，短命进程可能已退出。
-		if event.Pid > 0 {
+		// 尽早读取进程名：
+		// 1. 优先使用 eBPF 侧通过 bpf_get_current_comm 获取的 comm（在内核中读取，不受进程退出竞态影响）
+		// 2. 若 eBPF 未提供（如 softirq 上下文中 comm 无意义），fallback 到用户态 /proc/<pid>/comm
+		if event.Pid > 0 && event.Comm == "" {
 			event.Comm = readProcComm(event.Pid)
+		}
+		// sanitize eBPF 提供的 comm（可能含内核线程名中的特殊字符）
+		if event.Comm != "" {
+			event.Comm = sanitizeComm(event.Comm)
 		}
 
 		// eBPF 模式下追踪活跃连接（使 ActiveConnectionCount/ForEachActiveConnection 工作）
@@ -587,6 +592,13 @@ func (t *Tracer) seedExistingConnections() {
 
 	for _, c := range conns {
 		pid := uint32(c.Pid)
+
+		// 跳过 PID=0 的连接（TIME_WAIT、内核连接等无归属进程的连接）。
+		// 这些连接无法映射到正确的进程/容器，只会产生 proc_0 垃圾节点。
+		if pid == 0 {
+			continue
+		}
+
 		comm := readProcComm(pid)
 
 		if strings.ToUpper(c.Status) == "LISTEN" {
@@ -1128,12 +1140,17 @@ func readProcComm(pid uint32) string {
 		return ""
 	}
 	comm := strings.TrimSpace(string(b))
-	// sanitize: 保留字母、数字、-._
+	return sanitizeComm(comm)
+}
+
+// sanitizeComm 将进程名中的非法字符替换为下划线，使其适合作为 Prometheus 标签值。
+// 用于 eBPF bpf_get_current_comm 和 /proc/<pid>/comm 两种来源。
+func sanitizeComm(s string) string {
 	return strings.Map(func(r rune) rune {
 		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') ||
 			(r >= '0' && r <= '9') || r == '-' || r == '.' || r == '_' {
 			return r
 		}
 		return '_'
-	}, comm)
+	}, s)
 }

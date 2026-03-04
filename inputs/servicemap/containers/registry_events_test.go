@@ -51,6 +51,23 @@ func TestRegistryLaunchBackground_Multiple(t *testing.T) {
 
 // ─── processEvent ─────────────────────────────────────────────
 
+// TestProcessEvent_PidZero_Skipped 验证 PID=0 的事件被跳过（softirq/内核上下文噪声）
+func TestProcessEvent_PidZero_Skipped(t *testing.T) {
+	r := newBareRegistry(Config{EnableCgroup: false})
+
+	r.processEvent(&tracer.Event{
+		Type:    tracer.EventTypeConnectionOpen,
+		Pid:     0, // PID=0 → 应被跳过
+		Fd:      1,
+		DstAddr: "10.0.0.1:80",
+	})
+
+	cs := r.GetContainers()
+	if len(cs) != 0 {
+		t.Fatalf("expected 0 containers for PID=0 event (should be skipped), got %d", len(cs))
+	}
+}
+
 func TestProcessEvent_NoCgroup_CreatesProcContainer(t *testing.T) {
 	// EnableCgroup=false → getContainerIDByPID 返回 "" → resolveProcID(12345) → "proc_12345[_<comm>]"
 	r := newBareRegistry(Config{EnableCgroup: false})
@@ -77,6 +94,7 @@ func TestProcessEvent_ConnectionOpen_UpdatesTCPStats(t *testing.T) {
 
 	r.processEvent(&tracer.Event{
 		Type:    tracer.EventTypeConnectionOpen,
+		Pid:     999,
 		Fd:      5,
 		DstAddr: "192.168.1.1:5432",
 	})
@@ -103,8 +121,8 @@ func TestProcessEvent_MaxContainersReached_ReturnsNil(t *testing.T) {
 	// MaxContainers=1，先创建一个，再发 processEvent 触发第二个
 	r := newBareRegistry(Config{EnableCgroup: false, MaxContainers: 1})
 
-	// 先填满（创建 proc_0 容器）
-	r.processEvent(&tracer.Event{Type: tracer.EventTypeConnectionOpen, Fd: 1, DstAddr: "1.1.1.1:80"})
+	// 先填满（创建 proc_999 容器）— PID 必须非零，PID=0 事件会被跳过
+	r.processEvent(&tracer.Event{Type: tracer.EventTypeConnectionOpen, Pid: 999, Fd: 1, DstAddr: "1.1.1.1:80"})
 
 	// 直接调用 getOrCreateContainer 触发 MaxContainers 上限检测
 	// 改为直接调用 getOrCreateContainer
@@ -120,10 +138,11 @@ func TestProcessEvent_MaxContainersReached_ReturnsNil(t *testing.T) {
 func TestProcessEvent_MultipleEvents_SameContainer(t *testing.T) {
 	r := newBareRegistry(Config{EnableCgroup: false})
 
-	// 3 次 ConnectionOpen 到不同目标
+	// 3 次 ConnectionOpen 到不同目标，同一 PID → 同一容器
 	for i, dest := range []string{"10.0.0.1:80", "10.0.0.2:80", "10.0.0.3:80"} {
 		r.processEvent(&tracer.Event{
 			Type:    tracer.EventTypeConnectionOpen,
+			Pid:     555, // 同一 PID → 同一 proc_ 容器
 			Fd:      uint64(i + 1),
 			DstAddr: dest,
 		})
@@ -131,7 +150,7 @@ func TestProcessEvent_MultipleEvents_SameContainer(t *testing.T) {
 
 	cs := r.GetContainers()
 	if len(cs) != 1 {
-		t.Fatalf("expected 1 container (all pid=0 → same proc_0 container), got %d", len(cs))
+		t.Fatalf("expected 1 container (all pid=555 → same proc_ container), got %d", len(cs))
 	}
 	snap := cs[0].GetTCPStatsSnapshot()
 	if len(snap) != 3 {
@@ -166,9 +185,10 @@ func TestUpdateConnectionStats_WithActiveConns(t *testing.T) {
 	r := newBareRegistry(Config{EnableCgroup: false})
 	r.tracer = tr
 
-	// 在 registry 中创建 proc_0（裸进程）容器并打开一个连接
+	// 在 registry 中创建裸进程容器并打开一个连接 — PID 必须非零
 	r.processEvent(&tracer.Event{
 		Type:    tracer.EventTypeConnectionOpen,
+		Pid:     888,
 		Fd:      10,
 		DstAddr: "8.8.8.8:53",
 	})

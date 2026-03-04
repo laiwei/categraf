@@ -286,10 +286,20 @@ func (r *Registry) processEvent(event *tracer.Event) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
+	// 跳过 PID=0 的事件：
+	// - eBPF kprobe 在 softirq/interrupt 上下文中触发时 bpf_get_current_pid_tgid() 返回 0
+	//   （如 tcp_retransmit_skb、tcp_set_state 处理 accept 的被动连接）
+	// - seed 扫描到 TIME_WAIT 等无归属进程的连接时 PID=0
+	// 这些事件无法关联到正确的进程，只会产生 proc_0 垃圾容器。
+	// 例外：ProcessStart/ProcessExit 的 PID=0 理论上不应出现，但也安全跳过。
+	if event.Pid == 0 {
+		return
+	}
+
 	// 所有事件类型：如果携带了进程名（tracer 层尽早读取），更新 commCache。
 	// 这保证了即使 ProcessStart 与 ConnectionOpen 跨 CPU 乱序到达，
 	// ConnectionOpen 自身携带的 Comm 也能被缓存供 resolveContainerID 使用。
-	if event.Pid > 0 && event.Comm != "" {
+	if event.Comm != "" {
 		r.commCache[event.Pid] = event.Comm
 	}
 

@@ -20,19 +20,21 @@ enum event_type {
 	EVENT_CONNECTION_ACCEPTED = 8,  // 服务端 accept 的被动连接（与 OPEN 区分方向）
 };
 
-// 与 Go 端 Event 结构对应
+// 与 Go 端 rawEvent 结构对应（修改时必须同步 event_parser.go）
 struct event {
 	__u64 timestamp;
 	__u32 type;
 	__u32 pid;
-	__u64 fd;
+	__u64 fd;           // sock 指针作为唯一连接标识（替代不可用的 fd）
 	__u32 src_addr[4];  // IPv4 只用第一个元素
 	__u32 dst_addr[4];
 	__u16 src_port;
 	__u16 dst_port;
 	__u16 family;       // AF_INET or AF_INET6
+	__u16 _pad;         // 显式对齐填充（与 Go 端 Padding uint16 对应）
 	__u64 bytes_sent;
 	__u64 bytes_received;
+	char comm[16];      // 进程名（bpf_get_current_comm），避免用户态竞态读取失败
 };
 
 // Perf event buffer
@@ -54,8 +56,10 @@ struct conn_info {
 	__u16 src_port;
 	__u16 dst_port;
 	__u16 family;
+	__u16 _pad;        // 显式对齐填充
 	__u64 bytes_sent;
 	__u64 bytes_received;
+	char comm[16];     // 进程名，从 tcp_connect 保存，供 close/retransmit 取回
 };
 
 struct {
@@ -97,10 +101,12 @@ int BPF_KPROBE(tcp_connect, struct sock *sk) {
 	struct event e = {};
 	e.type = EVENT_CONNECTION_OPEN;
 	e.pid = bpf_get_current_pid_tgid() >> 32;
+	e.fd = (__u64)sk;  // sock 指针作为唯一连接标识
+	bpf_get_current_comm(e.comm, sizeof(e.comm));  // 内核侧读取进程名，避免用户态竞态
 
 	fill_addr_from_sock(sk, &e);
 
-	// 保存连接信息（以 sock 指针为 key，存储 PID 供 close 时取回）
+	// 保存连接信息（以 sock 指针为 key，存储 PID + comm 供 close 时取回）
 	struct conn_key key = {
 		.sk_ptr = (__u64)sk,
 	};
@@ -111,6 +117,7 @@ int BPF_KPROBE(tcp_connect, struct sock *sk) {
 	info.src_port = e.src_port;
 	info.dst_port = e.dst_port;
 	info.family = e.family;
+	__builtin_memcpy(info.comm, e.comm, sizeof(info.comm));
 	bpf_map_update_elem(&active_connections, &key, &info, BPF_ANY);
 
 	send_event(ctx, &e);
@@ -136,9 +143,14 @@ int BPF_KPROBE(tcp_set_state, struct sock *sk, int state) {
 			return 0;  // 主动连接，已由 tcp_connect 处理
 
 		// 被动连接（accept）：创建 Accepted 事件（与主动 Open 区分方向）
+		// 注意：tcp_set_state 可能在 softirq 上下文中被调用，
+		// bpf_get_current_pid_tgid() 可能返回 0 或无关进程的 PID。
+		// Go 端会跳过 PID=0 的事件。
 		struct event e = {};
 		e.type = EVENT_CONNECTION_ACCEPTED;
 		e.pid = bpf_get_current_pid_tgid() >> 32;
+		e.fd = (__u64)sk;
+		bpf_get_current_comm(e.comm, sizeof(e.comm));
 
 		fill_addr_from_sock(sk, &e);
 
@@ -150,6 +162,7 @@ int BPF_KPROBE(tcp_set_state, struct sock *sk, int state) {
 		info.src_port = e.src_port;
 		info.dst_port = e.dst_port;
 		info.family = e.family;
+		__builtin_memcpy(info.comm, e.comm, sizeof(info.comm));
 		bpf_map_update_elem(&active_connections, &key, &info, BPF_ANY);
 
 		send_event(ctx, &e);
@@ -160,15 +173,17 @@ int BPF_KPROBE(tcp_set_state, struct sock *sk, int state) {
 		// TCP_CLOSE — 连接关闭
 		struct event e = {};
 		e.type = EVENT_CONNECTION_CLOSE;
+		e.fd = key.sk_ptr;  // 与 Open/Accepted 事件的 fd 一致
 
 		fill_addr_from_sock(sk, &e);
 
-		// 查找并删除活跃连接（从 map 中取回 connect/accept 时保存的 PID）
+		// 查找并删除活跃连接（从 map 中取回 connect/accept 时保存的 PID 和 comm）
 		struct conn_info *info = bpf_map_lookup_elem(&active_connections, &key);
 		if (info) {
 			e.pid = info->pid;
 			e.bytes_sent = info->bytes_sent;
 			e.bytes_received = info->bytes_received;
+			__builtin_memcpy(e.comm, info->comm, sizeof(e.comm));
 			bpf_map_delete_elem(&active_connections, &key);
 		} else {
 			// map 中找不到，fallback 到当前上下文 PID（可能不准确）
@@ -183,11 +198,28 @@ int BPF_KPROBE(tcp_set_state, struct sock *sk, int state) {
 }
 
 // Hook tcp_retransmit_skb - TCP重传
+// 关键修复：tcp_retransmit_skb 通常在 softirq 上下文中被调用，
+// bpf_get_current_pid_tgid() 返回 0 或无关进程的 PID。
+// 因此必须从 active_connections map 中查找正确的 PID 和 comm。
 SEC("kprobe/tcp_retransmit_skb")
 int BPF_KPROBE(tcp_retransmit_skb, struct sock *sk) {
+	struct conn_key key = {
+		.sk_ptr = (__u64)sk,
+	};
+
 	struct event e = {};
 	e.type = EVENT_TCP_RETRANSMIT;
-	e.pid = bpf_get_current_pid_tgid() >> 32;
+	e.fd = (__u64)sk;
+
+	// 优先从 active_connections 取回正确的 PID 和 comm
+	struct conn_info *info = bpf_map_lookup_elem(&active_connections, &key);
+	if (info) {
+		e.pid = info->pid;
+		__builtin_memcpy(e.comm, info->comm, sizeof(e.comm));
+	} else {
+		// map 中找不到，fallback（可能不准确，Go 端会跳过 PID=0）
+		e.pid = bpf_get_current_pid_tgid() >> 32;
+	}
 
 	fill_addr_from_sock(sk, &e);
 	send_event(ctx, &e);
@@ -200,6 +232,7 @@ int BPF_KPROBE(inet_listen, struct socket *sock, int backlog) {
 	struct event e = {};
 	e.type = EVENT_LISTEN_OPEN;
 	e.pid = bpf_get_current_pid_tgid() >> 32;
+	bpf_get_current_comm(e.comm, sizeof(e.comm));  // 进程上下文，comm 可靠
 
 	struct sock *sk = BPF_CORE_READ(sock, sk);
 	if (sk) {
