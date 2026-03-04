@@ -745,21 +745,25 @@ func (t *Tracer) seedExistingConnections() {
 
 		fd := connectionFD(c)
 
-		// 区分主动连接 vs 被动连接：
-		// 如果本地端口是已知监听端口，说明这是服务端 accept 的被动连接，
-		// 使用 ConnectionAccepted 类型避免生成反向边。
-		evType := EventTypeConnectionOpen
+		// 跳过被动连接（本地端口匹配已知监听端口）：
+		// 被动连接由远端客户端发起，在本机视角中无法正确表达拓扑方向。
+		// seed 它只会创建一个无边的孤立容器节点，最终被 GC 清除，浪费一轮生命周期。
+		// 正确的拓扑边应由客户端机器的 agent 通过 ConnectionOpen 产生。
+		isPassive := false
 		t.listenMu.RLock()
 		for lk := range t.listenPorts {
 			if lk.Port == uint16(c.Laddr.Port) {
-				evType = EventTypeConnectionAccepted
+				isPassive = true
 				break
 			}
 		}
 		t.listenMu.RUnlock()
+		if isPassive {
+			continue
+		}
 
 		event := Event{
-			Type:      evType,
+			Type:      EventTypeConnectionOpen,
 			Timestamp: nowNano,
 			Pid:       pid,
 			Fd:        fd,
