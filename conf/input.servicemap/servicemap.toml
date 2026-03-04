@@ -21,8 +21,9 @@ disable_l7_tracing = false
 #   curl http://localhost:9099/graph                  # JSON 完整输出
 #   curl http://localhost:9099/graph?filter=nc        # 按名称过滤
 #   curl http://localhost:9099/graph?edges_only=true  # 仅有连接的节点
-#   curl http://localhost:9099/graph/text             # 人类可读文本格式
+#   curl http://localhost:9099/graph/text             # 人类可读文本格式（含 ASCII 拓扑）
 #   curl http://localhost:9099/graph/text?filter=nc   # 文本 + 过滤
+#   浏览器打开 http://localhost:9099/graph/view       # 交互式可视化拓扑
 #   curl http://localhost:9099/graph/debug            # 诊断信息
 #   curl http://localhost:9099/graph/debug?search=nc  # 搜索特定容器
 #   curl http://localhost:9099/health                 # 健康检查

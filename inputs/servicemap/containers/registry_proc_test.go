@@ -78,8 +78,15 @@ func TestSanitizeProcLabel_Special(t *testing.T) {
 		{"my app", "my_app"},     // 空格
 		{"app/v2", "app_v2"},     // 斜杠
 		{"app:8080", "app_8080"}, // 冒号
-		{"(app)", "_app_"},       // 括号
-		{"", ""},
+		{"(app)", "app"},         // 括号 → 首尾下划线去除
+		{"", ""},                 // 空串
+		{"百度网盘", "百度网盘"},         // 全中文 → 保留（Prometheus label value 支持 UTF-8）
+		{"企业微信", "企业微信"},         // 另一个全中文名 → 保留
+		{"App(中文)", "App_中文"},    // 混合：括号→下划线，中文保留
+		{"a//b", "a_b"},          // 连续斜杠 → 折叠
+		{"---", "---"},           // 连续连字符保留
+		{"__test__", "test"},     // 已有下划线 → 去除首尾
+		{"a (b) c", "a_b_c"},     // 多段特殊字符 → 折叠 + trim
 	}
 	for _, c := range cases {
 		got := sanitizeProcLabel(c.input)

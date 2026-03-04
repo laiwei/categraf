@@ -310,6 +310,7 @@ func (ins *Instance) startAPIServer() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/graph", ins.handleGraph)
 	mux.HandleFunc("/graph/text", ins.handleGraphText)
+	mux.HandleFunc("/graph/view", ins.handleGraphView)
 	mux.HandleFunc("/graph/debug", ins.handleGraphDebug)
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -521,6 +522,12 @@ func (ins *Instance) writeGraphText(w io.Writer, graph GraphResponse) {
 	}
 
 	_, _ = fmt.Fprint(w, sb.String())
+
+	// ASCII 拓扑图（可视化连接关系）
+	if len(graph.Edges) > 0 {
+		_, _ = fmt.Fprint(w, "\n")
+		writeASCIITopology(w, graph)
+	}
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -658,6 +665,7 @@ func (ins *Instance) handleGraphDebug(w http.ResponseWriter, r *http.Request) {
 	}
 
 	sb.WriteString("\n--- Usage ---\n")
+	sb.WriteString("  /graph/view                   交互式可视化拓扑（浏览器打开）\n")
 	sb.WriteString("  /graph/debug                  全量诊断\n")
 	sb.WriteString("  /graph/debug?search=nc        搜索含 'nc' 的容器\n")
 	sb.WriteString("  /graph?filter=nc              仅输出含 'nc' 的节点和边\n")

@@ -11,11 +11,13 @@ import (
 	"log"
 	"net"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"flashcat.cloud/categraf/inputs/servicemap/l7"
 	"github.com/cilium/ebpf"
@@ -1269,20 +1271,36 @@ func readProcComm(pid uint32) string {
 	// 非 Linux fallback：gopsutil 跨平台进程名查询
 	if p, err := gopsprocess.NewProcess(int32(pid)); err == nil {
 		if name, err := p.Name(); err == nil && name != "" {
-			return sanitizeComm(name)
+			if s := sanitizeComm(name); s != "" {
+				return s
+			}
+		}
+		// Name() sanitize 后为空（全非 ASCII，如中文 App）→ 尝试可执行文件名
+		if exe, err := p.Exe(); err == nil && exe != "" {
+			base := filepath.Base(exe)
+			if s := sanitizeComm(base); s != "" {
+				return s
+			}
 		}
 	}
 	return ""
 }
 
-// sanitizeComm 将进程名中的非法字符替换为下划线，使其适合作为 Prometheus 标签值。
-// 用于 eBPF bpf_get_current_comm 和 /proc/<pid>/comm 两种来源。
+// sanitizeComm 将进程名中不适合做 Prometheus label value 的字符替换为下划线。
+// 保留 Unicode 字母（中文、日文等）和数字，允许 - . _，其余替换为下划线。
+// 连续下划线折叠为一个，首尾下划线去除。
+// Prometheus label value 规范允许任意 UTF-8，但控制字符、空格等仍需清理。
 func sanitizeComm(s string) string {
-	return strings.Map(func(r rune) rune {
-		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') ||
-			(r >= '0' && r <= '9') || r == '-' || r == '.' || r == '_' {
+	result := strings.Map(func(r rune) rune {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) ||
+			r == '-' || r == '.' || r == '_' {
 			return r
 		}
 		return '_'
 	}, s)
+	for strings.Contains(result, "__") {
+		result = strings.ReplaceAll(result, "__", "_")
+	}
+	result = strings.Trim(result, "_")
+	return result
 }

@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -305,19 +306,35 @@ func resolveProcID(pid uint32) string {
 				return fmt.Sprintf("proc_%s", name)
 			}
 		}
+		// Name() sanitize 后为空（全非 ASCII，如中文 App）→ 尝试可执行文件名
+		if exe, err := p.Exe(); err == nil && exe != "" {
+			base := filepath.Base(exe)
+			base = sanitizeProcLabel(base)
+			if base != "" {
+				return fmt.Sprintf("proc_%s", base)
+			}
+		}
 	}
 	return fmt.Sprintf("proc_%d", pid) // 最终兜底: proc_80793
 }
 
-// sanitizeProcLabel 将进程名中的非法字符替换为下划线，使其适合作为 Prometheus 标签值。
+// sanitizeProcLabel 将进程名中不适合做 Prometheus label value 的字符替换为下划线。
+// 保留 Unicode 字母（中文、日文等）和数字，允许 - . _，其余替换为下划线。
+// 连续下划线折叠为一个，首尾下划线去除。
+// Prometheus label value 规范允许任意 UTF-8，但控制字符、空格等仍需清理。
 func sanitizeProcLabel(s string) string {
-	return strings.Map(func(r rune) rune {
-		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') ||
-			(r >= '0' && r <= '9') || r == '-' || r == '.' || r == '_' {
+	result := strings.Map(func(r rune) rune {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) ||
+			r == '-' || r == '.' || r == '_' {
 			return r
 		}
 		return '_'
 	}, s)
+	for strings.Contains(result, "__") {
+		result = strings.ReplaceAll(result, "__", "_")
+	}
+	result = strings.Trim(result, "_")
+	return result
 }
 
 // isIgnoredDestination 检查目标地址是否匹配黑名单（ignore_cidrs / ignore_ports）。
