@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -33,6 +34,10 @@ type Config struct {
 	DockerSocket  string
 	KubeConfig    string
 	MaxContainers int // P1-6: 容器数上限，0 = 不限制
+
+	// 黑名单过滤
+	IgnoreCIDRs []string // 忽略的 CIDR 列表（如 "127.0.0.0/8"），匹配目标地址的连接事件将被丢弃
+	IgnorePorts []int    // 忽略的端口列表（如 22），匹配目标端口的连接事件将被丢弃
 }
 
 const (
@@ -80,6 +85,10 @@ type Registry struct {
 	// ProcessExit 时清理。由 r.mu 保护。
 	commCache map[uint32]string
 
+	// 黑名单过滤（初始化后只读，无需加锁）
+	ignoredNets  []*net.IPNet        // 解析后的 CIDR 黑名单
+	ignoredPorts map[uint16]struct{} // 端口黑名单
+
 	// listenPorts 当前已知的监听端口集合。
 	// 由 ListenOpen/ListenClose 事件维护，用于判断重传事件的方向性：
 	// 如果重传事件的 SrcPort 匹配监听端口，说明是服务端重传（被动连接），
@@ -99,6 +108,41 @@ func NewRegistry(ctx context.Context, tr *tracer.Tracer, config Config) (*Regist
 		pidCache:         make(map[uint32]string),
 		commCache:        make(map[uint32]string),
 		listenPorts:      make(map[uint16]struct{}),
+	}
+
+	// 解析 CIDR 黑名单
+	for _, cidr := range config.IgnoreCIDRs {
+		_, ipNet, err := net.ParseCIDR(cidr)
+		if err != nil {
+			log.Printf("W! servicemap: invalid ignore_cidrs entry %q: %v", cidr, err)
+			continue
+		}
+		r.ignoredNets = append(r.ignoredNets, ipNet)
+	}
+	// 127.0.0.0/8 自动涵盖 IPv6 回环 ::1（用户只需配 IPv4 CIDR 即可）
+	for _, ipNet := range r.ignoredNets {
+		if ipNet.Contains(net.IPv4(127, 0, 0, 1)) {
+			r.ignoredNets = append(r.ignoredNets, &net.IPNet{
+				IP:   net.IPv6loopback,
+				Mask: net.CIDRMask(128, 128),
+			})
+			break
+		}
+	}
+
+	// 解析端口黑名单
+	if len(config.IgnorePorts) > 0 {
+		r.ignoredPorts = make(map[uint16]struct{}, len(config.IgnorePorts))
+		for _, p := range config.IgnorePorts {
+			if p > 0 && p <= 65535 {
+				r.ignoredPorts[uint16(p)] = struct{}{}
+			}
+		}
+	}
+
+	if len(r.ignoredNets) > 0 || len(r.ignoredPorts) > 0 {
+		log.Printf("I! servicemap: blacklist active: %d CIDRs, %d ports",
+			len(r.ignoredNets), len(r.ignoredPorts))
 	}
 
 	// P1-8: 监听 context 取消，自动触发关闭
@@ -276,6 +320,42 @@ func sanitizeProcLabel(s string) string {
 	}, s)
 }
 
+// isIgnoredDestination 检查目标地址是否匹配黑名单（ignore_cidrs / ignore_ports）。
+// addr 格式为 net.JoinHostPort 产生的 "ip:port" 或 "[ipv6]:port"。
+// 无黑名单配置时快速返回 false。
+func (r *Registry) isIgnoredDestination(addr string, dstPort uint16) bool {
+	// 快速路径：无黑名单
+	if len(r.ignoredNets) == 0 && len(r.ignoredPorts) == 0 {
+		return false
+	}
+
+	// 端口黑名单检查
+	if dstPort > 0 && len(r.ignoredPorts) > 0 {
+		if _, ignored := r.ignoredPorts[dstPort]; ignored {
+			return true
+		}
+	}
+
+	// CIDR 黑名单检查
+	if len(r.ignoredNets) > 0 && addr != "" {
+		host, _, err := net.SplitHostPort(addr)
+		if err != nil {
+			return false
+		}
+		ip := net.ParseIP(host)
+		if ip == nil {
+			return false
+		}
+		for _, ipNet := range r.ignoredNets {
+			if ipNet.Contains(ip) {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
 // enrichProcContainer 从合成 ID（proc_<comm> 或 proc_<pid>）中提取进程名，
 // 填充裸进程容器的元数据，跳过 Docker / K8s API 查询。
 //
@@ -331,6 +411,12 @@ func (r *Registry) processEvent(event *tracer.Event) {
 		if selfNs > 0 && event.NetnsInum != selfNs {
 			return
 		}
+	}
+
+	// 黑名单过滤：忽略目标地址匹配 ignore_cidrs 或目标端口匹配 ignore_ports 的事件。
+	// 在事件处理最早期丢弃，避免创建无意义的容器节点和统计数据。
+	if event.DstAddr != "" && r.isIgnoredDestination(event.DstAddr, event.DstPort) {
+		return
 	}
 
 	// 所有事件类型：如果携带了进程名（tracer 层尽早读取），更新 commCache。

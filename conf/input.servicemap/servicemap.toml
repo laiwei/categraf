@@ -51,6 +51,10 @@ enable_cgroup = true
 # Kubernetes kubeconfig 路径（留空使用 in-cluster 配置）
 # kubeconfig_path = ""
 
+# Docker label 白名单：只有在此列表中的 label key 才会被输出为 Prometheus 标签。
+# 留空则不透传任何 Docker label（推荐，避免高基数标签导致时序爆炸）。
+# label_allowlist = ["app", "version", "service"]
+
 # ─── 附加标签 ──────────────────────────────────
 [instances.labels]
   # env = "production"

@@ -67,6 +67,11 @@ func (ins *Instance) Init() error {
 		ins.MaxContainers = 5000
 	}
 
+	// 检查指标开关：若 TCP 和 HTTP 都未启用，插件不会产生任何业务指标
+	if !ins.EnableTCP && !ins.EnableHTTP {
+		log.Printf("W! servicemap: both enable_tcp and enable_http are false, no metrics will be produced")
+	}
+
 	hostNetNs := netns.NsHandle(-1)
 	selfNetNs := hostNetNs
 
@@ -104,11 +109,13 @@ func (ins *Instance) Init() error {
 	// 创建容器注册表
 	regConfig := containers.Config{
 		EnableDocker:  ins.EnableDocker,
-		EnableK8s:     ins.EnableK8s && ins.KubeConfigPath != "",
+		EnableK8s:     ins.EnableK8s,
 		EnableCgroup:  ins.EnableCgroup,
 		DockerSocket:  ins.DockerSocketPath,
 		KubeConfig:    ins.KubeConfigPath,
 		MaxContainers: ins.MaxContainers,
+		IgnoreCIDRs:   ins.IgnoreCIDRs,
+		IgnorePorts:   ins.IgnorePorts,
 	}
 
 	reg, err := containers.NewRegistry(ins.ctx, t, regConfig)
