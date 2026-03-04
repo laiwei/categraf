@@ -23,6 +23,7 @@ import (
 	"github.com/cilium/ebpf/perf"
 	"github.com/cilium/ebpf/rlimit"
 	gopsnet "github.com/shirou/gopsutil/v3/net"
+	gopsprocess "github.com/shirou/gopsutil/v3/process"
 	"github.com/vishvananda/netns"
 	"golang.org/x/sys/unix"
 )
@@ -1248,18 +1249,26 @@ func checkKernelVersion() error {
 	return nil
 }
 
-// readProcComm 读取 /proc/<pid>/comm 并返回 sanitized 的进程名。
-// 读取失败（进程已退出、非 Linux 等）时返回空字符串。
+// readProcComm 读取进程名并返回 sanitized 的结果。
+// 优先使用 /proc/<pid>/comm（Linux，~1µs），失败时 fallback 到
+// gopsutil process.Name()（macOS 用 sysctl，~30µs；Windows 用 CreateToolhelp32Snapshot）。
+// 两者都失败（进程已退出等）时返回空字符串。
 func readProcComm(pid uint32) string {
 	if pid == 0 {
 		return ""
 	}
-	b, err := os.ReadFile(fmt.Sprintf("/proc/%d/comm", pid))
-	if err != nil {
-		return ""
+	// Linux 快速路径
+	if b, err := os.ReadFile(fmt.Sprintf("/proc/%d/comm", pid)); err == nil {
+		comm := strings.TrimSpace(string(b))
+		return sanitizeComm(comm)
 	}
-	comm := strings.TrimSpace(string(b))
-	return sanitizeComm(comm)
+	// 非 Linux fallback：gopsutil 跨平台进程名查询
+	if p, err := gopsprocess.NewProcess(int32(pid)); err == nil {
+		if name, err := p.Name(); err == nil && name != "" {
+			return sanitizeComm(name)
+		}
+	}
+	return ""
 }
 
 // sanitizeComm 将进程名中的非法字符替换为下划线，使其适合作为 Prometheus 标签值。

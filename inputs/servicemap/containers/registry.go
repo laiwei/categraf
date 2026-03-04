@@ -20,6 +20,7 @@ import (
 	"flashcat.cloud/categraf/inputs/servicemap/tracer"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/client"
+	gopsprocess "github.com/shirou/gopsutil/v3/process"
 )
 
 var containerIDRegex = regexp.MustCompile(`[a-f0-9]{64}`)
@@ -231,14 +232,19 @@ func (r *Registry) resolveContainerID(pid uint32) string {
 
 // resolveProcID 为裸进程（非容器化）生成合成 container ID。
 // 格式：
-//   - "proc_<comm>"（/proc/<pid>/comm 可读时）← 稳定，按进程名聚合同类进程
-//   - "proc_<pid>"（否则，包括非 Linux 平台）← 兜底，保留 PID 以便调试
+//   - "proc_<comm>"（进程名可获取时）← 稳定，按进程名聚合同类进程
+//   - "proc_<pid>"（否则，如进程已退出）← 兜底，保留 PID 以便调试
+//
+// 进程名获取优先级：
+//  1. /proc/<pid>/comm（Linux，~1µs）
+//  2. gopsutil process.Name()（macOS sysctl ~30µs / Windows CreateToolhelp32Snapshot）
 //
 // 设计选择：以进程名而非 PID 作为主标识，原因：
 //  1. 时间序列稳定：进程重启 PID 变化，进程名不变，Grafana 曲线不断裂
 //  2. 基数可控：N 个同名进程实例共享 1 个时间序列，避免 cardinality 爆炸
 //  3. 服务拓扑语义：关心「nginx 与谁通信」而非「PID 80793 与谁通信」
 func resolveProcID(pid uint32) string {
+	// Linux 快速路径
 	commPath := filepath.Join("/proc", fmt.Sprintf("%d", pid), "comm")
 	if b, err := os.ReadFile(commPath); err == nil {
 		comm := strings.TrimSpace(string(b))
@@ -247,7 +253,16 @@ func resolveProcID(pid uint32) string {
 			return fmt.Sprintf("proc_%s", comm) // proc_nginx, proc_python3, ...
 		}
 	}
-	return fmt.Sprintf("proc_%d", pid) // fallback: proc_80793
+	// 非 Linux fallback：gopsutil 跨平台进程名查询
+	if p, err := gopsprocess.NewProcess(int32(pid)); err == nil {
+		if name, err := p.Name(); err == nil {
+			name = sanitizeProcLabel(name)
+			if name != "" {
+				return fmt.Sprintf("proc_%s", name)
+			}
+		}
+	}
+	return fmt.Sprintf("proc_%d", pid) // 最终兜底: proc_80793
 }
 
 // sanitizeProcLabel 将进程名中的非法字符替换为下划线，使其适合作为 Prometheus 标签值。
