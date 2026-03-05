@@ -200,6 +200,17 @@ ignore_cidrs = ["127.0.0.0/8"]
 # 留空则不透传任何 Docker label（推荐，防止高基数标签导致时序爆炸）
 # label_allowlist = ["app", "version", "team"]
 
+# Graph API 服务地址（可选）
+# 启用后在该地址上同时暴露：
+#   /graph         — JSON 服务拓扑图（供 topology-aggregator 和可视化使用）
+#   /graph/text    — 纯文本摘要
+#   /graph/view    — 内嵌浏览器可视化页面
+#   /graph/debug   — 调试信息（原始容器/连接状态）
+#   /metrics       — Prometheus text format（可被 Prometheus 直接 scrape）
+#   /health        — 健康探针（始终返回 200 "ok"）
+# 留空则不启动 Graph API 服务器
+api_addr = ":9099"
+
 # 附加标签（框架自动注入到所有指标）
 [instances.labels]
   # env = "production"
@@ -314,7 +325,7 @@ rate(servicemap_http_request_duration_seconds_sum[5m])
 
 ---
 
-### 服务拓扑边指标（edge）
+### 拓扑边指标（edge）
 
 > 需启用 `enable_tcp = true`。每条边代表一个源节点到一个目标端点的聚合调用关系。
 
@@ -342,6 +353,8 @@ rate(servicemap_http_request_duration_seconds_sum[5m])
 
 **边的聚合粒度**：边的唯一键为 `source_id + "->" + destination`。同名进程的多个实例（如 4 个 nginx worker）共享同一条边。
 
+**边的 GC 机制**：边在内存中以 `TCPStats[dest]` 条目存储。满足以下条件时，该边在 GC 周期（每 60s）中被清理：`ActiveConnections == 0` **且** `LastActivity` 超过 15 分钟且非零值。持续保持 ESTABLISHED 状态的连接（如数据库连接池）由 `RefreshLiveConnections`（每 1 分钟）刷新 `LastActivity`，不会被误删。
+
 **PromQL 示例**：
 ```promql
 # 服务拓扑图：查看所有服务间的活跃连接
@@ -349,6 +362,37 @@ servicemap_edge_active_connections > 0
 
 # 某服务对 MySQL 的调用连接失败率
 rate(servicemap_edge_connect_failed_total{source_name="api-server", destination_port="3306"}[5m])
+```
+
+---
+
+### 监听端点指标（listen_endpoint）
+
+> 用于跨主机 P2P 拓扑 JOIN 的核心指标。记录每个进程/容器当前监听的端口，值恒为 `1`（presence metric，消失即代表端口已关闭）。
+
+**标签**：
+
+| 标签 | 示例值 | 说明 |
+|---|---|---|
+| `source_id` | `proc_nginx` | 源节点唯一标识 |
+| `source_name` | `nginx` | 源节点可读名称 |
+| `source_type` | `bare_process` / `container` | 节点类型 |
+| `port` | `80` | 监听端口号 |
+| `listen_ip` | `10.0.1.5` | 监听 IP。`0.0.0.0` / `::` 会展开为主机所有非回环 IP，以便跨主机 JOIN |
+
+| 指标名 | 类型 | 说明 |
+|---|---|---|
+| `servicemap_listen_endpoint` | Gauge（值=1） | 进程/容器当前监听的端口（P2P 拓扑 JOIN 用） |
+
+**用途**：`topology-aggregator` 查询此指标并与 `servicemap_edge_*` 做 JOIN，推断出跨主机的 P2P 拓扑（clientA → serverB）。
+
+**PromQL 示例**：
+```promql
+# 查看所有正在监听 3306 的进程（MySQL 服务）
+servicemap_listen_endpoint{port="3306"}
+
+# 与边指标 JOIN（手动）
+# 调用方（edge dest IP:port）→ 被调用方（listen_ip:port）
 ```
 
 ---
@@ -408,6 +452,65 @@ servicemap_graph_nodes < 5
 | `servicemap_tracer_listen_ports` | Gauge | 当前监听端口数量 |
 | `servicemap_tracked_containers` | Gauge | 当前注册表中追踪的容器/进程总数 |
 
+---
+
+## Graph API
+
+配置 `api_addr = ":9099"` 后，插件在该地址启动内嵌 HTTP 服务，提供以下端点：
+
+| 端点 | 方法 | 说明 |
+|---|---|---|
+| `/graph` | GET | JSON 格式完整服务拓扑图（含 TCP/HTTP/L7 统计） |
+| `/graph/text` | GET | 纯文本摘要（适合终端快速查看） |
+| `/graph/view` | GET | 内嵌浏览器可视化页面（无需 Grafana） |
+| `/graph/debug` | GET | 调试信息：原始容器列表、连接状态、监听端口 |
+| `/metrics` | GET | **Prometheus text format**（可被 Prometheus 直接 scrape） |
+| `/health` | GET | 健康探针，始终返回 `200 ok` |
+
+### `/graph` 查询参数
+
+| 参数 | 示例 | 说明 |
+|---|---|---|
+| `filter=<keyword>` | `filter=nginx,mysql` | 按节点 ID/Name 模糊过滤，逗号分隔多个关键词 |
+| `edges_only=true` | `edges_only=true` | 仅返回有出站 TCP 边的节点（隐藏纯监听进程） |
+
+### `/metrics` 说明
+
+`/metrics` 端点返回的是上次 `Gather()` 产生的缓存数据（Prometheus text format 0.0.4），可配置为 Prometheus scrape 目标：
+
+```yaml
+# prometheus.yml
+scrape_configs:
+  - job_name: servicemap
+    static_configs:
+      - targets: ['localhost:9099']
+    metrics_path: /metrics
+```
+
+---
+
+## GC 机制参数
+
+插件内置多层 GC，参数已按实际使用场景调优：
+
+| 参数 | 当前值 | 说明 |
+|---|---|---|
+| `connectionRefreshInterval` | 1 min | 扫描系统 TCP 连接表，刷新 ESTABLISHED 连接时间戳，防止长期空闲连接被误 GC |
+| `containerGCInterval` | 60 s | 每分钟执行一次 GC 扫描 |
+| `containerTimeout` | 5 min | 进程/容器无活动超过此时长后整体回收 |
+| `edgeTimeout` | 15 min（= 3 × containerTimeout） | 单条连接路径无活动超过此时长后清理（容器仍活着但停止访问某 dest 的场景） |
+
+**不等式约束**（保障正确性）：
+
+```
+connectionRefreshInterval × 3 ≤ containerTimeout ≤ edgeTimeout / 3
+          1min × 3 = 3min      ≤      5min        ≤   15min / 3 = 5min  ✓
+```
+
+---
+
+## 故障排查
+
 ### 1. eBPF 程序加载失败
 
 ```bash
@@ -436,29 +539,51 @@ crictl ps
 
 如果遇到性能问题，可以：
 
-- 增大采集间隔 (`interval`)
-- 禁用 L7 跟踪 (`enable_l7_tracing = false`)
-- 添加更多过滤规则
+- 增大采集间隔（`interval`）
+- 禁用 L7 跟踪（`disable_l7_tracing = true`）
+- 添加更多过滤规则（`ignore_ports`、`ignore_cidrs`）
+
+### 4. `servicemap_listen_endpoint` 指标不出现
+
+- 确认 categraf 以 root 或具有 `CAP_SYS_ADMIN` 权限运行
+- 在 macOS/轮询模式下，首次出现需等待约 2–10 秒（等待轮询扫描到 LISTEN 端口）
+- 检查 Graph API 输出：`curl http://localhost:9099/metrics | grep listen_endpoint`
+
+### 5. Graph API 无法访问
+
+- 确认配置了 `api_addr = ":9099"`
+- 检查端口是否被占用：`lsof -i :9099`
+- 查看 categraf 日志中是否有 `graph API listening on` 日志
+
+---
 
 ## 开发状态
 
 **当前状态**: ✅ 可用
 
 - [x] 基础框架与插件接口
-- [x] eBPF TCP/HTTP 追踪
+- [x] eBPF TCP/HTTP 追踪（Linux）
 - [x] L7 协议解析（MySQL / PostgreSQL / Redis / Kafka）
 - [x] Docker 容器发现
 - [x] Kubernetes Pod 发现（含 K8s 元数据注入）
 - [x] 裸进程追踪（`proc_<进程名>` 聚合）
-- [x] 服务拓扑图构建与 Graph API
-- [x] 全量单元测试（race 模式）
+- [x] 服务拓扑图构建与 Graph API（`:9099`）
+- [x] `/metrics` 端点（Prometheus text format，可直接 scrape）
+- [x] `servicemap_listen_endpoint` 指标（P2P 跨主机 JOIN）
+- [x] Graph Edge GC（死亡连接路径超时清理）
+- [x] 全量单元测试（race 模式通过）
+
+## 相关组件
+
+- [topology-aggregator](./topology-aggregator/README.md) — 从 Prometheus 中 JOIN 出跨主机 P2P 拓扑图
+- [prometheus/rules](./prometheus/rules/) — Prometheus Recording Rules
+- [grafana/](./grafana/) — Grafana Dashboard JSON
 
 ## 参考资料
 
 - [Coroot Node Agent](https://github.com/coroot/coroot-node-agent)
 - [eBPF Documentation](https://ebpf.io/)
 - [Cilium eBPF Library](https://github.com/cilium/ebpf)
-- [Graph API 使用说明](./graph_api.go)
 
 ## 许可证
 

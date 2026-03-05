@@ -312,6 +312,7 @@ func (ins *Instance) startAPIServer() {
 	mux.HandleFunc("/graph/text", ins.handleGraphText)
 	mux.HandleFunc("/graph/view", ins.handleGraphView)
 	mux.HandleFunc("/graph/debug", ins.handleGraphDebug)
+	mux.HandleFunc("/metrics", ins.handleMetrics) // Prometheus text format
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = fmt.Fprintln(w, "ok")

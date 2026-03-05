@@ -21,6 +21,9 @@ type TCPStats struct {
 	MinTime            uint64
 	BytesSent          uint64
 	BytesReceived      uint64
+	// LastActivity 最后一次有连接事件或流量变化的时间，用于 graph edge GC。
+	// 零值表示代码升级前创建的历史遗留条目，GCStaleTCPEdges 会跳过，等待容器 GC 自然回收。
+	LastActivity time.Time
 }
 
 // HTTPStats HTTP统计
@@ -63,6 +66,12 @@ type Container struct {
 	HTTPStats map[string]*HTTPStats
 	L7Stats   map[string]*L7Stats // 非 HTTP 协议的 L7 统计
 
+	// ListenEndpoints: 监听端口 → 监听 IP（由 registry 在 ListenOpen/ListenClose 时维护）
+	// "0.0.0.0" 或 "::" 表示监听所有接口；具体 IP 表示绑定到特定接口。
+	// 供 Gather 生成 servicemap_listen_endpoint 指标，用于跨主机 P2P 拓扑 JOIN。
+	// 由 mu 保护。
+	ListenEndpoints map[uint16]string
+
 	// 活跃连接追踪 — 由 mu 保护
 	mu                sync.RWMutex
 	activeConnections map[uint64]*ConnectionTracker
@@ -89,6 +98,7 @@ func NewContainer(id string) *Container {
 		TCPStats:          make(map[string]*TCPStats),
 		HTTPStats:         make(map[string]*HTTPStats),
 		L7Stats:           make(map[string]*L7Stats),
+		ListenEndpoints:   make(map[uint16]string),
 		activeConnections: make(map[uint64]*ConnectionTracker),
 		connectionsByDest: make(map[string][]uint64),
 		LastActivity:      time.Now(),
@@ -140,10 +150,12 @@ func (c *Container) onConnectionOpen(event *tracer.Event) {
 	if c.TCPStats[dest] == nil {
 		c.TCPStats[dest] = &TCPStats{
 			DestinationAddr: dest,
+			LastActivity:    now,
 		}
 	}
 	c.TCPStats[dest].SuccessfulConnects++
 	c.TCPStats[dest].ActiveConnections++
+	c.TCPStats[dest].LastActivity = now
 }
 
 // onConnectionClose 连接关闭
@@ -176,6 +188,7 @@ func (c *Container) onConnectionClose(event *tracer.Event) {
 	stats.BytesSent += conn.BytesSent
 	stats.BytesReceived += conn.BytesReceived
 	stats.ActiveConnections--
+	stats.LastActivity = time.Now()
 
 	// 清理活跃连接记录
 	delete(c.activeConnections, event.Fd)
@@ -201,12 +214,15 @@ func (c *Container) onRetransmit(event *tracer.Event) {
 		return
 	}
 
+	now := time.Now()
 	if c.TCPStats[dest] == nil {
 		c.TCPStats[dest] = &TCPStats{
 			DestinationAddr: dest,
+			LastActivity:    now,
 		}
 	}
 	c.TCPStats[dest].Retransmissions++
+	c.TCPStats[dest].LastActivity = now
 }
 
 // UpdateTrafficStats 更新流量统计
@@ -231,9 +247,10 @@ func (c *Container) UpdateTrafficStats(fd uint64, sent, received uint64) {
 	}
 
 	// 更新连接记录
+	now := time.Now()
 	conn.BytesSent = sent
 	conn.BytesReceived = received
-	conn.LastSeen = time.Now()
+	conn.LastSeen = now
 
 	// 更新对应 destination 的统计
 	if conn.Destination == "" {
@@ -242,12 +259,13 @@ func (c *Container) UpdateTrafficStats(fd uint64, sent, received uint64) {
 
 	stats := c.TCPStats[conn.Destination]
 	if stats == nil {
-		stats = &TCPStats{DestinationAddr: conn.Destination}
+		stats = &TCPStats{DestinationAddr: conn.Destination, LastActivity: now}
 		c.TCPStats[conn.Destination] = stats
 	}
 
 	stats.BytesSent += sentDelta
 	stats.BytesReceived += receivedDelta
+	stats.LastActivity = now
 }
 
 // ============================================================
@@ -447,6 +465,31 @@ func (c *Container) GetL7StatsSnapshot() map[string]*L7Stats {
 	return snapshot
 }
 
+// AddListenEndpoint 记录该容器在 port 上的监听（listenIP 可为 "0.0.0.0"/"::" 或具体 IP）
+func (c *Container) AddListenEndpoint(port uint16, listenIP string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.ListenEndpoints[port] = listenIP
+}
+
+// RemoveListenEndpoint 删除该容器在 port 上的监听记录
+func (c *Container) RemoveListenEndpoint(port uint16) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.ListenEndpoints, port)
+}
+
+// GetListenEndpointsSnapshot 返回 ListenEndpoints 的深拷贝（线程安全）
+func (c *Container) GetListenEndpointsSnapshot() map[uint16]string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	snapshot := make(map[uint16]string, len(c.ListenEndpoints))
+	for port, ip := range c.ListenEndpoints {
+		snapshot[port] = ip
+	}
+	return snapshot
+}
+
 // ActiveConnectionCount 返回当前活跃连接数（线程安全）
 func (c *Container) ActiveConnectionCount() int {
 	c.mu.RLock()
@@ -457,6 +500,11 @@ func (c *Container) ActiveConnectionCount() int {
 // RefreshLiveConnections 批量刷新仍在系统中存活的连接的 LastSeen 时间戳。
 // liveDests 是通过 netlink/gopsutil 获取的当前 ESTABLISHED 连接目标地址集合。
 // 返回刷新的连接数。
+//
+// 同时刷新对应 TCPStats.LastActivity：
+//
+//	长期空闲但仍存活的 TCP 连接（如数据库连接池、nc 持久连接）不会产生任何
+//	eBPF 事件，若不刷新 TCPStats.LastActivity，这些正常使用的边会被 edge GC 误删。
 func (c *Container) RefreshLiveConnections(liveDests map[string]struct{}, now time.Time) int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -465,10 +513,52 @@ func (c *Container) RefreshLiveConnections(liveDests map[string]struct{}, now ti
 	for _, conn := range c.activeConnections {
 		if _, live := liveDests[conn.Destination]; live {
 			conn.LastSeen = now
+			// 同步刷新 TCPStats.LastActivity，防止长期空闲但存活的连接的边被 edge GC 误删
+			if stats, ok := c.TCPStats[conn.Destination]; ok && stats != nil {
+				stats.LastActivity = now
+			}
 			refreshed++
 		}
 	}
 	return refreshed
+}
+
+// GCStaleTCPEdges 清理长时间无活跃连接且不活跃的 TCP 边（graph edge）。
+//
+// 清理条件（同时满足）：
+//  1. stats.ActiveConnections == 0 — 无连接在途，清理安全
+//  2. stats.LastActivity 非零且超过 maxAge — 确实属于死亡边
+//
+// LastActivity 为零值说明是代码升级前的历史遗留条目（未写过该字段），
+// 为防止升级后首次 GC 大量误删，保留这些条目等待容器 GC 自然回收。
+// 返回清理的条目数。
+func (c *Container) GCStaleTCPEdges(maxAge time.Duration) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	now := time.Now()
+	cleaned := 0
+	for dest, stats := range c.TCPStats {
+		if stats == nil {
+			delete(c.TCPStats, dest)
+			cleaned++
+			continue
+		}
+		// 有活跃连接的边必须保留
+		if stats.ActiveConnections > 0 {
+			continue
+		}
+		// 零值：历史遗留条目，跳过（不主动清理）
+		if stats.LastActivity.IsZero() {
+			continue
+		}
+		if now.Sub(stats.LastActivity) < maxAge {
+			continue
+		}
+		delete(c.TCPStats, dest)
+		cleaned++
+	}
+	return cleaned
 }
 
 // GCStaleConnections 清理长时间没有任何流量更新的「僵尸」连接。

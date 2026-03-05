@@ -4,10 +4,14 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"runtime"
+	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"flashcat.cloud/categraf/config"
 	"flashcat.cloud/categraf/inputs/servicemap/containers"
@@ -50,11 +54,23 @@ type Instance struct {
 	tracer    *tracer.Tracer
 	registry  *containers.Registry
 	apiServer *http.Server
+	// hostIPs 是本机所有非回环、非链路本地的 IP。
+	// 用于将监听地址为 0.0.0.0/:: 的端点展开为可供跨主机 JOIN 的具体 IP。
+	hostIPs []string
+
+	// /metrics 端点缓存：每次 Gather() 结束时更新
+	metricsMu    sync.RWMutex
+	promCache    []byte
+	promCacheAge time.Time
 }
 
 // Init 初始化实例
 func (ins *Instance) Init() error {
 	log.Printf("I! servicemap: initializing instance")
+
+	// 收集主机非回环 IP，供监听端点 0.0.0.0 展开使用
+	ins.hostIPs = gatherHostIPs()
+	log.Printf("I! servicemap: host IPs detected: %v", ins.hostIPs)
 
 	// P1-8: 创建 context 用于优雅退出
 	ins.ctx, ins.cancel = context.WithCancel(context.Background())
@@ -192,6 +208,8 @@ func (ins *Instance) Gather(slist *types.SampleList) {
 		// TCP连接统计
 		if ins.EnableTCP {
 			ins.collectTCPStats(container, tags, slist)
+			// 监听端点指标（用于跨主机 P2P 拓扑 JOIN）
+			ins.collectListenEndpoints(container, tags, slist)
 		}
 
 		// HTTP请求统计
@@ -211,6 +229,9 @@ func (ins *Instance) Gather(slist *types.SampleList) {
 
 	// P1-7: 内部状态指标
 	ins.collectInternalStats(slist)
+
+	// 更新 /metrics 端点缓存（非破坏性只读遍历 slist）
+	ins.cacheMetrics(slist)
 }
 
 // Drop 清理资源 (P1-8: 先取消 context，再等待清理完成)
@@ -462,6 +483,64 @@ func mergeTags(base, additional map[string]string) map[string]string {
 	}
 
 	return result
+}
+
+// gatherHostIPs 返回本机所有非回环、非链路本地的 IP 地址。
+// 用于将 0.0.0.0/:: 监听端点展开为可供跨主机 Prometheus JOIN 的具体 IP。
+func gatherHostIPs() []string {
+	var ips []string
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return ips
+	}
+	for _, iface := range ifaces {
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, addr := range addrs {
+			var ip net.IP
+			switch v := addr.(type) {
+			case *net.IPNet:
+				ip = v.IP
+			case *net.IPAddr:
+				ip = v.IP
+			}
+			if ip == nil || ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
+				continue
+			}
+			ips = append(ips, ip.String())
+		}
+	}
+	return ips
+}
+
+// collectListenEndpoints 采集进程/容器的监听端点指标。
+// 监听地址为 0.0.0.0/:: 时，展开为主机所有非回环 IP，使 Prometheus 跨主机 JOIN 时能命中。
+// 上报指标 servicemap_listen_endpoint{listen_ip, port, source_id, source_name, ...} = 1
+func (ins *Instance) collectListenEndpoints(container *containers.Container, baseTags map[string]string, slist *types.SampleList) {
+	endpoints := container.GetListenEndpointsSnapshot()
+	if len(endpoints) == 0 {
+		return
+	}
+	for port, listenIP := range endpoints {
+		portStr := strconv.Itoa(int(port))
+		var listenIPs []string
+		if listenIP == "" || listenIP == "0.0.0.0" || listenIP == "::" {
+			// 监听所有接口：展开为主机实际 IP（便于 JOIN）
+			listenIPs = ins.hostIPs
+		} else {
+			listenIPs = []string{listenIP}
+		}
+		for _, ip := range listenIPs {
+			tags := mergeTags(baseTags, map[string]string{
+				"listen_ip": ip,
+				"port":      portStr,
+			})
+			// Gauge = 1（presence metric，存在即为 1，消失代表端口已关闭）
+			slist.PushFront(types.NewSample(inputName, "listen_endpoint", 1.0, tags))
+		}
+	}
 }
 
 // collectInternalStats 输出插件内部状态指标 (P1-7: 自监控)

@@ -936,6 +936,9 @@ func (t *Tracer) pollConnections() int {
 	}
 
 	discoveredListens := make(map[ListenKey]struct{})
+	// listenEvents 携带 LISTEN 连接的 PID+Comm 信息，用于向 registry 发出 ListenOpen 事件。
+	// key 与 discoveredListens 保持一致，gopsutil 路径下包含 PID，netlink 路径下 PID=0。
+	listenEvents := make(map[ListenKey]Event)
 
 	// ─── 数据采集层：netlink 优先，gopsutil 兜底 ───────────
 	var diagConns []DiagConnection
@@ -946,10 +949,10 @@ func (t *Tracer) pollConnections() int {
 		netlinkErr = fmt.Errorf("netlink disabled for testing")
 	}
 	if netlinkErr == nil {
-		t.collectFromNetlink(diagConns, current, discoveredListens, nowNano)
+		t.collectFromNetlink(diagConns, current, discoveredListens, listenEvents, nowNano)
 	} else {
 		log.Printf("D! servicemap: netlink unavailable (%v), fallback to gopsutil", netlinkErr)
-		if err := t.collectFromGopsutil(current, discoveredListens, nowNano); err != nil {
+		if err := t.collectFromGopsutil(current, discoveredListens, listenEvents, nowNano); err != nil {
 			log.Printf("W! servicemap: polling tcp connections failed: %v", err)
 			return 0
 		}
@@ -959,10 +962,38 @@ func (t *Tracer) pollConnections() int {
 
 	// ─── 差量比较层（与采集方式无关）─────────────────────────
 
-	// P0-4: 更新监听端口列表
+	// P0-4: 更新监听端口列表；同时对比前后差量，向 registry 发出 ListenOpen/ListenClose 事件。
+	// 轮询模式（macOS/fallback）依赖此机制填充 container.ListenEndpoints，eBPF 模式由
+	// seedExistingConnections() + kprobe 负责，此处 emit 不影响 eBPF 路径的正确性。
 	t.listenMu.Lock()
+	prevListenPorts := t.listenPorts
 	t.listenPorts = discoveredListens
 	t.listenMu.Unlock()
+
+	// 新出现的监听端口 → ListenOpen（PID=0 的事件会被 registry.processEvent 跳过）
+	for key, ev := range listenEvents {
+		if _, existed := prevListenPorts[key]; !existed {
+			ev.Timestamp = nowNano
+			select {
+			case t.eventChan <- ev:
+			default:
+			}
+		}
+	}
+	// 消失的监听端口 → ListenClose
+	for key := range prevListenPorts {
+		if _, exists := discoveredListens[key]; !exists {
+			select {
+			case t.eventChan <- Event{
+				Type:      EventTypeListenClose,
+				Timestamp: nowNano,
+				SrcPort:   key.Port,
+				SrcAddr:   key.Addr,
+			}:
+			default:
+			}
+		}
+	}
 
 	t.activeConnMu.Lock()
 	defer t.activeConnMu.Unlock()
@@ -1028,6 +1059,7 @@ func (t *Tracer) collectFromNetlink(
 	diagConns []DiagConnection,
 	current map[ConnectionID]Event,
 	discoveredListens map[ListenKey]struct{},
+	listenEvents map[ListenKey]Event,
 	nowNano uint64,
 ) {
 	for i := range diagConns {
@@ -1039,6 +1071,14 @@ func (t *Tracer) collectFromNetlink(
 				Addr: endpoint(dc.SrcIP, uint32(dc.SrcPort)),
 			}
 			discoveredListens[key] = struct{}{}
+			// netlink 不返回 PID；PID=0 事件会被 registry 跳过（processEvent 有 PID=0 守卫）。
+			// 在 Linux 上此路径正常工作（eBPF 负责 Listen 感知）；macOS 走 gopsutil 路径有 PID。
+			listenEvents[key] = Event{
+				Type:    EventTypeListenOpen,
+				Pid:     0,
+				SrcPort: key.Port,
+				SrcAddr: key.Addr,
+			}
 			continue
 		}
 
@@ -1082,6 +1122,7 @@ func (t *Tracer) collectFromNetlink(
 func (t *Tracer) collectFromGopsutil(
 	current map[ConnectionID]Event,
 	discoveredListens map[ListenKey]struct{},
+	listenEvents map[ListenKey]Event,
 	nowNano uint64,
 ) error {
 	conns, err := gopsnet.Connections("tcp")
@@ -1115,6 +1156,16 @@ func (t *Tracer) collectFromGopsutil(
 				Addr: endpoint(c.Laddr.IP, c.Laddr.Port),
 			}
 			discoveredListens[key] = struct{}{}
+			// 携带 PID+Comm，供 pollConnections 在端口首次出现时向 registry 发出 ListenOpen 事件。
+			// 这是轮询模式（macOS/fallback）下 servicemap_listen_endpoint 指标的数据来源。
+			pid := uint32(c.Pid)
+			listenEvents[key] = Event{
+				Type:    EventTypeListenOpen,
+				Pid:     pid,
+				SrcPort: key.Port,
+				SrcAddr: key.Addr,
+				Comm:    readProcComm(pid),
+			}
 			continue
 		}
 

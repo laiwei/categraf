@@ -44,13 +44,32 @@ type Config struct {
 const (
 	// P0-5: 容器 GC 参数
 	containerGCInterval = 60 * time.Second
-	containerTimeout    = 10 * time.Minute
+	containerTimeout    = 5 * time.Minute
+
+	// graph edge（TCPStats 条目）GC 超时 = 3 × containerTimeout = 15 分钟。
+	//
+	// 设计推导（三个参数联动）：
+	//
+	//   connectionRefreshInterval（1 min）：
+	//     每分钟扫描系统 TCP 连接表，刷新 ESTABLISHED 连接的时间戳，
+	//     代价低（netlink ~5ms，gopsutil ~100ms），ESTABLISHED 边永远不超时。
+	//
+	//   containerTimeout（5 min）：
+	//     覆盖最长 ~2 min 的健康探测间歇（3× 安全余量）。
+	//     refreshLiveConnections 每 1 min 刷新，5 min 内至少 5 次保护机会。
+	//     约束：connectionRefreshInterval × 3 = 3 min < containerTimeout = 5 min ✓
+	//
+	//   edgeTimeout（15 min = 3 × containerTimeout）：
+	//     下界（防误删间歇连接）：健康探测最长 ~5 min × 3 = 15 min 安全余量 ✓
+	//     上界（容器先于边 GC）：真正死亡容器 5 min 后整体被 GC，
+	//       边随之消失，edge GC 不介入；仅对长期存活但停止访问某 dest 的进程生效。
+	edgeTimeout = 3 * containerTimeout // 15 min
 
 	// 周期性活跃连接刷新间隔
 	// 长期空闲但仍然存活的 TCP 连接（如 sshd、持久数据库连接）不会产生任何 eBPF 事件，
 	// 导致 container.LastActivity 和 conn.LastSeen 过期，最终被 GC 误杀。
-	// 每 3 分钟扫描一次系统 TCP 连接表，对仍然存活的连接刷新时间戳。
-	connectionRefreshInterval = 3 * time.Minute
+	// 每 1 分钟扫描一次系统 TCP 连接表，对仍然存活的连接刷新时间戳。
+	connectionRefreshInterval = 1 * time.Minute
 )
 
 type k8sContainerMeta struct {
@@ -485,6 +504,20 @@ func (r *Registry) processEvent(event *tracer.Event) {
 		return
 	}
 
+	// ListenOpen/ListenClose：将监听端点嵌入到容器级别（用于跨主机 P2P 拓扑 JOIN）
+	if event.SrcPort > 0 {
+		if event.Type == tracer.EventTypeListenOpen {
+			listenIP := parseListenIP(event.SrcAddr)
+			container.AddListenEndpoint(event.SrcPort, listenIP)
+			container.LastActivity = time.Now()
+			return
+		}
+		if event.Type == tracer.EventTypeListenClose {
+			container.RemoveListenEndpoint(event.SrcPort)
+			return
+		}
+	}
+
 	// 诊断日志：记录连接事件及其容器归属（含 proc_ 和 Docker 容器）。
 	// 使用 D! 级别避免正常运行时日志洪泛。
 	if event.Type == tracer.EventTypeConnectionOpen || event.Type == tracer.EventTypeConnectionAccepted {
@@ -508,6 +541,28 @@ func (r *Registry) processEvent(event *tracer.Event) {
 		}
 	}
 	container.OnEvent(event)
+}
+
+// parseListenIP 从 "host:port" 格式的地址字符串中提取 IP 部分。
+// 监听地址为 0.0.0.0 或 :: （所有接口）时统一返回 "0.0.0.0"，
+// 具体 IP 则原样返回。
+func parseListenIP(addr string) string {
+	if addr == "" {
+		return "0.0.0.0"
+	}
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		// 不是 host:port 格式，尝试直接解析为 IP
+		if ip := net.ParseIP(addr); ip != nil {
+			return ip.String()
+		}
+		return "0.0.0.0"
+	}
+	if host == "" || host == "::" {
+		// IPv6 任意地址，统一标记为 "0.0.0.0"（表示所有接口）
+		return "0.0.0.0"
+	}
+	return host
 }
 
 // updateConnectionStats 更新连接统计（含裸进程的字节流量）
@@ -881,14 +936,20 @@ func (r *Registry) gcContainers() {
 
 	now := time.Now()
 
-	// 第一步：清理各容器内的「僵尸」连接
-	// （ConnectionClose 事件丢失或 FD 不匹配导致 activeConnections 永远不为 0）
+	// 第一步：清理各容器内的「僵尸」连接和不活跃 TCP 边（graph edge）
+	//   - GCStaleConnections：ConnectionClose 事件丢失或 FD 不匹配导致 activeConnections 永不归零
+	//   - GCStaleTCPEdges：进程历史上曾连接但已断开超过 edgeTimeout 的死亡边
 	staleConns := 0
+	staleTCPEdges := 0
 	for _, c := range r.containers {
 		staleConns += c.GCStaleConnections(containerTimeout)
+		staleTCPEdges += c.GCStaleTCPEdges(edgeTimeout)
 	}
 	if staleConns > 0 {
 		log.Printf("D! servicemap: GC cleaned %d stale connections across containers", staleConns)
+	}
+	if staleTCPEdges > 0 {
+		log.Printf("D! servicemap: GC cleaned %d stale TCP edges across containers", staleTCPEdges)
 	}
 
 	// 第二步：清理无活跃连接且长时间不活跃的容器
