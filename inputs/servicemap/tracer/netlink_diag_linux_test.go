@@ -128,8 +128,9 @@ func TestCollectFromNetlink_Integration(t *testing.T) {
 
 	current := make(map[ConnectionID]Event)
 	listens := make(map[ListenKey]struct{})
+	listenEvents := make(map[ListenKey]Event)
 
-	tr.collectFromNetlink(diagConns, current, listens, uint64(0))
+	tr.collectFromNetlink(diagConns, current, listens, listenEvents, uint64(0))
 
 	t.Logf("collectFromNetlink: %d tracked, %d listen ports", len(current), len(listens))
 
