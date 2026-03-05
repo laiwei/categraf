@@ -11,8 +11,9 @@ BPFTOOL ?= bpftool
 
 # 检测架构
 UNAME_M := $(shell uname -m)
+# 直接设置架构为 x86（bpf_tracing.h 使用 __TARGET_ARCH_x86 而不是 __TARGET_ARCH_x86_64）
 ifeq ($(UNAME_M),x86_64)
-	ARCH := x86_64
+	ARCH := x86
 	GO_ARCH := amd64
 endif
 ifeq ($(UNAME_M),aarch64)
