@@ -37,18 +37,18 @@ func (w *RemoteWriter) WriteP2PEdges(ctx context.Context, edges []P2PEdge) error
 	now := time.Now().UnixMilli()
 	var tsList []prompb.TimeSeries
 
-	// 聚合：同一 source_name → dest_source_name 的边求和
+	// 聚合：同一 client_name → server_name 的边求和
 	type key struct {
-		SourceName, SourceType, DestName, DestType, DestNamespace string
+		ClientName, ClientType, ServerName, ServerType, ServerNamespace string
 	}
 	agg := make(map[key]float64)
 	for _, e := range edges {
 		k := key{
-			SourceName:    e.SourceName,
-			SourceType:    e.SourceType,
-			DestName:      e.DestName,
-			DestType:      e.DestType,
-			DestNamespace: e.DestNamespace,
+			ClientName:      e.ClientName,
+			ClientType:      e.ClientType,
+			ServerName:      e.ServerName,
+			ServerType:      e.ServerType,
+			ServerNamespace: e.ServerNamespace,
 		}
 		agg[k] += e.ActiveConnections
 	}
@@ -60,11 +60,11 @@ func (w *RemoteWriter) WriteP2PEdges(ctx context.Context, edges []P2PEdge) error
 		ts := prompb.TimeSeries{
 			Labels: []prompb.Label{
 				{Name: "__name__", Value: "servicemap_p2p_topology_active"},
-				{Name: "source_name", Value: k.SourceName},
-				{Name: "source_type", Value: k.SourceType},
-				{Name: "dest_source_name", Value: k.DestName},
-				{Name: "dest_source_type", Value: k.DestType},
-				{Name: "dest_namespace", Value: k.DestNamespace},
+				{Name: "client_name", Value: k.ClientName},
+				{Name: "client_type", Value: k.ClientType},
+				{Name: "server_name", Value: k.ServerName},
+				{Name: "server_type", Value: k.ServerType},
+				{Name: "server_namespace", Value: k.ServerNamespace},
 				{Name: "generated_by", Value: "topology-aggregator"},
 			},
 			Samples: []prompb.Sample{

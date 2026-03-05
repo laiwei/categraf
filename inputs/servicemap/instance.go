@@ -169,18 +169,18 @@ func (ins *Instance) Gather(slist *types.SampleList) {
 	for _, container := range containers {
 		// 构建基础标签
 		tags := map[string]string{
-			"source_id": container.ID,
+			"client_id": container.ID,
 		}
 
 		// 区分裸进程与容器化进程，便于过滤和告警分组
 		if strings.HasPrefix(container.ID, "proc_") {
-			tags["source_type"] = "bare_process"
+			tags["client_type"] = "bare_process"
 		} else {
-			tags["source_type"] = "container"
+			tags["client_type"] = "container"
 		}
 
 		if container.Name != "" {
-			tags["source_name"] = container.Name
+			tags["client_name"] = container.Name
 		}
 		if container.PodName != "" {
 			tags["pod_name"] = container.PodName
@@ -395,16 +395,16 @@ func (ins *Instance) collectServiceMapStats(cs []*containers.Container, slist *t
 
 	for _, edge := range g.Edges {
 		tags := map[string]string{
-			"source_id":   edge.Source.ID,
-			"source_name": edge.Source.Name,
+			"client_id":   edge.Source.ID,
+			"client_name": edge.Source.Name,
 			"destination": edge.Destination,
 		}
 
 		// 区分裸进程与容器化进程
 		if strings.HasPrefix(edge.Source.ID, "proc_") {
-			tags["source_type"] = "bare_process"
+			tags["client_type"] = "bare_process"
 		} else {
-			tags["source_type"] = "container"
+			tags["client_type"] = "container"
 		}
 
 		if edge.Source.Namespace != "" {
@@ -461,13 +461,13 @@ func (ins *Instance) collectServiceMapStats(cs []*containers.Container, slist *t
 	}
 
 	slist.PushFront(types.NewSample(inputName, "graph_nodes", float64(nodeBareProcess),
-		mergeTags(graphBaseTags, map[string]string{"source_type": "bare_process"})))
+		mergeTags(graphBaseTags, map[string]string{"client_type": "bare_process"})))
 	slist.PushFront(types.NewSample(inputName, "graph_nodes", float64(nodeContainer),
-		mergeTags(graphBaseTags, map[string]string{"source_type": "container"})))
+		mergeTags(graphBaseTags, map[string]string{"client_type": "container"})))
 	slist.PushFront(types.NewSample(inputName, "graph_edges", float64(edgeBareProcess),
-		mergeTags(graphBaseTags, map[string]string{"source_type": "bare_process"})))
+		mergeTags(graphBaseTags, map[string]string{"client_type": "bare_process"})))
 	slist.PushFront(types.NewSample(inputName, "graph_edges", float64(edgeContainer),
-		mergeTags(graphBaseTags, map[string]string{"source_type": "container"})))
+		mergeTags(graphBaseTags, map[string]string{"client_type": "container"})))
 }
 
 // mergeTags 合并标签
@@ -517,12 +517,31 @@ func gatherHostIPs() []string {
 
 // collectListenEndpoints 采集进程/容器的监听端点指标。
 // 监听地址为 0.0.0.0/:: 时，展开为主机所有非回环 IP，使 Prometheus 跨主机 JOIN 时能命中。
-// 上报指标 servicemap_listen_endpoint{listen_ip, port, source_id, source_name, ...} = 1
+// 上报指标 servicemap_listen_endpoint{listen_ip, port, server_id, server_name, ...} = 1
+//
+// 注意：此指标中进程扮演「服务端」角色（监听端口、接受连接），使用 server_* 标签；
+// 与之对应，servicemap_edge_* 中进程扮演「客户端」角色（发起连接），使用 client_* 标签。
 func (ins *Instance) collectListenEndpoints(container *containers.Container, baseTags map[string]string, slist *types.SampleList) {
 	endpoints := container.GetListenEndpointsSnapshot()
 	if len(endpoints) == 0 {
 		return
 	}
+
+	// 监听端点：进程角色是接受连接的服务端，使用 server_* 标签
+	serverTags := make(map[string]string, len(baseTags))
+	for k, v := range baseTags {
+		switch k {
+		case "client_id":
+			serverTags["server_id"] = v
+		case "client_name":
+			serverTags["server_name"] = v
+		case "client_type":
+			serverTags["server_type"] = v
+		default:
+			serverTags[k] = v
+		}
+	}
+
 	for port, listenIP := range endpoints {
 		portStr := strconv.Itoa(int(port))
 		var listenIPs []string
@@ -533,7 +552,7 @@ func (ins *Instance) collectListenEndpoints(container *containers.Container, bas
 			listenIPs = []string{listenIP}
 		}
 		for _, ip := range listenIPs {
-			tags := mergeTags(baseTags, map[string]string{
+			tags := mergeTags(serverTags, map[string]string{
 				"listen_ip": ip,
 				"port":      portStr,
 			})

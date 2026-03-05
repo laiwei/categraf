@@ -47,36 +47,36 @@ func (s *APIServer) Shutdown(ctx context.Context) error {
 // GET /api/v1/topology
 // 可选参数：
 //
-//	?source_name=nginx    — 过滤源服务名
-//	?dest_name=mysql      — 过滤目标服务名
+//	?client_name=nginx    — 过滤源服务名
+//	?server_name=mysql    — 过滤目标服务名
 //	?namespace=production — 过滤命名空间
 func (s *APIServer) handleTopology(w http.ResponseWriter, r *http.Request) {
 	snap := s.agg.GetSnapshot()
 
 	q := r.URL.Query()
-	srcFilter := q.Get("source_name")
-	dstFilter := q.Get("dest_name")
+	srcFilter := q.Get("client_name")
+	dstFilter := q.Get("server_name")
 	nsFilter := q.Get("namespace")
 
 	filtered := snap
 	if srcFilter != "" || dstFilter != "" || nsFilter != "" {
 		var edges []P2PEdge
 		for _, e := range snap.Edges {
-			if srcFilter != "" && e.SourceName != srcFilter {
+			if srcFilter != "" && e.ClientName != srcFilter {
 				continue
 			}
-			if dstFilter != "" && e.DestName != dstFilter {
+			if dstFilter != "" && e.ServerName != dstFilter {
 				continue
 			}
-			if nsFilter != "" && e.DestNamespace != nsFilter {
+			if nsFilter != "" && e.ServerNamespace != nsFilter {
 				continue
 			}
 			edges = append(edges, e)
 		}
 		nodeSet := make(map[string]struct{})
 		for _, e := range edges {
-			nodeSet[e.SourceID] = struct{}{}
-			nodeSet[e.DestID] = struct{}{}
+			nodeSet[e.ClientID] = struct{}{}
+			nodeSet[e.ServerID] = struct{}{}
 		}
 		filtered = &TopologySnapshot{
 			Edges:     edges,
@@ -120,29 +120,29 @@ func (s *APIServer) handleEdges(w http.ResponseWriter, r *http.Request) {
 
 	for i, e := range snap.Edges {
 		// 节点：源
-		if _, exists := nodeMap[e.SourceID]; !exists {
-			nodeMap[e.SourceID] = &nodeItem{
-				ID:            e.SourceID,
-				Title:         e.SourceName,
-				SecondaryStat: e.SourceType,
+		if _, exists := nodeMap[e.ClientID]; !exists {
+			nodeMap[e.ClientID] = &nodeItem{
+				ID:            e.ClientID,
+				Title:         e.ClientName,
+				SecondaryStat: e.ClientType,
 			}
 		}
-		nodeMap[e.SourceID].MainStat += e.ActiveConnections
+		nodeMap[e.ClientID].MainStat += e.ActiveConnections
 
 		// 节点：目标
-		if _, exists := nodeMap[e.DestID]; !exists {
-			nodeMap[e.DestID] = &nodeItem{
-				ID:            e.DestID,
-				Title:         e.DestName,
-				SecondaryStat: e.DestType,
+		if _, exists := nodeMap[e.ServerID]; !exists {
+			nodeMap[e.ServerID] = &nodeItem{
+				ID:            e.ServerID,
+				Title:         e.ServerName,
+				SecondaryStat: e.ServerType,
 			}
 		}
 
 		// 边
 		edges = append(edges, edgeItem{
-			ID:       generateEdgeID(i, e.SourceID, e.DestID),
-			Source:   e.SourceID,
-			Target:   e.DestID,
+			ID:       generateEdgeID(i, e.ClientID, e.ServerID),
+			Source:   e.ClientID,
+			Target:   e.ServerID,
 			MainStat: e.ActiveConnections,
 		})
 	}

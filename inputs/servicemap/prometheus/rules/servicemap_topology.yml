@@ -15,10 +15,10 @@
 #   3. 触发热加载：curl -X POST http://prometheus:9090/-/reload
 #
 # 依赖指标（来自 servicemap 插件）：
-#   servicemap_edge_active_connections  标签：source_id, source_name, source_type,
+#   servicemap_edge_active_connections  标签：client_id, client_name, client_type,
 #                                             destination_host, destination_port,
 #                                             namespace, pod_name, instance
-#   servicemap_listen_endpoint          标签：source_id, source_name, source_type,
+#   servicemap_listen_endpoint          标签：server_id, server_name, server_type,
 #                                             listen_ip, port,
 #                                             namespace, pod_name, instance
 
@@ -32,11 +32,11 @@ groups:
       # ──────────────────────────────────────────────────────────────────────
       # Step 1: 将 listen_endpoint 的标签重命名为 JOIN 所需格式
       #
-      # 原始标签：source_id, source_name, source_type, namespace, pod_name,
-      #           listen_ip, port, instance
+      # 原始标签：server_id, server_name, server_type（已由插件直接输出）
+      #           namespace, pod_name, listen_ip, port, instance
       # 输出标签：destination_host, destination_port（与 edge 侧对齐）
-      #           dest_source_id, dest_source_name, dest_source_type（目标进程信息）
-      #           dest_namespace, dest_pod_name（目标 K8s 信息）
+      #           server_id, server_name, server_type（直接透传，无需 rename）
+      #           server_namespace, server_pod_name（K8s 信息重命名）
       #
       # 使用 min by(...) 去重：同一 IP:port 可能由多个 categraf 实例上报
       # ──────────────────────────────────────────────────────────────────────
@@ -45,30 +45,24 @@ groups:
           min by (
             destination_host,
             destination_port,
-            dest_source_id,
-            dest_source_name,
-            dest_source_type,
-            dest_namespace,
-            dest_pod_name
+            server_id,
+            server_name,
+            server_type,
+            server_namespace,
+            server_pod_name
           ) (
             label_replace(
               label_replace(
                 label_replace(
                   label_replace(
-                    label_replace(
-                      label_replace(
-                        servicemap_listen_endpoint,
-                        "destination_host", "$1", "listen_ip",   "(.*)"
-                      ),
-                      "destination_port", "$1", "port",          "(.*)"
-                    ),
-                    "dest_source_id",   "$1", "source_id",       "(.*)"
+                    servicemap_listen_endpoint,
+                    "destination_host", "$1", "listen_ip", "(.*)"
                   ),
-                  "dest_source_name",  "$1", "source_name",      "(.*)"
+                  "destination_port", "$1", "port", "(.*)"
                 ),
-                "dest_source_type",    "$1", "source_type",      "(.*)"
+                "server_namespace", "$1", "namespace", "(.*)"
               ),
-              "dest_namespace",        "$1", "namespace",        "(.*)"
+              "server_pod_name", "$1", "pod_name", "(.*)"
             )
           )
 
@@ -80,10 +74,10 @@ groups:
       # group_left 从 listen 侧附加目标进程信息标签
       #
       # 结果标签：
-      #   source_id, source_name, source_type           ← 来自 edge（发起方）
+      #   client_id, client_name, client_type           ← 来自 edge（发起方）
       #   destination_host, destination_port            ← JOIN 键
-      #   dest_source_id, dest_source_name, dest_source_type  ← 来自 listen（接收方）
-      #   dest_namespace, dest_pod_name                 ← 接收方 K8s 信息
+      #   server_id, server_name, server_type           ← 来自 listen（接收方）
+      #   server_namespace, server_pod_name             ← 接收方 K8s 信息
       #   namespace, pod_name                           ← 发起方 K8s 信息
       # ──────────────────────────────────────────────────────────────────────
       - record: servicemap:p2p_edge:active_connections
@@ -93,11 +87,11 @@ groups:
           )
           * on (destination_host, destination_port)
           group_left (
-            dest_source_id,
-            dest_source_name,
-            dest_source_type,
-            dest_namespace,
-            dest_pod_name
+            server_id,
+            server_name,
+            server_type,
+            server_namespace,
+            server_pod_name
           )
           servicemap:listen_endpoint:joinable
 
@@ -113,11 +107,11 @@ groups:
           servicemap_edge_connects_total
           * on (destination_host, destination_port)
           group_left (
-            dest_source_id,
-            dest_source_name,
-            dest_source_type,
-            dest_namespace,
-            dest_pod_name
+            server_id,
+            server_name,
+            server_type,
+            server_namespace,
+            server_pod_name
           )
           servicemap:listen_endpoint:joinable
 
@@ -129,11 +123,11 @@ groups:
           servicemap_edge_bytes_sent_total
           * on (destination_host, destination_port)
           group_left (
-            dest_source_id,
-            dest_source_name,
-            dest_source_type,
-            dest_namespace,
-            dest_pod_name
+            server_id,
+            server_name,
+            server_type,
+            server_namespace,
+            server_pod_name
           )
           servicemap:listen_endpoint:joinable
 
@@ -144,18 +138,18 @@ groups:
       # sum by(...) 合并多个 Pod/实例的边。
       #
       # 结果标签：
-      #   source_name, source_type          ← 发起方服务名和类型
-      #   dest_source_name, dest_source_type← 接收方服务名和类型
-      #   dest_namespace                    ← 接收方 K8s 命名空间
+      #   client_name, client_type          ← 发起方服务名和类型
+      #   server_name, server_type          ← 接收方服务名和类型
+      #   server_namespace                  ← 接收方 K8s 命名空间
       # ──────────────────────────────────────────────────────────────────────
       - record: servicemap:p2p_topology:active
         expr: |
           sum by (
-            source_name,
-            source_type,
-            dest_source_name,
-            dest_source_type,
-            dest_namespace
+            client_name,
+            client_type,
+            server_name,
+            server_type,
+            server_namespace
           ) (
             servicemap:p2p_edge:active_connections
           )
@@ -166,11 +160,11 @@ groups:
       - record: servicemap:p2p_topology:connect_rate5m
         expr: |
           sum by (
-            source_name,
-            source_type,
-            dest_source_name,
-            dest_source_type,
-            dest_namespace
+            client_name,
+            client_type,
+            server_name,
+            server_type,
+            server_namespace
           ) (
             rate(servicemap:p2p_edge:connects_total[5m])
           )

@@ -11,18 +11,18 @@ import (
 // P2PEdge 表示一条 process/container → process/container 的拓扑边
 type P2PEdge struct {
 	// 发起方（client）信息
-	SourceID   string `json:"source_id"`
-	SourceName string `json:"source_name"`
-	SourceType string `json:"source_type"`
+	ClientID   string `json:"client_id"`
+	ClientName string `json:"client_name"`
+	ClientType string `json:"client_type"`
 	Namespace  string `json:"namespace,omitempty"`
 	PodName    string `json:"pod_name,omitempty"`
 
 	// 目标方（server）信息
-	DestID        string `json:"dest_source_id"`
-	DestName      string `json:"dest_source_name"`
-	DestType      string `json:"dest_source_type"`
-	DestNamespace string `json:"dest_namespace,omitempty"`
-	DestPodName   string `json:"dest_pod_name,omitempty"`
+	ServerID        string `json:"server_id"`
+	ServerName      string `json:"server_name"`
+	ServerType      string `json:"server_type"`
+	ServerNamespace string `json:"server_namespace,omitempty"`
+	ServerPodName   string `json:"server_pod_name,omitempty"`
 
 	// 连接数（来自 edge 指标）
 	ActiveConnections float64 `json:"active_connections"`
@@ -51,9 +51,9 @@ type listenKey struct {
 
 // listenInfo 监听端点对应的进程/容器信息
 type listenInfo struct {
-	SourceID   string
-	SourceName string
-	SourceType string
+	ServerID   string
+	ServerName string
+	ServerType string
 	Namespace  string
 	PodName    string
 }
@@ -106,9 +106,9 @@ func (a *Aggregator) Aggregate() {
 		key := listenKey{IP: m["listen_ip"], Port: m["port"]}
 		if _, exists := listenMap[key]; !exists {
 			listenMap[key] = listenInfo{
-				SourceID:   m["source_id"],
-				SourceName: m["source_name"],
-				SourceType: m["source_type"],
+				ServerID:   m["server_id"],
+				ServerName: m["server_name"],
+				ServerType: m["server_type"],
 				Namespace:  m["namespace"],
 				PodName:    m["pod_name"],
 			}
@@ -150,16 +150,16 @@ func (a *Aggregator) Aggregate() {
 		}
 
 		edge := P2PEdge{
-			SourceID:          m["source_id"],
-			SourceName:        m["source_name"],
-			SourceType:        m["source_type"],
+			ClientID:          m["client_id"],
+			ClientName:        m["client_name"],
+			ClientType:        m["client_type"],
 			Namespace:         m["namespace"],
 			PodName:           m["pod_name"],
-			DestID:            info.SourceID,
-			DestName:          info.SourceName,
-			DestType:          info.SourceType,
-			DestNamespace:     info.Namespace,
-			DestPodName:       info.PodName,
+			ServerID:          info.ServerID,
+			ServerName:        info.ServerName,
+			ServerType:        info.ServerType,
+			ServerNamespace:   info.Namespace,
+			ServerPodName:     info.PodName,
 			ActiveConnections: sampleValue(s),
 			DestinationHost:   dstHost,
 			DestinationPort:   dstPort,
@@ -167,8 +167,8 @@ func (a *Aggregator) Aggregate() {
 		}
 		edges = append(edges, edge)
 
-		nodeSet[edge.SourceID] = struct{}{}
-		nodeSet[edge.DestID] = struct{}{}
+		nodeSet[edge.ClientID] = struct{}{}
+		nodeSet[edge.ServerID] = struct{}{}
 	}
 
 	snap := &TopologySnapshot{

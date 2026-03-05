@@ -229,9 +229,9 @@ api_addr = ":9099"
 
 | 标签 | 示例值 | 说明 |
 |---|---|---|
-| `source_id` | `proc_nginx` / `a3f8c1d2` | 源节点唯一标识。裸进程为 `proc_<进程名>`（或 `proc_<pid>` 兜底），容器为 Docker 短 ID |
-| `source_name` | `nginx` / `api-server` | 源节点可读名称。裸进程为进程名，容器为 Docker 容器名 |
-| `source_type` | `bare_process` / `container` | 区分裸进程与容器化进程，用于告警分组和过滤 |
+| `client_id` | `proc_nginx` / `a3f8c1d2` | 客户端节点唯一标识。裸进程为 `proc_<进程名>`（或 `proc_<pid>` 兜底），容器为 Docker 短 ID |
+| `client_name` | `nginx` / `api-server` | 客户端节点可读名称。裸进程为进程名，容器为 Docker 容器名 |
+| `client_type` | `bare_process` / `container` | 区分裸进程与容器化进程，用于告警分组和过滤 |
 | `namespace` | `production` | K8s 命名空间（非 K8s 时不输出） |
 | `pod_name` | `api-server-7d9f8` | K8s Pod 名称（非 K8s 时不输出） |
 | `image` | `nginx:1.25` | 容器镜像名（仅容器场景） |
@@ -259,8 +259,8 @@ api_addr = ":9099"
 **PromQL 示例**：
 ```promql
 # 某进程的连接失败率
-rate(servicemap_tcp_connect_failed_total{source_name="nginx"}[5m])
-  / rate(servicemap_tcp_connects_total{source_name="nginx"}[5m])
+rate(servicemap_tcp_connect_failed_total{client_name="nginx"}[5m])
+  / rate(servicemap_tcp_connects_total{client_name="nginx"}[5m])
 
 # 平均 TCP 建连时延（毫秒）
 rate(servicemap_tcp_connect_duration_seconds_sum[5m])
@@ -333,9 +333,9 @@ rate(servicemap_http_request_duration_seconds_sum[5m])
 
 | 标签 | 是否必填 | 示例值 | 说明 |
 |---|---|---|---|
-| `source_id` | ✅ | `proc_nginx` / `a3f8c1` | 源节点唯一标识 |
-| `source_name` | ✅ | `nginx` / `api-server` | 源节点可读名称 |
-| `source_type` | ✅ | `bare_process` / `container` | 区分裸进程与容器 |
+| `client_id` | ✅ | `proc_nginx` / `a3f8c1` | 客户端节点唯一标识 |
+| `client_name` | ✅ | `nginx` / `api-server` | 客户端节点可读名称 |
+| `client_type` | ✅ | `bare_process` / `container` | 区分裸进程与容器 |
 | `destination` | ✅ | `10.0.0.1:3306` | 目标端点完整地址 |
 | `destination_host` | 条件 | `10.0.0.1` | 目标主机（解析失败时不输出） |
 | `destination_port` | 条件 | `3306` | 目标端口（解析失败时不输出） |
@@ -351,7 +351,7 @@ rate(servicemap_http_request_duration_seconds_sum[5m])
 | `servicemap_edge_bytes_received_total` | Counter | 源→目标接收字节数（累计） |
 | `servicemap_edge_active_connections` | Gauge | 当前活跃连接数（瞬时值） |
 
-**边的聚合粒度**：边的唯一键为 `source_id + "->" + destination`。同名进程的多个实例（如 4 个 nginx worker）共享同一条边。
+**边的聚合粒度**：边的唯一键为 `client_id + "->" + destination`。同名进程的多个实例（如 4 个 nginx worker）共享同一条边。
 
 **边的 GC 机制**：边在内存中以 `TCPStats[dest]` 条目存储。满足以下条件时，该边在 GC 周期（每 60s）中被清理：`ActiveConnections == 0` **且** `LastActivity` 超过 15 分钟且非零值。持续保持 ESTABLISHED 状态的连接（如数据库连接池）由 `RefreshLiveConnections`（每 1 分钟）刷新 `LastActivity`，不会被误删。
 
@@ -361,7 +361,7 @@ rate(servicemap_http_request_duration_seconds_sum[5m])
 servicemap_edge_active_connections > 0
 
 # 某服务对 MySQL 的调用连接失败率
-rate(servicemap_edge_connect_failed_total{source_name="api-server", destination_port="3306"}[5m])
+rate(servicemap_edge_connect_failed_total{client_name="api-server", destination_port="3306"}[5m])
 ```
 
 ---
@@ -374,9 +374,9 @@ rate(servicemap_edge_connect_failed_total{source_name="api-server", destination_
 
 | 标签 | 示例值 | 说明 |
 |---|---|---|
-| `source_id` | `proc_nginx` | 源节点唯一标识 |
-| `source_name` | `nginx` | 源节点可读名称 |
-| `source_type` | `bare_process` / `container` | 节点类型 |
+| `server_id` | `proc_nginx` | 服务端节点唯一标识 |
+| `server_name` | `nginx` | 服务端节点可读名称 |
+| `server_type` | `bare_process` / `container` | 节点类型 |
 | `port` | `80` | 监听端口号 |
 | `listen_ip` | `10.0.1.5` | 监听 IP。`0.0.0.0` / `::` 会展开为主机所有非回环 IP，以便跨主机 JOIN |
 
@@ -399,13 +399,13 @@ servicemap_listen_endpoint{port="3306"}
 
 ### 拓扑规模指标（graph）
 
-> 按 `source_type` 分拆输出，分别统计裸进程和容器的拓扑规模。
+> 按 `client_type` 分拆输出，分别统计裸进程和容器的拓扑规模。
 
 **标签**：
 
 | 标签 | 示例值 | 说明 |
 |---|---|---|
-| `source_type` | `bare_process` / `container` | 节点/边类型分组 |
+| `client_type` | `bare_process` / `container` | 节点/边类型分组 |
 | `kube_node` | `node-1` | K8s 节点名，来自 `NODE_NAME` 环境变量（非 K8s 时不输出） |
 | `cluster` | `prod` | 集群名，由 `[instances.labels]` 配置注入（可选） |
 
@@ -417,10 +417,10 @@ servicemap_listen_endpoint{port="3306"}
 **PromQL 示例**：
 ```promql
 # 容器服务节点总数
-servicemap_graph_nodes{source_type="container"}
+servicemap_graph_nodes{client_type="container"}
 
 # 裸进程边总数（观察非容器化服务的调用关系规模）
-servicemap_graph_edges{source_type="bare_process"}
+servicemap_graph_edges{client_type="bare_process"}
 
 # 节点数骤降告警（服务异常下线）
 servicemap_graph_nodes < 5

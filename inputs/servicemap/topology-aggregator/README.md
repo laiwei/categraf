@@ -144,8 +144,8 @@ subjects:
 返回完整拓扑快照（JSON）。
 
 **查询参数（可选）：**
-- `source_name=nginx` — 只返回源服务名匹配的边
-- `dest_name=mysql` — 只返回目标服务名匹配的边
+- `client_name=nginx` — 只返回客户端服务名匹配的边
+- `server_name=mysql` — 只返回服务端服务名匹配的边
 - `namespace=production` — 只返回目标命名空间匹配的边
 
 **响应示例：**
@@ -153,13 +153,13 @@ subjects:
 {
   "edges": [
     {
-      "source_id": "proc_curl",
-      "source_name": "curl",
-      "source_type": "bare_process",
-      "dest_source_id": "proc_nginx",
-      "dest_source_name": "nginx",
-      "dest_source_type": "bare_process",
-      "dest_namespace": "production",
+      "client_id": "proc_curl",
+      "client_name": "curl",
+      "client_type": "bare_process",
+      "server_id": "proc_nginx",
+      "server_name": "nginx",
+      "server_type": "bare_process",
+      "server_namespace": "production",
       "active_connections": 3,
       "destination_host": "10.0.2.15",
       "destination_port": "80",
@@ -172,7 +172,7 @@ subjects:
 }
 ```
 
-> `dest_namespace`、`dest_pod_name`、`namespace`、`pod_name` 字段为 `omitempty`，
+> `server_namespace`、`server_pod_name`、`namespace`、`pod_name` 字段为 `omitempty`，
 > 仅在启用 `--enable-k8s` 且成功解析时出现。
 
 ### `GET /api/v1/edges`
@@ -217,11 +217,11 @@ subjects:
 
 ```
 servicemap_p2p_topology_active{
-  source_name,        # 调用方服务名
-  source_type,        # bare_process / container
-  dest_source_name,   # 被调用方服务名（经 listen_endpoint JOIN 推断）
-  dest_source_type,   # 被调用方节点类型
-  dest_namespace,     # 被调用方 K8s 命名空间（非 K8s 时为空）
+  client_name,        # 客户端服务名
+  client_type,        # bare_process / container
+  server_name,        # 服务端服务名（经 listen_endpoint JOIN 推断）
+  server_type,        # 服务端节点类型
+  server_namespace,   # 服务端 K8s 命名空间（非 K8s 时为空）
   generated_by="topology-aggregator"
 } = <active_connections>
 ```

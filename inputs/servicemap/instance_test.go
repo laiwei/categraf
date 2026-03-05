@@ -471,8 +471,8 @@ func TestCollectServiceMapStats_NodesAndEdges(t *testing.T) {
 	ins.collectServiceMapStats([]*containers.Container{c1, c2}, slist)
 	m := sampleMap(slist)
 
-	assertMetricByTag(t, m, inputName+"_graph_nodes", "source_type", "container", 2)
-	assertMetricByTag(t, m, inputName+"_graph_edges", "source_type", "container", 2)
+	assertMetricByTag(t, m, inputName+"_graph_nodes", "client_type", "container", 2)
+	assertMetricByTag(t, m, inputName+"_graph_edges", "client_type", "container", 2)
 }
 
 func TestCollectServiceMapStats_EdgeLabels(t *testing.T) {
@@ -501,8 +501,8 @@ func TestCollectServiceMapStats_EdgeLabels(t *testing.T) {
 	s := eConns[0]
 
 	wantLabels := map[string]string{
-		"source_id":        "frontend-001",
-		"source_name":      "frontend",
+		"client_id":        "frontend-001",
+		"client_name":      "frontend",
 		"namespace":        "prod",
 		"pod_name":         "frontend-pod-abc",
 		"destination_host": "10.20.30.40",
@@ -660,8 +660,8 @@ func TestGather_FullPipeline(t *testing.T) {
 	}
 
 	// service map: 1 容器 → 1 个 TCP 目标 = 1 条边
-	assertMetricByTag(t, m, inputName+"_graph_nodes", "source_type", "container", 1)
-	assertMetricByTag(t, m, inputName+"_graph_edges", "source_type", "container", 1)
+	assertMetricByTag(t, m, inputName+"_graph_nodes", "client_type", "container", 1)
+	assertMetricByTag(t, m, inputName+"_graph_edges", "client_type", "container", 1)
 
 	// HTTP: 1 次成功
 	assertMetric(t, m, inputName+"_http_requests_total", 1)
@@ -964,7 +964,7 @@ func TestConfig_MaxContainers(t *testing.T) {
 	m := sampleMap(slist)
 
 	// graph_nodes 应为 2（MaxContainers 限制）
-	assertMetricByTag(t, m, inputName+"_graph_nodes", "source_type", "container", 2)
+	assertMetricByTag(t, m, inputName+"_graph_nodes", "client_type", "container", 2)
 	// graph_edges 应为 2（每个容器 1 条边）
-	assertMetricByTag(t, m, inputName+"_graph_edges", "source_type", "container", 2)
+	assertMetricByTag(t, m, inputName+"_graph_edges", "client_type", "container", 2)
 }
