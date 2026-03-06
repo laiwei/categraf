@@ -130,8 +130,8 @@ func TestContainer_UpdateTrafficStats(t *testing.T) {
 	}
 	container.OnEvent(openEvent)
 
-	container.UpdateTrafficStats(123, 100, 60)
-	container.UpdateTrafficStats(123, 150, 90)
+	container.UpdateTrafficStats(123, 100, 60, 0)
+	container.UpdateTrafficStats(123, 150, 90, 0)
 
 	stats := container.TCPStats["10.0.0.1:80"]
 	if stats == nil {

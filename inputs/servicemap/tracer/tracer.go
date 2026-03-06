@@ -42,6 +42,7 @@ const (
 	EventTypeListenOpen         EventType = 6
 	EventTypeListenClose        EventType = 7
 	EventTypeConnectionAccepted EventType = 8  // 服务端 accept 的被动连接
+	EventTypeConnectionFailed   EventType = 9  // 主动连接失败（SYN_SENT → CLOSE）
 	EventTypeL7Request          EventType = 10 // P2-9: L7 协议事件
 )
 
@@ -92,6 +93,16 @@ type Event struct {
 	// 值为 0 表示 eBPF 未提供（如轮询模式），不过滤。
 	NetnsInum uint32
 
+	// BytesSent/BytesReceived: 对应连接累计发送/接收字节数（绝对值）。
+	// eBPF 模式：由 tcp_sendmsg/tcp_cleanup_rbuf kprobe 累计，关闭时随事件带出。
+	// 轮询模式：由 INET_DIAG_INFO (tcp_info) 每轮填入绝对值，在 UpdateTrafficStats 计算增量。
+	BytesSent     uint64
+	BytesReceived uint64
+
+	// Retransmissions: 对应连接累计重传次数（绝对值 tcpi_total_retrans）。
+	// 轮询模式下由 INET_DIAG_INFO 填充；eBPF 模式下暂不使用（由 tcp_retransmit_skb 事件直接计数）。
+	Retransmissions uint64
+
 	// P2-9: L7 请求数据（仅当 Type == EventTypeL7Request 时有效）
 	L7Request *l7.RequestData
 }
@@ -104,10 +115,11 @@ type ConnectionID struct {
 
 // Connection 连接统计
 type Connection struct {
-	Timestamp     uint64
-	LastSeen      time.Time // P0-2: 用于过期清理
-	BytesSent     uint64
-	BytesReceived uint64
+	Timestamp       uint64
+	LastSeen        time.Time // P0-2: 用于过期清理
+	BytesSent       uint64    // 累计发送字节数（绝对值）
+	BytesReceived   uint64    // 累计接收字节数（绝对值）
+	Retransmissions uint64    // 累计 TCP 重传次数（tcpi_total_retrans 绝对值，轮询模式）
 }
 
 // ListenKey 监听端口标识 (P0-4)
@@ -397,9 +409,16 @@ func (t *Tracer) attachProbes() error {
 	// kprobe 程序名 → 内核函数名（与 bpf C 代码 SEC("kprobe/xxx") 对应）
 	kprobeTargets := map[string]string{
 		"tcp_connect":        "tcp_connect",
+		"tcp_sendmsg_enter":  "tcp_sendmsg",
 		"tcp_set_state":      "tcp_set_state",
 		"tcp_retransmit_skb": "tcp_retransmit_skb",
+		"tcp_cleanup_rbuf":   "tcp_cleanup_rbuf",
 		"inet_listen":        "inet_listen",
+	}
+
+	// kretprobe 程序名 → 内核函数名（与 bpf C 代码 SEC("kretprobe/xxx") 对应）
+	kretprobeTargets := map[string]string{
+		"tcp_sendmsg_ret": "tcp_sendmsg",
 	}
 
 	// tracepoint 程序名 → (group, name)（与 SEC("tracepoint/group/name") 对应）
@@ -419,6 +438,14 @@ func (t *Tracer) attachProbes() error {
 			t.links = append(t.links, l)
 			attached++
 			log.Printf("I! servicemap: attached kprobe/%s", kfunc)
+		} else if kfunc, ok := kretprobeTargets[progName]; ok {
+			l, err := link.Kretprobe(kfunc, prog, nil)
+			if err != nil {
+				return fmt.Errorf("attach kretprobe %s failed: %w", progName, err)
+			}
+			t.links = append(t.links, l)
+			attached++
+			log.Printf("I! servicemap: attached kretprobe/%s", kfunc)
 		} else if tp, ok := tracepointTargets[progName]; ok {
 			l, err := link.Tracepoint(tp.group, tp.name, prog, nil)
 			if err != nil {
@@ -810,7 +837,8 @@ func (t *Tracer) trackConnectionEvent(event *Event) {
 		}
 		t.activeConnMu.Unlock()
 
-	case EventTypeConnectionClose:
+	case EventTypeConnectionClose, EventTypeConnectionFailed:
+		// 失败连接和正常关闭同样清理 activeConns
 		id := ConnectionID{FD: event.Fd, PID: event.Pid}
 		t.activeConnMu.Lock()
 		delete(t.activeConns, id)
@@ -1008,21 +1036,29 @@ func (t *Tracer) pollConnections() int {
 		}
 
 		if existing, ok := t.activeConns[id]; ok {
-			// P0-2: 已有连接，更新 LastSeen
+			// P0-2: 已有连接，更新 LastSeen 和字节/重传计数（当前轮询绝对值）
+			// 重要：使用 e.BytesSent（当前轮询值）而非 existing.BytesSent（旧值），
+			// 下游 UpdateTrafficStats 会將其与 conn.BytesSent 对比计算增量。
 			t.activeConns[id] = Connection{
-				Timestamp:     existing.Timestamp,
-				LastSeen:      now,
-				BytesSent:     existing.BytesSent,
-				BytesReceived: existing.BytesReceived,
+				Timestamp:       existing.Timestamp,
+				LastSeen:        now,
+				BytesSent:       e.BytesSent,
+				BytesReceived:   e.BytesReceived,
+				Retransmissions: e.Retransmissions,
 			}
 		} else {
 			// P1-6: 检查连接数上限
 			if t.maxActiveConns > 0 && len(t.activeConns) >= t.maxActiveConns {
 				continue
 			}
+			// 初始化时携带当前字节/重传绝对值，使下一次 updateConnectionStats
+			// 能立即传递正确数据到 container.UpdateTrafficStats。
 			t.activeConns[id] = Connection{
-				Timestamp: e.Timestamp,
-				LastSeen:  now,
+				Timestamp:       e.Timestamp,
+				LastSeen:        now,
+				BytesSent:       e.BytesSent,
+				BytesReceived:   e.BytesReceived,
+				Retransmissions: e.Retransmissions,
 			}
 		}
 	}
@@ -1104,14 +1140,17 @@ func (t *Tracer) collectFromNetlink(
 		}
 
 		e := Event{
-			Type:      evType,
-			Timestamp: nowNano,
-			Pid:       0, // netlink 不提供 PID（需额外 INET_DIAG_INFO 查询，此处暂不实现）
-			Fd:        fd,
-			SrcAddr:   endpoint(dc.SrcIP, uint32(dc.SrcPort)),
-			DstAddr:   endpoint(dc.DstIP, uint32(dc.DstPort)),
-			SrcPort:   dc.SrcPort,
-			DstPort:   dc.DstPort,
+			Type:            evType,
+			Timestamp:       nowNano,
+			Pid:             0, // netlink 不提供 PID
+			Fd:              fd,
+			SrcAddr:         endpoint(dc.SrcIP, uint32(dc.SrcPort)),
+			DstAddr:         endpoint(dc.DstIP, uint32(dc.DstPort)),
+			SrcPort:         dc.SrcPort,
+			DstPort:         dc.DstPort,
+			BytesSent:       dc.BytesSent,            // 由 INET_DIAG_INFO 填入（tcpi_bytes_sent/acked）
+			BytesReceived:   dc.BytesReceived,        // 由 INET_DIAG_INFO 填入（tcpi_bytes_received）
+			Retransmissions: uint64(dc.TotalRetrans), // 由 INET_DIAG_INFO 填入（tcpi_total_retrans）
 		}
 		current[id] = e
 	}
@@ -1129,6 +1168,10 @@ func (t *Tracer) collectFromGopsutil(
 	if err != nil {
 		return err
 	}
+
+	// 获取 per-connection 字节统计（macOS: 解析 netstat -b；其他平台: nil）。
+	// 尽早获取，使 netstat 快照与 gopsutil 快照时间尽可能接近。
+	byteStats := getPerConnByteStats()
 
 	// P1: PID 作用域过滤
 	if t.pidFilter != nil {
@@ -1197,6 +1240,22 @@ func (t *Tracer) collectFromGopsutil(
 			DstPort:   uint16(c.Raddr.Port),
 			Comm:      readProcComm(pid),
 		}
+
+		// 用 netstat -b 的 per-connection 字节数据补充 gopsutil 不提供的 BytesSent/BytesReceived。
+		// macOS 上 gopsutil 不返回字节计数，需要从 netstat -b 的 rxbytes/txbytes 列获取。
+		if byteStats != nil {
+			key := connByteKey{
+				SrcIP:   c.Laddr.IP,
+				SrcPort: uint16(c.Laddr.Port),
+				DstIP:   c.Raddr.IP,
+				DstPort: uint16(c.Raddr.Port),
+			}
+			if bs, ok := byteStats[key]; ok {
+				e.BytesSent = bs.TxBytes
+				e.BytesReceived = bs.RxBytes
+			}
+		}
+
 		current[id] = e
 	}
 

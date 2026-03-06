@@ -477,7 +477,7 @@ func (r *Registry) processEvent(event *tracer.Event) {
 	case tracer.EventTypeConnectionOpen, tracer.EventTypeConnectionClose,
 		tracer.EventTypeTCPRetransmit, tracer.EventTypeL7Request,
 		tracer.EventTypeListenOpen, tracer.EventTypeListenClose,
-		tracer.EventTypeConnectionAccepted:
+		tracer.EventTypeConnectionAccepted, tracer.EventTypeConnectionFailed:
 		// 连接相关事件 + 监听事件 + 被动连接事件均需要创建/查找容器。
 		// ListenOpen 触发容器创建，但不写入 TCPStats，因此不会产生拓扑边；
 		//   纯监听进程（如 sshd）在 graph.Build() 阶段因 TCPStats 为空而被过滤，
@@ -581,7 +581,7 @@ func (r *Registry) updateConnectionStats() {
 		if !exists {
 			return
 		}
-		container.UpdateTrafficStats(connID.FD, conn.BytesSent, conn.BytesReceived)
+		container.UpdateTrafficStats(connID.FD, conn.BytesSent, conn.BytesReceived, conn.Retransmissions)
 	})
 }
 

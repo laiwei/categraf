@@ -17,6 +17,10 @@ type DiagConnection struct {
 	DstPort uint16
 	State   uint8
 	Inode   uint32
+	// 以下字段由 INET_DIAG_INFO 填充（Linux only）；非 Linux 始终为 0。
+	BytesSent     uint64
+	BytesReceived uint64
+	TotalRetrans  uint32
 }
 
 func (d *DiagConnection) IsListen() bool  { return false }

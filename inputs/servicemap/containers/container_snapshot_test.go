@@ -186,7 +186,7 @@ func TestGetL7StatsSnapshot_NilFilter(t *testing.T) {
 func TestUpdateTrafficStats_NoTrackedFD(t *testing.T) {
 	c := NewContainer("u1")
 	// fd=99 未被 onConnectionOpen 追踪，应静默忽略
-	c.UpdateTrafficStats(99, 1024, 2048)
+	c.UpdateTrafficStats(99, 1024, 2048, 0)
 	if len(c.TCPStats) != 0 {
 		t.Error("expected no TCP stats for untracked FD")
 	}
@@ -197,9 +197,9 @@ func TestUpdateTrafficStats_Delta(t *testing.T) {
 	c.OnEvent(&tracer.Event{Type: tracer.EventTypeConnectionOpen, Fd: 1, DstAddr: "1.2.3.4:80"})
 
 	// 第一次更新
-	c.UpdateTrafficStats(1, 100, 200)
+	c.UpdateTrafficStats(1, 100, 200, 0)
 	// 第二次更新（增量 = 150-100=50, 300-200=100）
-	c.UpdateTrafficStats(1, 150, 300)
+	c.UpdateTrafficStats(1, 150, 300, 0)
 
 	c.mu.RLock()
 	stats := c.TCPStats["1.2.3.4:80"]
@@ -220,9 +220,9 @@ func TestUpdateTrafficStats_NoDecrement(t *testing.T) {
 	c := NewContainer("u3")
 	c.OnEvent(&tracer.Event{Type: tracer.EventTypeConnectionOpen, Fd: 2, DstAddr: "5.5.5.5:443"})
 
-	c.UpdateTrafficStats(2, 100, 100)
+	c.UpdateTrafficStats(2, 100, 100, 0)
 	// 减小不应产生负的增量
-	c.UpdateTrafficStats(2, 50, 50)
+	c.UpdateTrafficStats(2, 50, 50, 0)
 
 	c.mu.RLock()
 	stats := c.TCPStats["5.5.5.5:443"]

@@ -84,17 +84,21 @@ volumeMounts:
 
 ### 功能差异
 
-| 功能 | eBPF 模式 | 轮询模式 |
-|---|---|---|
-| TCP 连接追踪 | ✅ | ✅ |
-| 监听端口发现 | ✅（ListenOpen/ListenClose 事件） | ✅（扫描 LISTEN 状态） |
-| 字节数统计（BytesSent/Received） | ✅（内核直接计数） | ❌ 始终为 0（gopsutil 无法获取） |
-| TCP Retransmit 事件 | ✅ | ❌ |
-| **L7 协议解析**（HTTP/MySQL/Redis 等） | ✅（独立 `l7_events` perf buffer） | ❌ 完全不支持 |
-| 连接精确时间戳 | ✅（纳秒级） | ⚠️ 取当前时刻，精度约 ±2s |
-| **短连接捕获**（< 2s 即断开） | ✅ 不丢 | ❌ 两次快照之间打开并关闭的连接**不可见** |
+| 功能 | eBPF 模式 | 轮询模式（Linux fallback） | 轮询模式（macOS） |
+|---|---|---|---|
+| TCP 连接追踪 | ✅ | ✅ | ✅ |
+| 监听端口发现 | ✅（ListenOpen/ListenClose 事件） | ✅（扫描 LISTEN 状态） | ✅ |
+| 字节数统计（BytesSent/Received） | ✅（内核直接计数） | ✅（NETLINK_INET_DIAG tcp_info） | ✅（`netstat -b` rxbytes/txbytes） |
+| TCP Retransmit 事件 | ✅ | ✅（NETLINK_INET_DIAG tcpi_total_retrans） | ❌ macOS 无 per-connection 重传 API |
+| 连接失败检测（FailedConnects） | ✅（eBPF tcp_set_state） | ❌ 轮询无法捕获瞬态 SYN_SENT→CLOSE | ❌ 同左 |
+| **L7 协议解析**（HTTP/MySQL/Redis 等） | ✅（独立 `l7_events` perf buffer） | ❌ 完全不支持 | ❌ 完全不支持 |
+| 连接精确时间戳 | ✅（纳秒级） | ⚠️ 取当前时刻，精度约 ±2s | ⚠️ 同左 |
+| **短连接捕获**（< 2s 即断开） | ✅ 不丢 | ❌ 两次快照之间打开并关闭的连接**不可见** | ❌ 同左 |
 
-> **关键限制**：轮询模式下 `servicemap_edge_bytes_sent_total`、`servicemap_edge_bytes_received_total`、`servicemap_edge_retransmits_total` 恒为 0，L7 相关指标系列（`servicemap_mysql_*` 等）不会产生数据。
+> **关键限制**：
+> - **Linux 轮询模式**（内核 < 4.16 或无 eBPF 权限）：字节和重传通过 NETLINK_INET_DIAG 获取，L7 相关指标不可用。
+> - **macOS 轮询模式**：字节通过 `netstat -b` 获取；重传（`retransmits_total`）和连接失败（`failed_connects`）始终为 0；L7 相关指标系列（`servicemap_mysql_*` 等）不会产生数据。
+> - **连接失败**：所有轮询模式下 `servicemap_edge_failed_connects_total` 恒为 0（需 eBPF 检测 SYN_SENT→CLOSE 瞬态转换）。
 
 ### 性能对比
 
@@ -107,21 +111,21 @@ volumeMounts:
 
 ### 指标可用性汇总
 
-| 指标系列 | eBPF 模式 | 轮询模式 |
-|---|---|---|
-| `servicemap_tcp_*` | ✅ 全量 | ✅ 连接数 / ❌ 字节 / ❌ 重传 |
-| `servicemap_edge_*` | ✅ 全量 | ✅ 连接数 / ❌ 字节 / ❌ 重传 |
-| `servicemap_http_*` | ✅ | ❌ |
-| `servicemap_mysql_*` / `redis_*` 等 | ✅ | ❌ |
-| `servicemap_graph_*` | ✅ | ✅ |
-| `servicemap_tracer_*` | ✅ | ✅ |
+| 指标系列 | eBPF 模式 | 轮询模式（Linux） | 轮询模式（macOS） |
+|---|---|---|---|
+| `servicemap_tcp_*` | ✅ 全量 | ✅ 连接数 / ✅ 字节 / ✅ 重传 | ✅ 连接数 / ✅ 字节 / ❌ 重传 |
+| `servicemap_edge_*` | ✅ 全量 | ✅ 连接数 / ✅ 字节 / ✅ 重传 | ✅ 连接数 / ✅ 字节 / ❌ 重传 |
+| `servicemap_http_*` | ✅ | ❌ | ❌ |
+| `servicemap_mysql_*` / `redis_*` 等 | ✅ | ❌ | ❌ |
+| `servicemap_graph_*` | ✅ | ✅ | ✅ |
+| `servicemap_tracer_*` | ✅ | ✅ | ✅ |
 
 ### 选型建议
 
 | 场景 | 建议 |
 |---|---|
 | 生产 Linux 环境（K8s / 裸机） | 配置 `CAP_SYS_ADMIN` 权限，启用 eBPF 获取完整数据 |
-| 开发机 / macOS | 轮询模式足够验证拓扑逻辑，无需额外配置 |
+| 开发机 / macOS | 轮询模式自动生效，拓扑 + 字节流量可用；重传/连接失败/L7 不可用 |
 | Linux 旧内核（< 4.16）| 轮询模式可用，字节统计和 L7 数据缺失，告警规则中相关指标需设兜底处理 |
 | 高连接密度旧内核（> 5000 连接）| 评估 procfs 扫描的 CPU 成本，优先考虑升级内核到 4.16+ |
 

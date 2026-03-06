@@ -83,11 +83,12 @@ type Container struct {
 
 // ConnectionTracker 连接追踪器
 type ConnectionTracker struct {
-	Destination   string
-	OpenTime      time.Time
-	LastSeen      time.Time // 最后一次被 UpdateTrafficStats 或 Open 触及的时间
-	BytesSent     uint64
-	BytesReceived uint64
+	Destination     string
+	OpenTime        time.Time
+	LastSeen        time.Time // 最后一次被 UpdateTrafficStats 或 Open 触及的时间
+	BytesSent       uint64
+	BytesReceived   uint64
+	Retransmissions uint64 // 上一轮记录的 tcpi_total_retrans 绝对值，用于计算增量
 }
 
 // NewContainer 创建新的容器对象
@@ -112,6 +113,8 @@ func (c *Container) OnEvent(event *tracer.Event) {
 		c.onConnectionOpen(event)
 	case tracer.EventTypeConnectionClose:
 		c.onConnectionClose(event)
+	case tracer.EventTypeConnectionFailed:
+		c.onConnectionFailed(event)
 	case tracer.EventTypeTCPRetransmit:
 		c.onRetransmit(event)
 	case tracer.EventTypeL7Request:
@@ -184,16 +187,74 @@ func (c *Container) onConnectionClose(event *tracer.Event) {
 		stats.MinTime = uint64(duration)
 	}
 
-	// 更新统计
-	stats.BytesSent += conn.BytesSent
-	stats.BytesReceived += conn.BytesReceived
-	stats.ActiveConnections--
+	// 最终字节对账：使用 event 的绝对值与 tracker 最后记录的增量差值。
+	// - 轮询模式：UpdateTrafficStats 已经增量添加过了，close 事件的 BytesSent
+	//   等于 tracker.BytesSent（都来自同一轮 poll），delta=0，不重复计算。
+	// - eBPF 模式：Close 事件携带连接累计 BytesSent，tracker.BytesSent=0
+	//   （eBPF 模式下 UpdateTrafficStats 未填充），delta=全量。
+	if event.BytesSent > conn.BytesSent {
+		stats.BytesSent += event.BytesSent - conn.BytesSent
+	}
+	if event.BytesReceived > conn.BytesReceived {
+		stats.BytesReceived += event.BytesReceived - conn.BytesReceived
+	}
+	// 饱和减法防止 uint64 下溢：若 Open 事件丢失而 Close 到达，拟再 count 不应变负
+	if stats.ActiveConnections > 0 {
+		stats.ActiveConnections--
+	}
 	stats.LastActivity = time.Now()
 
 	// 清理活跃连接记录
 	delete(c.activeConnections, event.Fd)
 
 	// 从目标地址连接列表中删除
+	fds := c.connectionsByDest[dest]
+	for i, fd := range fds {
+		if fd == event.Fd {
+			fds = append(fds[:i], fds[i+1:]...)
+			break
+		}
+	}
+	c.connectionsByDest[dest] = fds
+}
+
+// onConnectionFailed TCP 主动连接失败（SYN_SENT → CLOSE，未到达 ESTABLISHED）
+// 来源：eBPF tcp_set_state 在连接未建立时转入 TCP_CLOSE 状态时发出。
+// 注意：轮询模式下，SYN_SENT 连接在週期内消失直接发 Close 事件（不区分失败/成功），
+// 失败计数仅在 eBPF 模式下准确计数。
+func (c *Container) onConnectionFailed(event *tracer.Event) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	conn, exists := c.activeConnections[event.Fd]
+	if !exists {
+		// 尚未建立连接追踪器时失败，直接将失败计数加到目标地址的统计中
+		dest := event.DstAddr
+		if dest == "" {
+			return
+		}
+		now := time.Now()
+		if c.TCPStats[dest] == nil {
+			c.TCPStats[dest] = &TCPStats{DestinationAddr: dest, LastActivity: now}
+		}
+		c.TCPStats[dest].FailedConnects++
+		c.TCPStats[dest].LastActivity = now
+		return
+	}
+
+	dest := conn.Destination
+	// 饱和减法：防止异常情况下 uint64 下溢
+	stats := c.TCPStats[dest]
+	if stats != nil && stats.ActiveConnections > 0 {
+		stats.ActiveConnections--
+	}
+	if stats != nil {
+		stats.FailedConnects++
+		stats.LastActivity = time.Now()
+	}
+
+	// 清理连接追踪器
+	delete(c.activeConnections, event.Fd)
 	fds := c.connectionsByDest[dest]
 	for i, fd := range fds {
 		if fd == event.Fd {
@@ -225,8 +286,11 @@ func (c *Container) onRetransmit(event *tracer.Event) {
 	c.TCPStats[dest].LastActivity = now
 }
 
-// UpdateTrafficStats 更新流量统计
-func (c *Container) UpdateTrafficStats(fd uint64, sent, received uint64) {
+// UpdateTrafficStats 更新流量和重传统计。
+// sent/received/totalRetrans 均为绝对值（轮询模式下来自 INET_DIAG_INFO tcp_info）；
+// 方法内部计算增量并累加到 TCPStats。
+// totalRetrans=0 表示未获取到重传数据（内核不支持或 eBPF 模式下由事件直接累计）。
+func (c *Container) UpdateTrafficStats(fd uint64, sent, received, totalRetrans uint64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -246,10 +310,16 @@ func (c *Container) UpdateTrafficStats(fd uint64, sent, received uint64) {
 		receivedDelta = received - conn.BytesReceived
 	}
 
+	var retransDelta uint64
+	if totalRetrans > conn.Retransmissions {
+		retransDelta = totalRetrans - conn.Retransmissions
+	}
+
 	// 更新连接记录
 	now := time.Now()
 	conn.BytesSent = sent
 	conn.BytesReceived = received
+	conn.Retransmissions = totalRetrans
 	conn.LastSeen = now
 
 	// 更新对应 destination 的统计
@@ -265,6 +335,7 @@ func (c *Container) UpdateTrafficStats(fd uint64, sent, received uint64) {
 
 	stats.BytesSent += sentDelta
 	stats.BytesReceived += receivedDelta
+	stats.Retransmissions += retransDelta
 	stats.LastActivity = now
 }
 

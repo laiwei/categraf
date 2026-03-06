@@ -1453,16 +1453,23 @@ eBPF 仅支持 Linux，但开发团队通常在 macOS 或 Windows 上工作。`s
 
 ### 轮询模式 vs eBPF 模式对比
 
-| 特性 | eBPF 模式（Linux） | 轮询模式（macOS/非 Linux） |
-|------|------------------|--------------------------|
-| 平台要求 | Linux >= 4.16 | 任意平台 |
-| 权限要求 | root / CAP_SYS_ADMIN | 普通用户（部分功能需 root） |
-| TCP 连接追踪 | ✅ 实时内核事件 | ✅ 定期轮询 `/proc/net/tcp` |
-| L7 协议解析 | ✅ HTTP/MySQL/Postgres/Redis/Kafka | ❌ 不支持 |
-| 容器发现 | ✅ Docker + K8s + cgroup | ✅ Docker（需 Docker Desktop） |
-| 字节流量统计 | ✅ | ✅（部分） |
-| 连接时延 | ✅ 精确 | ❌ 不支持 |
-| 性能开销 | 极低（内核级） | 低（用户态轮询） |
+| 特性 | eBPF 模式（Linux） | 轮询模式（Linux fallback） | 轮询模式（macOS） |
+|------|------------------|--------------------------|-------------------|
+| 平台要求 | Linux >= 4.16 | Linux（任意内核） | macOS |
+| 权限要求 | root / CAP_SYS_ADMIN | 普通用户 | 普通用户 |
+| TCP 连接追踪 | ✅ 实时内核事件 | ✅ 定期轮询 `/proc/net/tcp` | ✅ 定期轮询 `gopsutil` |
+| L7 协议解析 | ✅ HTTP/MySQL/Postgres/Redis/Kafka | ❌ 不支持 | ❌ 不支持 |
+| 容器发现 | ✅ Docker + K8s + cgroup | ✅ Docker + cgroup | ✅ Docker（需 Docker Desktop） |
+| 字节流量统计（sent/recv） | ✅ 内核直接计数 | ✅ NETLINK_INET_DIAG tcp_info | ✅ `netstat -b` rxbytes/txbytes |
+| TCP 重传统计（retx） | ✅ tcp_retransmit_skb | ✅ NETLINK_INET_DIAG tcpi_total_retrans | ❌ macOS 无 per-connection 重传 API |
+| 连接失败检测（failed） | ✅ tcp_set_state | ❌ 轮询无法捕获瞬态 | ❌ 轮询无法捕获瞬态 |
+| 连接时延 | ✅ 精确 | ❌ 不支持 | ❌ 不支持 |
+| 性能开销 | 极低（内核级） | 低（用户态轮询） | 低（用户态轮询 + netstat -b） |
+
+> **macOS 指标能力说明**：
+> - **sent/recv**: ✅ 通过 `netstat -b` 获取 per-connection 字节（`tcp_bytes_darwin.go`）
+> - **retx**: ❌ macOS 无 per-connection 重传 API（`netstat -b` 不含此列），始终为 0
+> - **failed**: ❌ 轮询模式无法捕获瞬态 SYN_SENT→CLOSE 转换（需 eBPF），始终为 0
 
 ### macOS 本地开发配置
 

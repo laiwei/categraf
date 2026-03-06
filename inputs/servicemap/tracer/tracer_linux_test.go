@@ -14,6 +14,7 @@ package tracer
 
 import (
 	"context"
+	"os"
 	"testing"
 	"time"
 )
@@ -181,5 +182,48 @@ func TestGcConnections_Linux_WithRealConnections(t *testing.T) {
 	// 过期连接应被全部清除
 	if n := tr.ActiveConnectionCount(); n != 0 {
 		t.Errorf("expected 0 active connections after GC, got %d", n)
+	}
+}
+
+// TestEBPFProbes_Smoke 是可选的 eBPF 探针集成测试。
+// 默认在 CI/本地都 Skip，避免因权限、内核能力、未嵌入字节码等环境问题导致误报。
+//
+// 启用方式：
+//
+//	SERVICEMAP_EBPF_SMOKE=1 go test ./inputs/servicemap/tracer -run TestEBPFProbes_Smoke -v
+//
+// 目标：
+//  1. 确认 tracer 进入 eBPF 模式（非 fallback）
+//  2. 确认新增探针程序名存在于 eBPF collection：
+//     - tcp_sendmsg_enter
+//     - tcp_sendmsg_ret
+//     - tcp_cleanup_rbuf
+func TestEBPFProbes_Smoke(t *testing.T) {
+	if os.Getenv("SERVICEMAP_EBPF_SMOKE") != "1" {
+		t.Skip("set SERVICEMAP_EBPF_SMOKE=1 to enable eBPF probe smoke test")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	tr, err := NewTracer(ctx, -1, -1, true, 0)
+	if err != nil {
+		t.Fatalf("NewTracer: %v", err)
+	}
+	defer tr.Close()
+
+	if err := tr.Start(); err != nil {
+		t.Fatalf("Start() failed: %v", err)
+	}
+
+	if tr.collection == nil {
+		t.Fatalf("tracer did not enter eBPF mode (collection=nil), likely fallback mode")
+	}
+
+	wantPrograms := []string{"tcp_sendmsg_enter", "tcp_sendmsg_ret", "tcp_cleanup_rbuf"}
+	for _, name := range wantPrograms {
+		if _, ok := tr.collection.Programs[name]; !ok {
+			t.Fatalf("expected eBPF program %q in collection, but not found", name)
+		}
 	}
 }

@@ -56,7 +56,10 @@ func parseRawEvent(data []byte) (*Event, error) {
 		Fd:        raw.Fd,
 		SrcPort:   raw.SrcPort,
 		DstPort:   ntohs(raw.DstPort), // eBPF 端存储为网络字节序
-		NetnsInum: raw.NetnsInum,
+		BytesSent: raw.BytesSent,
+		// raw struct 字段名是 BytesRecv（兼容历史命名），映射到 Event.BytesReceived
+		BytesReceived: raw.BytesRecv,
+		NetnsInum:     raw.NetnsInum,
 	}
 
 	// 提取 eBPF 侧填充的进程名（null-terminated C string）

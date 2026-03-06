@@ -3,7 +3,11 @@
 package tracer
 
 import (
+	"bytes"
+	"io"
+	"net"
 	"testing"
+	"time"
 )
 
 // ─── netlinkConnections ─────────────────────────────────────────
@@ -152,5 +156,170 @@ func TestCollectFromNetlink_Integration(t *testing.T) {
 		if e.SrcAddr == "" {
 			t.Errorf("tracked event has empty SrcAddr: id=%+v event=%+v", id, e)
 		}
+	}
+}
+
+// ─── 真实流量集成测试（bytes/retrans）──────────────────────────────
+
+func TestNetlinkConnections_Integration_ReportsBytes(t *testing.T) {
+	ln, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen tcp4: %v", err)
+	}
+	defer ln.Close()
+
+	accepted := make(chan net.Conn, 1)
+	acceptErr := make(chan error, 1)
+	go func() {
+		c, err := ln.Accept()
+		if err != nil {
+			acceptErr <- err
+			return
+		}
+		accepted <- c
+	}()
+
+	client, err := net.Dial("tcp4", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("dial tcp4: %v", err)
+	}
+	defer client.Close()
+
+	var server net.Conn
+	select {
+	case server = <-accepted:
+	case err := <-acceptErr:
+		t.Fatalf("accept: %v", err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("accept timeout")
+	}
+	defer server.Close()
+
+	// 服务端持续读取，确保客户端发送字节被内核统计为已消费/已确认。
+	readDone := make(chan struct{})
+	go func() {
+		defer close(readDone)
+		_, _ = io.Copy(io.Discard, server)
+	}()
+
+	payload := bytes.Repeat([]byte("a"), 8*1024)
+	const rounds = 16
+	var written int
+	for i := 0; i < rounds; i++ {
+		n, werr := client.Write(payload)
+		if werr != nil {
+			t.Fatalf("client write failed at round %d: %v", i, werr)
+		}
+		written += n
+	}
+
+	clientPort := uint16(client.LocalAddr().(*net.TCPAddr).Port)
+	serverPort := uint16(ln.Addr().(*net.TCPAddr).Port)
+
+	var found bool
+	var sent, recv uint64
+	for i := 0; i < 20; i++ {
+		conns, err := netlinkConnections()
+		if err != nil {
+			t.Fatalf("netlinkConnections: %v", err)
+		}
+		for j := range conns {
+			dc := &conns[j]
+			if dc.SrcPort == clientPort && dc.DstPort == serverPort && dc.IsTracked() {
+				found = true
+				sent = dc.BytesSent
+				recv = dc.BytesReceived
+				break
+			}
+		}
+		if found && (sent > 0 || recv > 0) {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	if !found {
+		t.Skipf("did not observe loopback client socket in netlink dump (clientPort=%d serverPort=%d)", clientPort, serverPort)
+	}
+	if sent == 0 && recv == 0 {
+		t.Skip("tcp_info byte counters unavailable on this kernel (likely < 4.2 or restricted)")
+	}
+
+	if sent == 0 {
+		t.Fatalf("expected client socket bytes_sent > 0, got 0 (written=%d)", written)
+	}
+	t.Logf("observed loopback bytes: sent=%d recv=%d (written=%d)", sent, recv, written)
+}
+
+func TestCollectFromNetlink_Integration_PropagatesCounters(t *testing.T) {
+	conns, err := netlinkConnections()
+	if err != nil {
+		t.Fatalf("netlinkConnections: %v", err)
+	}
+
+	// 选一条 tracked 连接做透传验证；若当前系统没有 tracked 连接则跳过。
+	var sample *DiagConnection
+	for i := range conns {
+		if conns[i].IsTracked() {
+			sample = &conns[i]
+			break
+		}
+	}
+	if sample == nil {
+		t.Skip("no tracked TCP connection available for integration check")
+	}
+
+	tr := newTestTracer(t)
+	defer tr.Close()
+
+	current := make(map[ConnectionID]Event)
+	listens := make(map[ListenKey]struct{})
+	listenEvents := make(map[ListenKey]Event)
+	tr.collectFromNetlink([]DiagConnection{*sample}, current, listens, listenEvents, 123)
+
+	if len(current) != 1 {
+		t.Fatalf("expected exactly 1 event, got %d", len(current))
+	}
+	for _, e := range current {
+		if e.BytesSent != sample.BytesSent {
+			t.Fatalf("BytesSent mismatch: event=%d sample=%d", e.BytesSent, sample.BytesSent)
+		}
+		if e.BytesReceived != sample.BytesReceived {
+			t.Fatalf("BytesReceived mismatch: event=%d sample=%d", e.BytesReceived, sample.BytesReceived)
+		}
+		if e.Retransmissions != uint64(sample.TotalRetrans) {
+			t.Fatalf("Retransmissions mismatch: event=%d sample=%d", e.Retransmissions, sample.TotalRetrans)
+		}
+	}
+}
+
+// ─── native endian 解析兼容性测试 ────────────────────────────────
+
+func TestParseTCPInfo_NativeEndian(t *testing.T) {
+	b := make([]byte, tcpInfoMinSize5x)
+	nativeEndian.PutUint32(b[tcpInfoOffTotalRetrans:], 9)
+	nativeEndian.PutUint64(b[tcpInfoOffBytesReceived:], 12345)
+	nativeEndian.PutUint64(b[tcpInfoOffBytesSent:], 67890)
+
+	sent, recv, retx := parseTCPInfo(b)
+	if sent != 67890 || recv != 12345 || retx != 9 {
+		t.Fatalf("parseTCPInfo mismatch: sent=%d recv=%d retx=%d", sent, recv, retx)
+	}
+}
+
+func TestParseNLAttrs_NativeEndian(t *testing.T) {
+	// 构造一个 attr：type=INET_DIAG_INFO, len=12, data=8 bytes, 并对齐到 4 字节。
+	buf := make([]byte, 12)
+	nativeEndian.PutUint16(buf[0:2], 12)
+	nativeEndian.PutUint16(buf[2:4], uint16(inetDiagInfo))
+	copy(buf[4:12], []byte{1, 2, 3, 4, 5, 6, 7, 8})
+
+	attrs := parseNLAttrs(buf)
+	v, ok := attrs[uint16(inetDiagInfo)]
+	if !ok {
+		t.Fatalf("expected attr type %d", inetDiagInfo)
+	}
+	if len(v) != 8 {
+		t.Fatalf("expected data len 8, got %d", len(v))
 	}
 }

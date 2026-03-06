@@ -50,6 +50,12 @@ func TestParseRawEvent_IPv4(t *testing.T) {
 	if event.DstPort != 80 {
 		t.Errorf("expected DstPort 80, got %d", event.DstPort)
 	}
+	if event.BytesSent != 1024 {
+		t.Errorf("expected BytesSent 1024, got %d", event.BytesSent)
+	}
+	if event.BytesReceived != 2048 {
+		t.Errorf("expected BytesReceived 2048, got %d", event.BytesReceived)
+	}
 }
 
 func TestParseRawEvent_IPv6(t *testing.T) {

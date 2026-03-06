@@ -66,6 +66,7 @@ enum event_type {
 	EVENT_LISTEN_OPEN = 6,
 	EVENT_LISTEN_CLOSE = 7,
 	EVENT_CONNECTION_ACCEPTED = 8,  // 服务端 accept 的被动连接（与 OPEN 区分方向）
+	EVENT_CONNECTION_FAILED = 9,    // TCP 主动连接失败（SYN_SENT → CLOSE，未到达 ESTABLISHED）
 };
 
 // 与 Go 端 rawEvent 结构对应（修改时必须同步 event_parser.go）
@@ -107,10 +108,12 @@ struct conn_info {
 	__u16 dst_port;
 	__u16 family;
 	__u16 _pad;        // 显式对齐填充
-	__u64 bytes_sent;
-	__u64 bytes_received;
+	__u64 bytes_sent;       // 由 tcp_sendmsg kprobe 累计（主动连接方向）
+	__u64 bytes_received;   // 由 tcp_cleanup_rbuf kprobe 累计
 	char comm[16];     // 进程名，从 tcp_connect 保存，供 close/retransmit 取回
 	__u32 netns_inum;  // 连接所属 network namespace inode
+	__u8  reached_established; // 1 = 已进入 ESTABLISHED；0 = 仍在握手中（失败连接检测）
+	__u8  _pad2[3];    // 对齐到 4 字节
 };
 
 struct {
@@ -119,6 +122,15 @@ struct {
 	__type(key, struct conn_key);
 	__type(value, struct conn_info);
 } active_connections SEC(".maps");
+
+// tcp_sendmsg enter/return 之间传递参数：pid_tgid -> sk_ptr
+// 使用线程级 key 避免并发覆盖，返回探针读取后立即删除。
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 65536);
+	__type(key, __u64);
+	__type(value, __u64);
+} sendmsg_args SEC(".maps");
 
 // 辅助函数：发送事件
 static __always_inline void send_event(void *ctx, struct event *e) {
@@ -193,10 +205,15 @@ int BPF_KPROBE(tcp_set_state, struct sock *sk, int state) {
 	};
 
 	if (state == 1) {
-		// TCP_ESTABLISHED — 仅处理被动接受的连接（服务端）。
+		// TCP_ESTABLISHED — 分两种情况：
+		//   1) 主动连接（tcp_connect 已跟踪）：更新 reached_established 标记，不重发事件
+		//   2) 被动连接（服务端 accept）：新建 conn_info 并发送 ConnectionAccepted 事件
 		struct conn_info *existing = bpf_map_lookup_elem(&active_connections, &key);
-		if (existing)
-			return 0;  // 主动连接，已由 tcp_connect 处理
+		if (existing) {
+			// 主动连接握手完成：标记已到达 ESTABLISHED，供 close 时判断是否为失败连接
+			existing->reached_established = 1;
+			return 0;
+		}
 
 		// Network namespace 过滤
 		__u32 netns = get_netns_from_sock(sk);
@@ -222,6 +239,7 @@ int BPF_KPROBE(tcp_set_state, struct sock *sk, int state) {
 		info.family = e.family;
 		__builtin_memcpy(info.comm, e.comm, sizeof(info.comm));
 		info.netns_inum = netns;
+		info.reached_established = 1;  // 被动连接到达此 hook 时已经是 ESTABLISHED
 		bpf_map_update_elem(&active_connections, &key, &info, BPF_ANY);
 
 		send_event(ctx, &e);
@@ -252,6 +270,10 @@ int BPF_KPROBE(tcp_set_state, struct sock *sk, int state) {
 			e.bytes_sent = info->bytes_sent;
 			e.bytes_received = info->bytes_received;
 			__builtin_memcpy(e.comm, info->comm, sizeof(e.comm));
+			// 若主动连接从未到达 ESTABLISHED（仍在 SYN_SENT/SYN_RECV），则为失败连接
+			if (!info->reached_established) {
+				e.type = EVENT_CONNECTION_FAILED;
+			}
 			bpf_map_delete_elem(&active_connections, &key);
 		} else {
 			e.pid = bpf_get_current_pid_tgid() >> 32;
@@ -296,6 +318,66 @@ int BPF_KPROBE(tcp_retransmit_skb, struct sock *sk) {
 
 	fill_addr_from_sock(sk, &e);
 	send_event(ctx, &e);
+	return 0;
+}
+
+// Hook tcp_sendmsg (enter) - 缓存参数供 kretprobe 使用
+SEC("kprobe/tcp_sendmsg")
+int BPF_KPROBE(tcp_sendmsg_enter, struct sock *sk) {
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	__u64 sk_ptr = (__u64)sk;
+	bpf_map_update_elem(&sendmsg_args, &pid_tgid, &sk_ptr, BPF_ANY);
+	return 0;
+}
+
+// Hook tcp_sendmsg (return) - 累计主动发送字节数
+// 使用 kretprobe 返回值作为“实际成功发送字节数”，比入口参数 size 更准确。
+SEC("kretprobe/tcp_sendmsg")
+int BPF_KRETPROBE(tcp_sendmsg_ret, int ret) {
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	__u64 *sk_ptr = bpf_map_lookup_elem(&sendmsg_args, &pid_tgid);
+	if (!sk_ptr)
+		return 0;
+
+	struct conn_key key = {
+		.sk_ptr = *sk_ptr,
+	};
+	bpf_map_delete_elem(&sendmsg_args, &pid_tgid);
+
+	if (ret <= 0)
+		return 0;
+
+	struct conn_info *info = bpf_map_lookup_elem(&active_connections, &key);
+	if (!info)
+		return 0;
+
+	// Network namespace 过滤（使用已缓存的 netns_inum，避免重新读 sock）
+	if (!match_netns(info->netns_inum))
+		return 0;
+
+	__sync_fetch_and_add(&info->bytes_sent, (__u64)ret);
+	return 0;
+}
+
+// Hook tcp_cleanup_rbuf - 累计接收字节数
+// tcp_cleanup_rbuf 在应用层从接收缓冲区读走数据后调用，copied 为本次读取字节数。
+// 这是用户态实际消费的数据量，比 TCP 层收到的字节（含协议头）更接近应用层语义。
+SEC("kprobe/tcp_cleanup_rbuf")
+int BPF_KPROBE(tcp_cleanup_rbuf, struct sock *sk, int copied) {
+	if (copied <= 0)
+		return 0;
+
+	struct conn_key key = {
+		.sk_ptr = (__u64)sk,
+	};
+	struct conn_info *info = bpf_map_lookup_elem(&active_connections, &key);
+	if (!info)
+		return 0;
+
+	if (!match_netns(info->netns_inum))
+		return 0;
+
+	__sync_fetch_and_add(&info->bytes_received, (__u64)copied);
 	return 0;
 }
 
