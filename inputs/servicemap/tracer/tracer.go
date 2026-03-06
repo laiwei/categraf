@@ -342,6 +342,7 @@ func (t *Tracer) Start() error {
 	t.seedExistingConnections()
 
 	t.launchBackground(t.startConnectionGC)
+	t.launchBackground(t.startBPFByteSync) // 定期从 BPF map 同步字节计数器到 Go 侧
 	log.Println("I! servicemap: eBPF tracer started")
 	t.started = true
 	return nil
@@ -463,6 +464,16 @@ func (t *Tracer) attachProbes() error {
 	}
 
 	log.Printf("I! servicemap: attached %d eBPF probes", attached)
+
+	// 诊断日志：检查字节计数探针是否已加载（帮助发现过期的 BPF 二进制）
+	byteProbes := []string{"tcp_sendmsg_enter", "tcp_sendmsg_ret", "tcp_cleanup_rbuf"}
+	for _, name := range byteProbes {
+		if _, ok := t.collection.Programs[name]; !ok {
+			log.Printf("W! servicemap: byte-counting probe %q NOT found in eBPF collection — "+
+				"bytes_sent/bytes_received will be 0. Recompile BPF: cd inputs/servicemap/tracer && make", name)
+		}
+	}
+
 	return nil
 }
 
@@ -721,6 +732,97 @@ func (t *Tracer) handleListenEvent(event *Event) {
 		t.listenMu.Lock()
 		delete(t.listenPorts, key)
 		t.listenMu.Unlock()
+	}
+}
+
+// ─── BPF Map 字节计数器同步（eBPF 模式专用）────────────────
+//
+// eBPF 模式下，tcp_sendmsg_ret / tcp_cleanup_rbuf 在 BPF 内核侧 active_connections
+// map 中累加 bytes_sent / bytes_received。但 Go 侧的 activeConns（由 trackConnectionEvent
+// 维护）只记录 Timestamp/LastSeen，不含字节数据。
+//
+// registry.updateConnectionStats() 每 5s 调用 ForEachActiveConnection 读取 Go 侧
+// activeConns 的 BytesSent/BytesReceived，若不同步，活跃连接的字节始终为 0。
+//
+// 本机制每 3s 遍历 BPF active_connections map，将累计字节值同步到 Go 侧 activeConns，
+// 使 updateConnectionStats → UpdateTrafficStats 能拿到正确的增量。
+
+// bpfConnKey 对应 BPF 端 struct conn_key（必须与 tcp_tracer.bpf.c 保持一致）
+type bpfConnKey struct {
+	SkPtr uint64
+}
+
+// bpfConnInfo 对应 BPF 端 struct conn_info（必须与 tcp_tracer.bpf.c 保持一致）
+// 仅需读取字节/PID 字段，但结构必须完整以确保 binary layout 匹配。
+type bpfConnInfo struct {
+	Pid              uint32
+	SrcAddr          [4]uint32
+	DstAddr          [4]uint32
+	SrcPort          uint16
+	DstPort          uint16
+	Family           uint16
+	Pad              uint16
+	BytesSent        uint64
+	BytesReceived    uint64
+	Comm             [16]byte
+	NetnsInum        uint32
+	ReachedEstablish uint8
+	Pad2             [3]uint8
+}
+
+// startBPFByteSync 定期从 BPF active_connections map 同步字节计数器到 Go 侧 activeConns。
+// 仅在 eBPF 模式下由 Start() 启动。
+func (t *Tracer) startBPFByteSync() {
+	ticker := time.NewTicker(3 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-t.closeChan:
+			return
+		case <-ticker.C:
+			t.syncBPFByteCounters()
+		}
+	}
+}
+
+// syncBPFByteCounters 遍历 BPF active_connections map，
+// 将 conn_info.bytes_sent/bytes_received 同步到 Go 侧 activeConns。
+func (t *Tracer) syncBPFByteCounters() {
+	if t.collection == nil {
+		return
+	}
+	m := t.collection.Maps["active_connections"]
+	if m == nil {
+		return
+	}
+
+	var key bpfConnKey
+	var info bpfConnInfo
+	iter := m.Iterate()
+
+	t.activeConnMu.Lock()
+	defer t.activeConnMu.Unlock()
+
+	if t.activeConns == nil {
+		return
+	}
+
+	synced := 0
+	for iter.Next(&key, &info) {
+		// BPF 端 key = sk_ptr，Go 端 ConnectionID = {FD: sk_ptr, PID: info.pid}
+		id := ConnectionID{FD: key.SkPtr, PID: info.Pid}
+		if conn, ok := t.activeConns[id]; ok {
+			conn.BytesSent = info.BytesSent
+			conn.BytesReceived = info.BytesReceived
+			conn.LastSeen = time.Now()
+			t.activeConns[id] = conn
+			synced++
+		}
+	}
+
+	if synced > 0 {
+		log.Printf("D! servicemap: synced byte counters for %d active connections from BPF map", synced)
 	}
 }
 
