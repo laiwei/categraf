@@ -107,6 +107,65 @@ func TestGetTCPStatsSnapshot_Concurrent(t *testing.T) {
 	wg.Wait()
 }
 
+// ─── GetActiveLifetimeByDest ──────────────────────────────────
+
+func TestGetActiveLifetimeByDest_Empty(t *testing.T) {
+	c := NewContainer("alt1")
+	result := c.GetActiveLifetimeByDest()
+	if len(result) != 0 {
+		t.Errorf("expected empty map, got %v", result)
+	}
+}
+
+func TestGetActiveLifetimeByDest_WithActiveConnections(t *testing.T) {
+	c := NewContainer("alt2")
+	// 模拟打开两个连接到同一目标
+	past := time.Now().Add(-100 * time.Millisecond)
+	c.mu.Lock()
+	c.activeConnections[1] = &ConnectionTracker{Destination: "10.0.0.1:80", OpenTime: past}
+	c.activeConnections[2] = &ConnectionTracker{Destination: "10.0.0.1:80", OpenTime: past}
+	c.activeConnections[3] = &ConnectionTracker{Destination: "10.0.0.2:443", OpenTime: past}
+	c.mu.Unlock()
+
+	result := c.GetActiveLifetimeByDest()
+	if len(result) != 2 {
+		t.Fatalf("expected 2 destinations, got %d", len(result))
+	}
+	// 每个连接至少 100ms，两个连接到 10.0.0.1:80 至少 200ms
+	if result["10.0.0.1:80"] < 200 {
+		t.Errorf("expected >=200ms for 10.0.0.1:80, got %d", result["10.0.0.1:80"])
+	}
+	if result["10.0.0.2:443"] < 100 {
+		t.Errorf("expected >=100ms for 10.0.0.2:443, got %d", result["10.0.0.2:443"])
+	}
+}
+
+func TestGetActiveLifetimeByDest_NoClosedConnections(t *testing.T) {
+	c := NewContainer("alt3")
+	// TCPStats 有记录但 TotalLifetimeMs=0（连接未关闭）
+	c.TCPStats["10.0.0.1:80"] = &TCPStats{
+		SuccessfulConnects: 1,
+		ActiveConnections:  1,
+		TotalLifetimeMs:    0,
+	}
+	past := time.Now().Add(-50 * time.Millisecond)
+	c.mu.Lock()
+	c.activeConnections[1] = &ConnectionTracker{Destination: "10.0.0.1:80", OpenTime: past}
+	c.mu.Unlock()
+
+	// 快照中 TotalLifetimeMs 仍为 0（仅统计已关闭连接）
+	snap := c.GetTCPStatsSnapshot()
+	if snap["10.0.0.1:80"].TotalLifetimeMs != 0 {
+		t.Error("snapshot TotalLifetimeMs should be 0 for active-only connections")
+	}
+
+	// 但 GetActiveLifetimeByDest 能捕获活跃连接时长
+	active := c.GetActiveLifetimeByDest()
+	if active["10.0.0.1:80"] < 50 {
+		t.Errorf("expected >=50ms active lifetime, got %d", active["10.0.0.1:80"])
+	}
+}
+
 // ─── ActiveConnectionCount ────────────────────────────────────
 
 func TestActiveConnectionCount_Empty(t *testing.T) {

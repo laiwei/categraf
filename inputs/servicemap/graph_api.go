@@ -200,11 +200,14 @@ func (ins *Instance) buildGraphWithContainers(cs []*containers.Container) GraphR
 			BytesReceivedTotal: edge.BytesReceived,
 		}
 		if edge.SuccessfulConnects > 0 {
-			// TotalLifetimeMs 存储在容器的 TCPStats 中；需从 container 快照读取
+			// TotalLifetimeMs 存储在容器的 TCPStats 中；需从 container 快照读取。
+			// 同时叠加活跃连接的运行时长，确保仍处于 active 状态的连接也有展示值。
 			if c, ok := containerByID[edge.Source.ID]; ok {
 				tcpSnapshot := c.GetTCPStatsSnapshot()
 				if ts, ok := tcpSnapshot[edge.Destination]; ok && ts.SuccessfulConnects > 0 {
-					tcpJSON.AvgSessionLifetimeMs = float64(ts.TotalLifetimeMs) / float64(ts.SuccessfulConnects)
+					activeLifetime := c.GetActiveLifetimeByDest()
+					totalLifetime := ts.TotalLifetimeMs + activeLifetime[edge.Destination]
+					tcpJSON.AvgSessionLifetimeMs = float64(totalLifetime) / float64(ts.SuccessfulConnects)
 				}
 			}
 		}

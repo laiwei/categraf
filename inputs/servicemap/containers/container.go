@@ -106,6 +106,13 @@ func NewContainer(id string) *Container {
 	}
 }
 
+// InjectActiveConnection 注入活跃连接（仅供测试使用）。
+func (c *Container) InjectActiveConnection(fd uint64, ct *ConnectionTracker) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.activeConnections[fd] = ct
+}
+
 // OnEvent 处理来自eBPF的事件
 func (c *Container) OnEvent(event *tracer.Event) {
 	switch event.Type {
@@ -488,7 +495,8 @@ func (c *Container) onKafkaRequest(event *tracer.Event) {
 // P0-3: 线程安全的快照方法 — 供 Gather() 使用
 // ============================================================
 
-// GetTCPStatsSnapshot 返回 TCPStats 的深拷贝（线程安全）
+// GetTCPStatsSnapshot 返回 TCPStats 的深拷贝（线程安全）。
+// 此快照不含活跃连接的运行时长，适用于 Prometheus counter 导出（rate() 语义）。
 func (c *Container) GetTCPStatsSnapshot() map[string]*TCPStats {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -502,6 +510,23 @@ func (c *Container) GetTCPStatsSnapshot() map[string]*TCPStats {
 		snapshot[k] = &cp
 	}
 	return snapshot
+}
+
+// GetActiveLifetimeByDest 返回每个目标地址的活跃连接运行时长总和（ms），线程安全。
+// 用于展示层（Graph/Text/JSON），将活跃连接的"正在运行"时长计入平均值。
+func (c *Container) GetActiveLifetimeByDest() map[string]uint64 {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	result := make(map[string]uint64, len(c.connectionsByDest))
+	now := time.Now()
+	for _, conn := range c.activeConnections {
+		dur := now.Sub(conn.OpenTime).Milliseconds()
+		if dur > 0 {
+			result[conn.Destination] += uint64(dur)
+		}
+	}
+	return result
 }
 
 // GetHTTPStatsSnapshot 返回 HTTPStats 的深拷贝（线程安全）

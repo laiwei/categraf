@@ -135,6 +135,77 @@ func TestBuildGraph_SingleContainerTCPOnly(t *testing.T) {
 	}
 }
 
+func TestBuildGraph_ActiveConnectionLifetime(t *testing.T) {
+	// 模拟一个只有活跃连接（未关闭）的场景：
+	// connects=1, active=1, TotalLifetimeMs=0
+	// 预期 avg_session_lifetime_ms > 0（包含活跃连接的运行时长）
+	c := containers.NewContainer("active-001")
+	c.Name = "long-lived-svc"
+
+	// 通过 OnEvent 打开连接（这会设置 activeConnections + TCPStats）
+	c.OnEvent(&tracer.Event{
+		Type:    tracer.EventTypeConnectionOpen,
+		DstAddr: "10.0.0.1:443",
+		Fd:      99,
+	})
+
+	// 等待一小段时间，确保 duration > 0
+	time.Sleep(10 * time.Millisecond)
+
+	ins := &Instance{}
+	resp := ins.buildGraphWithContainers([]*containers.Container{c})
+
+	if len(resp.Edges) != 1 {
+		t.Fatalf("edges: want 1, got %d", len(resp.Edges))
+	}
+	e := resp.Edges[0]
+	if e.TCP == nil {
+		t.Fatal("edge.tcp should not be nil")
+	}
+	if e.TCP.ActiveConnections != 1 {
+		t.Errorf("active: want 1, got %d", e.TCP.ActiveConnections)
+	}
+	// 关键断言：即使连接未关闭，avg_session_lifetime_ms 也应 > 0
+	if e.TCP.AvgSessionLifetimeMs <= 0 {
+		t.Errorf("avg_session_lifetime_ms should be > 0 for active connection, got %.2f", e.TCP.AvgSessionLifetimeMs)
+	}
+}
+
+func TestBuildGraph_MixedActiveAndClosedLifetime(t *testing.T) {
+	// 模拟混合场景：1 个已关闭连接 (lifetime=100ms) + 1 个活跃连接
+	// 预期 avg = (100 + active_duration) / 2
+	c := containers.NewContainer("mixed-001")
+	c.Name = "mixed-svc"
+
+	// 打开连接 1 并关闭（手动设置 TCPStats 模拟）
+	c.TCPStats["10.0.0.1:80"] = &containers.TCPStats{
+		DestinationAddr:    "10.0.0.1:80",
+		SuccessfulConnects: 2,
+		ActiveConnections:  1,
+		TotalLifetimeMs:    100, // 第一个连接关闭时记录 100ms
+	}
+
+	// 手动注入一个活跃连接
+	past := time.Now().Add(-50 * time.Millisecond)
+	c.InjectActiveConnection(1, &containers.ConnectionTracker{
+		Destination: "10.0.0.1:80",
+		OpenTime:    past,
+	})
+
+	ins := &Instance{}
+	resp := ins.buildGraphWithContainers([]*containers.Container{c})
+
+	if len(resp.Edges) != 1 {
+		t.Fatalf("edges: want 1, got %d", len(resp.Edges))
+	}
+	e := resp.Edges[0]
+
+	// avg = (100 + >=50) / 2 >= 75
+	if e.TCP.AvgSessionLifetimeMs < 75 {
+		t.Errorf("avg_session_lifetime_ms should be >= 75, got %.2f", e.TCP.AvgSessionLifetimeMs)
+	}
+}
+
 func TestBuildGraph_HTTPEnrichment(t *testing.T) {
 	c := containers.NewContainer("frontend-001")
 	c.TCPStats["10.0.0.2:80"] = &containers.TCPStats{SuccessfulConnects: 50}
