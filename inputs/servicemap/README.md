@@ -256,8 +256,8 @@ api_addr = ":9099"
 | `servicemap_tcp_retransmits_total` | Counter | TCP 重传次数（累计） |
 | `servicemap_tcp_bytes_sent_total` | Counter | 向目标发送的字节数（累计） |
 | `servicemap_tcp_bytes_received_total` | Counter | 从目标接收的字节数（累计） |
-| `servicemap_tcp_connect_duration_seconds_sum` | Counter | 所有成功连接的建连耗时总和（秒，累计） |
-| `servicemap_tcp_connect_duration_seconds_count` | Counter | 成功连接次数（与 `_sum` 配合计算平均建连时延） |
+| `servicemap_tcp_session_lifetime_seconds_sum` | Counter | 所有成功连接的会话生命周期总和（秒，累计） |
+| `servicemap_tcp_session_lifetime_seconds_count` | Counter | 成功连接次数（与 `_sum` 配合计算平均会话生命周期） |
 | `servicemap_tcp_active_connections` | Gauge | 当前活跃连接数（瞬时值） |
 
 **PromQL 示例**：
@@ -266,9 +266,9 @@ api_addr = ":9099"
 rate(servicemap_tcp_connect_failed_total{client_name="nginx"}[5m])
   / rate(servicemap_tcp_connects_total{client_name="nginx"}[5m])
 
-# 平均 TCP 建连时延（毫秒）
-rate(servicemap_tcp_connect_duration_seconds_sum[5m])
-  / rate(servicemap_tcp_connect_duration_seconds_count[5m]) * 1000
+# 平均 TCP 会话生命周期（毫秒）
+rate(servicemap_tcp_session_lifetime_seconds_sum[5m])
+  / rate(servicemap_tcp_session_lifetime_seconds_count[5m]) * 1000
 ```
 
 ---

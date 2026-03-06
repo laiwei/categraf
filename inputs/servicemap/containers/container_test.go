@@ -90,8 +90,8 @@ func TestContainer_OnConnectionClose(t *testing.T) {
 			t.Errorf("Expected 0 active connections, got %d", stats.ActiveConnections)
 		}
 
-		if stats.TotalTime == 0 {
-			t.Error("TotalTime should not be 0")
+		if stats.TotalLifetimeMs == 0 {
+			t.Error("TotalLifetimeMs should not be 0")
 		}
 	}
 

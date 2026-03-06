@@ -160,7 +160,7 @@ const graphViewHTML = `<!DOCTYPE html>
       h += '<div class="tt-row">连接: <span class="tt-val">' + t.connects + '</span> (失败 ' + t.failed + ', 活跃 ' + t.active + ')</div>';
       h += '<div class="tt-row">重传: <span class="tt-val">' + t.retx + '</span></div>';
       if (t.sent > 0 || t.recv > 0) h += '<div class="tt-row">流量: <span class="tt-val">↑' + fmtBytes(t.sent) + ' ↓' + fmtBytes(t.recv) + '</span></div>';
-      if (t.avgMs > 0) h += '<div class="tt-row">平均耗时: <span class="tt-val">' + t.avgMs.toFixed(2) + 'ms</span></div>';
+      if (t.avgMs > 0) h += '<div class="tt-row">平均会话时长: <span class="tt-val">' + t.avgMs.toFixed(2) + 'ms</span></div>';
     }
     return h;
   }
@@ -223,7 +223,7 @@ const graphViewHTML = `<!DOCTYPE html>
           connects: e.tcp.connects_total||0, failed: e.tcp.connect_failed_total||0,
           active: e.tcp.active_connections||0, retx: e.tcp.retransmits_total||0,
           sent: e.tcp.bytes_sent_total||0, recv: e.tcp.bytes_received_total||0,
-          avgMs: e.tcp.avg_connect_duration_ms||0,
+          avgMs: e.tcp.avg_session_lifetime_ms||0,
         } : null,
       }});
     }

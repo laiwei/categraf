@@ -306,8 +306,8 @@ func (ins *Instance) collectTCPStats(container *containers.Container, baseTags m
 		slist.PushFront(types.NewSample(inputName, "tcp_bytes_received_total", float64(stats.BytesReceived), tags))
 
 		// Summary-style counters — _sum/_count 支持 avg = sum / count
-		slist.PushFront(types.NewSample(inputName, "tcp_connect_duration_seconds_sum", float64(stats.TotalTime)/1000.0, tags))
-		slist.PushFront(types.NewSample(inputName, "tcp_connect_duration_seconds_count", float64(stats.SuccessfulConnects), tags))
+		slist.PushFront(types.NewSample(inputName, "tcp_session_lifetime_seconds_sum", float64(stats.TotalLifetimeMs)/1000.0, tags))
+		slist.PushFront(types.NewSample(inputName, "tcp_session_lifetime_seconds_count", float64(stats.SuccessfulConnects), tags))
 
 		// Gauges — 瞬时值
 		slist.PushFront(types.NewSample(inputName, "tcp_active_connections", float64(stats.ActiveConnections), tags))

@@ -67,7 +67,7 @@ type TCPStatsJSON struct {
 	RetransmitsTotal     uint64  `json:"retransmits_total"`
 	BytesSentTotal       uint64  `json:"bytes_sent_total"`
 	BytesReceivedTotal   uint64  `json:"bytes_received_total"`
-	AvgConnectDurationMs float64 `json:"avg_connect_duration_ms,omitempty"`
+	AvgSessionLifetimeMs float64 `json:"avg_session_lifetime_ms,omitempty"`
 }
 
 // HTTPEntryJSON 单个 (method, status) 组合的 HTTP 统计
@@ -200,11 +200,11 @@ func (ins *Instance) buildGraphWithContainers(cs []*containers.Container) GraphR
 			BytesReceivedTotal: edge.BytesReceived,
 		}
 		if edge.SuccessfulConnects > 0 {
-			// TotalTime 存储在容器的 TCPStats 中；需从 container 快照读取
+			// TotalLifetimeMs 存储在容器的 TCPStats 中；需从 container 快照读取
 			if c, ok := containerByID[edge.Source.ID]; ok {
 				tcpSnapshot := c.GetTCPStatsSnapshot()
 				if ts, ok := tcpSnapshot[edge.Destination]; ok && ts.SuccessfulConnects > 0 {
-					tcpJSON.AvgConnectDurationMs = float64(ts.TotalTime) / float64(ts.SuccessfulConnects)
+					tcpJSON.AvgSessionLifetimeMs = float64(ts.TotalLifetimeMs) / float64(ts.SuccessfulConnects)
 				}
 			}
 		}
@@ -501,8 +501,8 @@ func (ins *Instance) writeGraphText(w io.Writer, graph GraphResponse) {
 				t.ActiveConnections, t.RetransmitsTotal,
 				t.BytesSentTotal, t.BytesReceivedTotal,
 			))
-			if t.AvgConnectDurationMs > 0 {
-				sb.WriteString(fmt.Sprintf(" avg_connect=%.2fms", t.AvgConnectDurationMs))
+			if t.AvgSessionLifetimeMs > 0 {
+				sb.WriteString(fmt.Sprintf(" avg_lifetime=%.2fms", t.AvgSessionLifetimeMs))
 			}
 			sb.WriteString("\n")
 		}

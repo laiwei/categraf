@@ -105,7 +105,7 @@ func TestCollectTCPStats_MetricNames(t *testing.T) {
 		Retransmissions:    2,
 		BytesSent:          1024,
 		BytesReceived:      2048,
-		TotalTime:          5000,
+		TotalLifetimeMs:    5000,
 	}
 
 	baseTags := map[string]string{
@@ -124,8 +124,8 @@ func TestCollectTCPStats_MetricNames(t *testing.T) {
 		inputName + "_tcp_bytes_sent_total":               1024,
 		inputName + "_tcp_bytes_received_total":           2048,
 		inputName + "_tcp_active_connections":             5,
-		inputName + "_tcp_connect_duration_seconds_count": 42,
-		inputName + "_tcp_connect_duration_seconds_sum":   5.0, // 5000ms → 5s
+		inputName + "_tcp_session_lifetime_seconds_count": 42,
+		inputName + "_tcp_session_lifetime_seconds_sum":   5.0, // 5000ms → 5s
 	}
 	for metric, wantVal := range wantMetrics {
 		assertMetric(t, m, metric, wantVal)

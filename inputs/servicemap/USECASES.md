@@ -516,7 +516,7 @@ curl http://localhost:9099/graph/text | grep ":3306"
 
 # 示例输出：
 #   user-service-abc123 -> 10.0.2.10:3306  [TCP, MySQL]
-#     TCP: connects=850 failed=0 active=5 retx=0 sent=2MB recv=8MB avg_connect=0.8ms
+#     TCP: connects=850 failed=0 active=5 retx=0 sent=2MB recv=8MB avg_lifetime=0.8ms
 #     L7 MySQL[ok]: req=42000 err=12 avg=8.2ms
 #     L7 MySQL[error]: req=12 err=12 avg=1.1ms
 ```
@@ -544,7 +544,7 @@ curl http://localhost:9099/graph/text | grep ":3306"
 |------|------|---------|
 | `servicemap_tcp_connect_failed_total` | Counter | 连接建立失败次数（目标不可达、拒绝连接） |
 | `servicemap_tcp_retransmits_total` | Counter | TCP 重传次数（丢包信号） |
-| `servicemap_tcp_connect_duration_seconds_sum/count` | Counter | 连接建立时延（SYN→SYN-ACK 耗时） |
+| `servicemap_tcp_session_lifetime_seconds_sum/count` | Counter | 连接会话生命周期（Open→Close 存活时长） |
 | `servicemap_tcp_active_connections` | Gauge | 当前活跃连接数（连接泄漏检测） |
 | `servicemap_tcp_connects_total` | Counter | 成功建立连接总数 |
 
@@ -645,23 +645,23 @@ sum by (source_id, destination) (
 
 **诊断查询**：
 ```promql
-# 平均 TCP 连接建立时延（毫秒）
+# 平均 TCP 会话生命周期（毫秒）
 sum by (source_id, destination) (
-  rate(servicemap_tcp_connect_duration_seconds_sum[5m])
+  rate(servicemap_tcp_session_lifetime_seconds_sum[5m])
 )
 /
 sum by (source_id, destination) (
-  rate(servicemap_tcp_connect_duration_seconds_count[5m])
+  rate(servicemap_tcp_session_lifetime_seconds_count[5m])
 ) * 1000
 
-# 告警：同机房连接时延 > 5ms
+# 告警：同机房会话生命周期 > 5ms
 (
   sum by (source_id, destination) (
-    rate(servicemap_tcp_connect_duration_seconds_sum[5m])
+    rate(servicemap_tcp_session_lifetime_seconds_sum[5m])
   )
   /
   sum by (source_id, destination) (
-    rate(servicemap_tcp_connect_duration_seconds_count[5m])
+    rate(servicemap_tcp_session_lifetime_seconds_count[5m])
   )
 ) * 1000 > 5
 ```
@@ -706,8 +706,8 @@ deriv(
                              tcp_retransmits_total ↑ ?
                                   │ Yes              │ No
                                   ▼                  ▼
-                             网络丢包/拥塞      ③ 检查连接时延
-                                             connect_duration ↑ ?
+                             网络丢包/拥塞      ③ 检查会话生命周期
+                                             session_lifetime ↑ ?
                                                   │ Yes       │ No
                                                   ▼           ▼
                                             DNS/内核瓶颈   ④ 检查活跃连接数
@@ -1104,7 +1104,7 @@ curl http://localhost:9099/graph | jq .
         "retransmits_total": 2,
         "bytes_sent_total": 15728640,
         "bytes_received_total": 44040192,
-        "avg_connect_duration_ms": 0.8
+        "avg_session_lifetime_ms": 0.8
       },
       "http": [
         {
@@ -1148,16 +1148,16 @@ Nodes (8):
 
 Edges (12):
   abc123 -> 10.0.1.5:8080  [TCP, HTTP]
-    TCP: connects=1240 failed=0 active=8 retx=2 sent=15000000B recv=44000000B avg_connect=0.8ms
+    TCP: connects=1240 failed=0 active=8 retx=2 sent=15000000B recv=44000000B avg_lifetime=0.8ms
     HTTP GET 200(2xx): req=1200 err=0 avg=12.5ms
     HTTP POST 500(5xx): req=3 err=3 avg=245.0ms
 
   def456 -> 10.0.2.10:3306  [TCP, MySQL]
-    TCP: connects=850 failed=0 active=5 retx=0 sent=2000000B recv=8000000B avg_connect=0.9ms
+    TCP: connects=850 failed=0 active=5 retx=0 sent=2000000B recv=8000000B avg_lifetime=0.9ms
     L7 MySQL[ok]: req=42000 err=0 avg=8.2ms
 
   ghi789 -> 10.0.3.20:6379  [TCP, Redis]
-    TCP: connects=320 failed=0 active=2 retx=0 sent=500000B recv=1200000B avg_connect=0.3ms
+    TCP: connects=320 failed=0 active=2 retx=0 sent=500000B recv=1200000B avg_lifetime=0.3ms
     L7 Redis[ok]: req=95000 err=12 avg=0.8ms
     L7 Redis[error]: req=12 err=12 avg=1.1ms
 ```
@@ -1339,11 +1339,11 @@ tc qdisc add dev eth0 root netem delay 200ms
 
 **观测查询**：
 ```promql
-# TCP 连接建立时延应升高
+# TCP 会话生命周期应升高
 (
-  rate(servicemap_tcp_connect_duration_seconds_sum[1m])
+  rate(servicemap_tcp_session_lifetime_seconds_sum[1m])
   /
-  rate(servicemap_tcp_connect_duration_seconds_count[1m])
+  rate(servicemap_tcp_session_lifetime_seconds_count[1m])
 ) * 1000 > 150
 
 # HTTP 请求平均延迟应升高
@@ -1889,8 +1889,8 @@ api_addr = ":9099"
 | `servicemap_tcp_retransmits_total` | Counter | 同上 |
 | `servicemap_tcp_bytes_sent_total` | Counter | 同上 |
 | `servicemap_tcp_bytes_received_total` | Counter | 同上 |
-| `servicemap_tcp_connect_duration_seconds_sum` | Counter | 同上 |
-| `servicemap_tcp_connect_duration_seconds_count` | Counter | 同上 |
+| `servicemap_tcp_session_lifetime_seconds_sum` | Counter | 同上 |
+| `servicemap_tcp_session_lifetime_seconds_count` | Counter | 同上 |
 | `servicemap_tcp_active_connections` | Gauge | 同上 |
 | `servicemap_http_requests_total` | Counter | `source_id`, `source_name`, `source_type`, `destination`, `method`, `status_code`, `status_class` |
 | `servicemap_http_request_errors_total` | Counter | 同上 |

@@ -62,9 +62,9 @@ func TestGetTCPStatsSnapshot_AllFields(t *testing.T) {
 		FailedConnects:     2,
 		ActiveConnections:  3,
 		Retransmissions:    4,
-		TotalTime:          500,
-		MaxTime:            100,
-		MinTime:            10,
+		TotalLifetimeMs:    500,
+		MaxLifetimeMs:      100,
+		MinLifetimeMs:      10,
 		BytesSent:          8192,
 		BytesReceived:      16384,
 	}
@@ -77,8 +77,8 @@ func TestGetTCPStatsSnapshot_AllFields(t *testing.T) {
 	if s.FailedConnects != 2 || s.ActiveConnections != 3 || s.Retransmissions != 4 {
 		t.Error("snapshot fields mismatch")
 	}
-	if s.MaxTime != 100 || s.MinTime != 10 || s.TotalTime != 500 {
-		t.Error("time fields mismatch")
+	if s.MaxLifetimeMs != 100 || s.MinLifetimeMs != 10 || s.TotalLifetimeMs != 500 {
+		t.Error("lifetime fields mismatch")
 	}
 	if s.BytesSent != 8192 || s.BytesReceived != 16384 {
 		t.Error("byte fields mismatch")
@@ -282,8 +282,8 @@ func TestOnConnectionClose_DurationTracking(t *testing.T) {
 	if s == nil {
 		t.Fatal("close should not remove TCPStats entry")
 	}
-	if s.TotalTime == 0 {
-		t.Error("expected non-zero TotalTime after close")
+	if s.TotalLifetimeMs == 0 {
+		t.Error("expected non-zero TotalLifetimeMs after close")
 	}
 	if s.ActiveConnections != 0 {
 		t.Errorf("expected 0 active connections after close, got %d", s.ActiveConnections)

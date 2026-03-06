@@ -16,9 +16,9 @@ type TCPStats struct {
 	FailedConnects     uint64
 	ActiveConnections  uint64
 	Retransmissions    uint64
-	TotalTime          uint64 // 所有连接的总耗时 (ms)
-	MaxTime            uint64
-	MinTime            uint64
+	TotalLifetimeMs    uint64 // 所有已关闭连接的会话生命周期总和 (ms)，即 Open→Close 的存活时长
+	MaxLifetimeMs      uint64 // 单次连接最大生命周期 (ms)
+	MinLifetimeMs      uint64 // 单次连接最小生命周期 (ms)
 	BytesSent          uint64
 	BytesReceived      uint64
 	// LastActivity 最后一次有连接事件或流量变化的时间，用于 graph edge GC。
@@ -177,14 +177,14 @@ func (c *Container) onConnectionClose(event *tracer.Event) {
 		return
 	}
 
-	// 计算连接时长
+	// 计算连接会话生命周期（Open→Close 存活时长）
 	duration := time.Since(conn.OpenTime).Milliseconds()
-	stats.TotalTime += uint64(duration)
-	if uint64(duration) > stats.MaxTime {
-		stats.MaxTime = uint64(duration)
+	stats.TotalLifetimeMs += uint64(duration)
+	if uint64(duration) > stats.MaxLifetimeMs {
+		stats.MaxLifetimeMs = uint64(duration)
 	}
-	if stats.MinTime == 0 || uint64(duration) < stats.MinTime {
-		stats.MinTime = uint64(duration)
+	if stats.MinLifetimeMs == 0 || uint64(duration) < stats.MinLifetimeMs {
+		stats.MinLifetimeMs = uint64(duration)
 	}
 
 	// 最终字节对账：使用 event 的绝对值与 tracker 最后记录的增量差值。

@@ -55,7 +55,7 @@ func TestBuildGraph_SingleContainerTCPOnly(t *testing.T) {
 		Retransmissions:    2,
 		BytesSent:          65536,
 		BytesReceived:      131072,
-		TotalTime:          300, // 300ms total → avg 3ms
+		TotalLifetimeMs:    300, // 300ms total → avg 3ms
 	}
 
 	ins := &Instance{}
@@ -124,9 +124,9 @@ func TestBuildGraph_SingleContainerTCPOnly(t *testing.T) {
 	if e.TCP.BytesSentTotal != 65536 {
 		t.Errorf("tcp.bytes_sent_total: want 65536, got %d", e.TCP.BytesSentTotal)
 	}
-	// avg_connect = 300ms / 100 = 3ms
-	if e.TCP.AvgConnectDurationMs != 3.0 {
-		t.Errorf("tcp.avg_connect_duration_ms: want 3.0, got %.2f", e.TCP.AvgConnectDurationMs)
+	// avg_lifetime = 300ms / 100 = 3ms
+	if e.TCP.AvgSessionLifetimeMs != 3.0 {
+		t.Errorf("tcp.avg_session_lifetime_ms: want 3.0, got %.2f", e.TCP.AvgSessionLifetimeMs)
 	}
 
 	// protocols 只有 TCP

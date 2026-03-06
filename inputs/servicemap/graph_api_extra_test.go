@@ -160,7 +160,7 @@ func TestWriteGraphText_FullEdgeHTTPL7(t *testing.T) {
 					RetransmitsTotal:     0,
 					BytesSentTotal:       4096,
 					BytesReceivedTotal:   8192,
-					AvgConnectDurationMs: 3.14,
+					AvgSessionLifetimeMs: 3.14,
 				},
 				HTTP: []HTTPEntryJSON{
 					{
@@ -192,7 +192,7 @@ func TestWriteGraphText_FullEdgeHTTPL7(t *testing.T) {
 
 	checks := []string{
 		"a-svc", "ns=ns", "pod=pod-a", "image=img:1",
-		"TCP:", "connects=10", "avg_connect=3.14ms",
+		"TCP:", "connects=10", "avg_lifetime=3.14ms",
 		"HTTP GET 200(2xx):", "req=100",
 		"L7 MySQL[ok]:", "req=50",
 	}
