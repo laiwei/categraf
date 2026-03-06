@@ -1,4 +1,4 @@
-module flashcat.cloud/categraf/topology-aggregator
+module flashcat.cloud/categraf/servicemap-aggregator
 
 go 1.21
 
@@ -11,5 +11,5 @@ require (
 )
 
 // 运行以下命令补全依赖：
-//   cd inputs/servicemap/topology-aggregator
+//   cd servicemap-aggregator
 //   go mod tidy

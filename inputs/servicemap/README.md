@@ -206,7 +206,7 @@ ignore_cidrs = ["127.0.0.0/8"]
 
 # Graph API 服务地址（可选）
 # 启用后在该地址上同时暴露：
-#   /graph         — JSON 服务拓扑图（供 topology-aggregator 和可视化使用）
+#   /graph         — JSON 服务拓扑图（供 servicemap-aggregator 和可视化使用）
 #   /graph/text    — 纯文本摘要
 #   /graph/view    — 内嵌浏览器可视化页面
 #   /graph/debug   — 调试信息（原始容器/连接状态）
@@ -388,7 +388,7 @@ rate(servicemap_edge_connect_failed_total{client_name="api-server", destination_
 |---|---|---|
 | `servicemap_listen_endpoint` | Gauge（值=1） | 进程/容器当前监听的端口（P2P 拓扑 JOIN 用） |
 
-**用途**：`topology-aggregator` 查询此指标并与 `servicemap_edge_*` 做 JOIN，推断出跨主机的 P2P 拓扑（clientA → serverB）。
+**用途**：`servicemap-aggregator` 查询此指标并与 `servicemap_edge_*` 做 JOIN，推断出跨主机的 P2P 拓扑（clientA → serverB）。
 
 **PromQL 示例**：
 ```promql
@@ -579,7 +579,7 @@ crictl ps
 
 ## 相关组件
 
-- [topology-aggregator](./topology-aggregator/README.md) — 从 Prometheus 中 JOIN 出跨主机 P2P 拓扑图
+- [servicemap-aggregator](../../servicemap-aggregator/README.md) — 从 Prometheus 中 JOIN 出跨主机 P2P 拓扑图
 - [prometheus/rules](./prometheus/rules/) — Prometheus Recording Rules
 - [grafana/](./grafana/) — Grafana Dashboard JSON
 

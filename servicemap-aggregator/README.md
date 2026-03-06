@@ -1,4 +1,4 @@
-# Topology Aggregator
+# ServiceMap Aggregator
 
 从 Prometheus 中的 `servicemap_edge_*` 和 `servicemap_listen_endpoint` 数据，
 在内存中 JOIN 出 **process/container → process/container** 的 P2P 拓扑图，
@@ -15,7 +15,7 @@ categraf(Host-A)              categraf(Host-B)
      │                               │
      └──────── Prometheus scrape ────┘
                       │
-               topology-aggregator
+              servicemap-aggregator
                    ┌──┴──┐
                 JOIN    K8s API
                    └──┬──┘
@@ -27,7 +27,7 @@ categraf(Host-A)              categraf(Host-B)
        Grafana
 ```
 
-> **数据来源**：topology-aggregator 通过 Prometheus 查询 `servicemap_edge_*` 和
+> **数据来源**：servicemap-aggregator 通过 Prometheus 查询 `servicemap_edge_*` 和
 > `servicemap_listen_endpoint` 指标。这两类指标由各主机上的 categraf 采集后推送到
 > Prometheus，或通过 categraf 自带的 `api_addr = ":9099"` Graph API 直接
 > scrape（`/metrics` 端点）。
@@ -37,7 +37,7 @@ categraf(Host-A)              categraf(Host-B)
 ### 1. 编译
 
 ```bash
-cd inputs/servicemap/topology-aggregator
+cd servicemap-aggregator
 go mod tidy
 make build
 ```
@@ -45,7 +45,7 @@ make build
 ### 2. 运行（裸机/VM 场景）
 
 ```bash
-./topology-aggregator \
+./servicemap-aggregator \
   --prometheus-url=http://prometheus:9090 \
   --listen=:9098 \
   --interval=60s
@@ -54,7 +54,7 @@ make build
 ### 3. 运行（含 K8s Service IP 解析）
 
 ```bash
-./topology-aggregator \
+./servicemap-aggregator \
   --prometheus-url=http://prometheus:9090 \
   --listen=:9098 \
   --interval=60s \
@@ -70,7 +70,7 @@ make docker VERSION=v1.0.0
 
 docker run -d \
   -p 9098:9098 \
-  flashcat/topology-aggregator:v1.0.0 \
+  flashcat/servicemap-aggregator:v1.0.0 \
   --prometheus-url=http://prometheus:9090 \
   --listen=:9098
 ```
@@ -83,22 +83,22 @@ docker run -d \
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: topology-aggregator
+  name: servicemap-aggregator
   namespace: monitoring
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: topology-aggregator
+      app: servicemap-aggregator
   template:
     metadata:
       labels:
-        app: topology-aggregator
+        app: servicemap-aggregator
     spec:
-      serviceAccountName: topology-aggregator  # 需要 list services/endpoints 权限
+      serviceAccountName: servicemap-aggregator  # 需要 list services/endpoints 权限
       containers:
         - name: aggregator
-          image: flashcat/topology-aggregator:v1.0.0
+          image: flashcat/servicemap-aggregator:v1.0.0
           args:
             - --prometheus-url=http://prometheus:9090
             - --listen=:9098
@@ -111,13 +111,13 @@ spec:
 apiVersion: v1
 kind: ServiceAccount
 metadata:
-  name: topology-aggregator
+  name: servicemap-aggregator
   namespace: monitoring
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: topology-aggregator
+  name: servicemap-aggregator
 rules:
   - apiGroups: [""]
     resources: ["services", "endpoints"]
@@ -126,14 +126,14 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: topology-aggregator
+  name: servicemap-aggregator
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
-  name: topology-aggregator
+  name: servicemap-aggregator
 subjects:
   - kind: ServiceAccount
-    name: topology-aggregator
+    name: servicemap-aggregator
     namespace: monitoring
 ```
 
@@ -208,7 +208,7 @@ subjects:
 | `--kubeconfig` | `""` | kubeconfig 路径（空则用 in-cluster） |
 
 > **提示**：如果 categraf 配置了 `api_addr = ":9099"`，可在 Prometheus 中直接 scrape
-> `http://<host>:9099/metrics`，无需额外推送配置。topology-aggregator 通过 Prometheus
+> `http://<host>:9099/metrics`，无需额外推送配置。servicemap-aggregator 通过 Prometheus
 > 查询这些数据，不直接访问 categraf。
 
 ## Remote Write 指标
@@ -222,7 +222,7 @@ servicemap_p2p_topology_active{
   server_name,        # 服务端服务名（经 listen_endpoint JOIN 推断）
   server_type,        # 服务端节点类型
   server_namespace,   # 服务端 K8s 命名空间（非 K8s 时为空）
-  generated_by="topology-aggregator"
+  generated_by="servicemap-aggregator"
 } = <active_connections>
 ```
 
@@ -230,7 +230,7 @@ servicemap_p2p_topology_active{
 
 ## 前置条件
 
-在使用 topology-aggregator 前，请确认：
+在使用 servicemap-aggregator 前，请确认：
 
 1. **categraf 已配置** `api_addr = ":9099"` 并采集到 `servicemap_edge_*` 和 `servicemap_listen_endpoint` 指标
 2. **Prometheus 已 scrape** 所有目标主机的 `:9099/metrics`

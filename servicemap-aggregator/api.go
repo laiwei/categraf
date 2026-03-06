@@ -34,7 +34,7 @@ func NewAPIServer(listen string, agg *Aggregator) *APIServer {
 }
 
 func (s *APIServer) Run() error {
-	log.Printf("I! topology-aggregator: API server listening on %s", s.listen)
+	log.Printf("I! servicemap-aggregator: API server listening on %s", s.listen)
 	return s.server.ListenAndServe()
 }
 

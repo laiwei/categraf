@@ -65,7 +65,7 @@ func (w *RemoteWriter) WriteP2PEdges(ctx context.Context, edges []P2PEdge) error
 				{Name: "server_name", Value: k.ServerName},
 				{Name: "server_type", Value: k.ServerType},
 				{Name: "server_namespace", Value: k.ServerNamespace},
-				{Name: "generated_by", Value: "topology-aggregator"},
+				{Name: "generated_by", Value: "servicemap-aggregator"},
 			},
 			Samples: []prompb.Sample{
 				{Value: v, Timestamp: now},

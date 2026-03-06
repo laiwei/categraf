@@ -1,6 +1,6 @@
 .PHONY: build run tidy docker clean
 
-BINARY  := topology-aggregator
+BINARY  := servicemap-aggregator
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
 LDFLAGS := -ldflags "-s -w -X main.Version=$(VERSION)"
 
@@ -17,7 +17,7 @@ tidy:
 	go mod tidy
 
 docker:
-	docker build -t flashcat/topology-aggregator:$(VERSION) \
+	docker build -t flashcat/servicemap-aggregator:$(VERSION) \
 	  --build-arg BINARY=$(BINARY) -f Dockerfile .
 
 clean:
