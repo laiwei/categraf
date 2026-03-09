@@ -57,6 +57,10 @@ type Instance struct {
 	// hostIPs 是本机所有非回环、非链路本地的 IP。
 	// 用于将监听地址为 0.0.0.0/:: 的端点展开为可供跨主机 JOIN 的具体 IP。
 	hostIPs []string
+	// ignoredNets 是解析后的 CIDR 黑名单（对应配置项 ignore_cidrs）。
+	// collectListenEndpoints 在补充 loopback 地址时会先检查黑名单，
+	// 确保 ignore_cidrs=["127.0.0.0/8"] 时不会把 127.0.0.1/::1 写入 listen_endpoint 指标。
+	ignoredNets []*net.IPNet
 
 	// /metrics 端点缓存：每次 Gather() 结束时更新
 	metricsMu    sync.RWMutex
@@ -71,6 +75,27 @@ func (ins *Instance) Init() error {
 	// 收集主机非回环 IP，供监听端点 0.0.0.0 展开使用
 	ins.hostIPs = gatherHostIPs()
 	log.Printf("I! servicemap: host IPs detected: %v", ins.hostIPs)
+
+	// 解析 CIDR 黑名单，供 collectListenEndpoints 过滤 loopback 补充地址使用。
+	// 与 registry.NewRegistry() 中的解析逻辑保持一致：若黑名单包含 127.0.0.1，
+	// 则自动追加 ::1/128，确保 IPv4/IPv6 回环地址的过滤语义对称。
+	for _, cidr := range ins.IgnoreCIDRs {
+		_, ipNet, err := net.ParseCIDR(cidr)
+		if err != nil {
+			continue // 非法 CIDR 已在 registry 侧打印过 Warning，此处静默跳过
+		}
+		ins.ignoredNets = append(ins.ignoredNets, ipNet)
+	}
+	// 自动扩展：若黑名单包含 127.0.0.1 则同时屏蔽 ::1
+	for _, ipNet := range ins.ignoredNets {
+		if ipNet.Contains(net.IPv4(127, 0, 0, 1)) {
+			ins.ignoredNets = append(ins.ignoredNets, &net.IPNet{
+				IP:   net.IPv6loopback,
+				Mask: net.CIDRMask(128, 128),
+			})
+			break
+		}
+	}
 
 	// P1-8: 创建 context 用于优雅退出
 	ins.ctx, ins.cancel = context.WithCancel(context.Background())
@@ -480,6 +505,24 @@ func (ins *Instance) collectServiceMapStats(cs []*containers.Container, slist *t
 		mergeTags(graphBaseTags, map[string]string{"client_type": "container"})))
 }
 
+// isIgnoredIP 检查给定 IP 字符串是否被 ins.ignoredNets 黑名单覆盖。
+// 用于 collectListenEndpoints 在补充 loopback 地址前的过滤判断。
+func (ins *Instance) isIgnoredIP(ipStr string) bool {
+	if len(ins.ignoredNets) == 0 {
+		return false
+	}
+	ip := net.ParseIP(ipStr)
+	if ip == nil {
+		return false
+	}
+	for _, ipNet := range ins.ignoredNets {
+		if ipNet.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
 // mergeTags 合并标签
 func mergeTags(base, additional map[string]string) map[string]string {
 	result := make(map[string]string)
@@ -527,6 +570,8 @@ func gatherHostIPs() []string {
 
 // collectListenEndpoints 采集进程/容器的监听端点指标。
 // 监听地址为 0.0.0.0/:: 时，展开为主机所有非回环 IP，使 Prometheus 跨主机 JOIN 时能命中。
+// 同时补充 loopback 地址，以支持经由 localhost 发起的精确匹配（常见于同主机服务间调用）；
+// 但若 ignore_cidrs 配置明确覆盖了这些地址（如 "127.0.0.0/8"），则遵从用户意图跳过上报。
 // 上报指标 servicemap_listen_endpoint{listen_ip, port, server_id, server_name, ...} = 1
 //
 // 注意：此指标中进程扮演「服务端」角色（监听端口、接受连接），使用 server_* 标签；
@@ -561,12 +606,27 @@ func (ins *Instance) collectListenEndpoints(container *containers.Container, bas
 		for _, listenIP := range boundIPs {
 			var expandIPs []string
 			if listenIP == "" || listenIP == "0.0.0.0" || listenIP == "::" {
-				// 监听所有接口：展开为主机实际 IP（便于 JOIN）
-				expandIPs = ins.hostIPs
+				// 监听所有接口：展开为主机实际 IP（便于跨主机 JOIN）。
+				// 同时补充 loopback 地址：
+				//   - 0.0.0.0 → 127.0.0.1
+				//   - ::      → ::1，并兼容补充 127.0.0.1 以覆盖 dual-stack localhost 场景
+				// 使用 make+copy 而非 append(ins.hostIPs, ...)，
+				// 避免写入 ins.hostIPs 底层数组的空余容量（slice append 陷阱）。
+				expandIPs = make([]string, len(ins.hostIPs), len(ins.hostIPs)+2)
+				copy(expandIPs, ins.hostIPs)
+				switch listenIP {
+				case "", "0.0.0.0":
+					expandIPs = append(expandIPs, "127.0.0.1")
+				case "::":
+					expandIPs = append(expandIPs, "127.0.0.1", "::1")
+				}
 			} else {
 				expandIPs = []string{listenIP}
 			}
 			for _, ip := range expandIPs {
+				if ins.isIgnoredIP(ip) {
+					continue
+				}
 				if _, dup := seen[ip]; dup {
 					continue
 				}

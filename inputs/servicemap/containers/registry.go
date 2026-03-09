@@ -544,7 +544,7 @@ func (r *Registry) processEvent(event *tracer.Event) {
 }
 
 // parseListenIP 从 "host:port" 格式的地址字符串中提取 IP 部分。
-// 监听地址为 0.0.0.0 或 :: （所有接口）时统一返回 "0.0.0.0"，
+// 监听地址为 0.0.0.0 或 :: （所有接口）时保留其地址族信息，
 // 具体 IP 则原样返回。
 func parseListenIP(addr string) string {
 	if addr == "" {
@@ -558,9 +558,11 @@ func parseListenIP(addr string) string {
 		}
 		return "0.0.0.0"
 	}
-	if host == "" || host == "::" {
-		// IPv6 任意地址，统一标记为 "0.0.0.0"（表示所有接口）
+	if host == "" {
 		return "0.0.0.0"
+	}
+	if host == "::" {
+		return "::"
 	}
 	return host
 }

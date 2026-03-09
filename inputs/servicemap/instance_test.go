@@ -2,6 +2,7 @@ package servicemap
 
 import (
 	"fmt"
+	"net"
 	"strings"
 	"testing"
 	"time"
@@ -202,6 +203,56 @@ func TestCollectTCPStats_MultiDestination(t *testing.T) {
 	}
 	if toFloat(s5432.Value) != 8 {
 		t.Errorf("10.0.0.3:5432 connects: got %.0f, want 8", toFloat(s5432.Value))
+	}
+}
+
+func TestCollectListenEndpoints_RespectsIgnoreCIDRsForExplicitAndExpandedIPs(t *testing.T) {
+	ins := newTestInstance()
+	ins.hostIPs = []string{"172.17.0.1", "10.0.0.8"}
+	_, n1, _ := net.ParseCIDR("127.0.0.0/8")
+	_, n2, _ := net.ParseCIDR("172.17.0.0/16")
+	ins.ignoredNets = []*net.IPNet{n1, n2}
+
+	c := containers.NewContainer("cid-listen-1")
+	c.AddListenEndpoint(9090, "0.0.0.0")
+	c.AddListenEndpoint(8080, "127.0.0.1")
+
+	slist := types.NewSampleList()
+	ins.collectListenEndpoints(c, map[string]string{"client_id": c.ID}, slist)
+	m := sampleMap(slist)
+	samples := m[inputName+"_listen_endpoint"]
+
+	for _, s := range samples {
+		if s.Labels["listen_ip"] == "127.0.0.1" {
+			t.Fatalf("unexpected loopback listen_endpoint when 127.0.0.0/8 is ignored: %+v", s.Labels)
+		}
+		if s.Labels["listen_ip"] == "172.17.0.1" {
+			t.Fatalf("unexpected expanded host IP when 172.17.0.0/16 is ignored: %+v", s.Labels)
+		}
+	}
+
+	if findByLabel(samples, "listen_ip", "10.0.0.8") == nil {
+		t.Fatal("expected non-ignored expanded host IP 10.0.0.8 to be reported")
+	}
+}
+
+func TestCollectListenEndpoints_ZeroAddrFamilyAwareLoopbackSupplement(t *testing.T) {
+	ins := newTestInstance()
+	ins.hostIPs = []string{"192.168.1.20"}
+
+	c := containers.NewContainer("cid-listen-2")
+	c.AddListenEndpoint(9090, "0.0.0.0")
+
+	slist := types.NewSampleList()
+	ins.collectListenEndpoints(c, map[string]string{"client_id": c.ID}, slist)
+	m := sampleMap(slist)
+	samples := m[inputName+"_listen_endpoint"]
+
+	if findByLabel(samples, "listen_ip", "127.0.0.1") == nil {
+		t.Fatal("expected 127.0.0.1 to be supplemented for 0.0.0.0 listener")
+	}
+	if findByLabel(samples, "listen_ip", "::1") != nil {
+		t.Fatal("did not expect ::1 to be supplemented for 0.0.0.0 listener")
 	}
 }
 

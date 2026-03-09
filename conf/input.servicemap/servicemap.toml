@@ -33,7 +33,13 @@ api_addr = ":9099"
 # 忽略的端口列表（如 SSH、监控端口等）
 ignore_ports = [22, 9100]
 
-# 忽略的 CIDR 列表（如本地回环）
+# 忽略的 CIDR 列表（如本地回环）。
+# 同时作用于：
+#   1) edge_* 指标中的 destination_host / destination_port
+#   2) listen_endpoint 指标中的 listen_ip
+# 例如：
+#   - 配置 ["127.0.0.0/8"] 后，会同时过滤 127.0.0.1 与 ::1
+#   - 若希望保留 localhost 拓扑边，请不要忽略 127.0.0.0/8
 ignore_cidrs = ["127.0.0.0/8"]
 
 # ─── 容器发现配置 ──────────────────────────────
