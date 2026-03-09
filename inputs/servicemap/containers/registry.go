@@ -513,7 +513,7 @@ func (r *Registry) processEvent(event *tracer.Event) {
 			return
 		}
 		if event.Type == tracer.EventTypeListenClose {
-			container.RemoveListenEndpoint(event.SrcPort)
+			container.RemoveListenEndpoint(event.SrcPort, parseListenIP(event.SrcAddr))
 			return
 		}
 	}

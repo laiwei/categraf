@@ -66,11 +66,13 @@ type Container struct {
 	HTTPStats map[string]*HTTPStats
 	L7Stats   map[string]*L7Stats // 非 HTTP 协议的 L7 统计
 
-	// ListenEndpoints: 监听端口 → 监听 IP（由 registry 在 ListenOpen/ListenClose 时维护）
+	// ListenEndpoints: 监听端口 → 绑定 IP 集合（由 registry 在 ListenOpen/ListenClose 时维护）
+	// 同一端口可同时绑定多个 IP（如 127.0.0.1:18789 与 [::1]:18789 并存），
+	// 因此值为 IP 集合（map[string]struct{}）而非单个字符串，防止后写覆盖先写。
 	// "0.0.0.0" 或 "::" 表示监听所有接口；具体 IP 表示绑定到特定接口。
 	// 供 Gather 生成 servicemap_listen_endpoint 指标，用于跨主机 P2P 拓扑 JOIN。
 	// 由 mu 保护。
-	ListenEndpoints map[uint16]string
+	ListenEndpoints map[uint16]map[string]struct{}
 
 	// 活跃连接追踪 — 由 mu 保护
 	mu                sync.RWMutex
@@ -99,7 +101,7 @@ func NewContainer(id string) *Container {
 		TCPStats:          make(map[string]*TCPStats),
 		HTTPStats:         make(map[string]*HTTPStats),
 		L7Stats:           make(map[string]*L7Stats),
-		ListenEndpoints:   make(map[uint16]string),
+		ListenEndpoints:   make(map[uint16]map[string]struct{}),
 		activeConnections: make(map[uint64]*ConnectionTracker),
 		connectionsByDest: make(map[string][]uint64),
 		LastActivity:      time.Now(),
@@ -561,27 +563,47 @@ func (c *Container) GetL7StatsSnapshot() map[string]*L7Stats {
 	return snapshot
 }
 
-// AddListenEndpoint 记录该容器在 port 上的监听（listenIP 可为 "0.0.0.0"/"::" 或具体 IP）
+// AddListenEndpoint 记录该容器在 port:listenIP 上的监听（listenIP 可为 "0.0.0.0"/"::" 或具体 IP）
+// 同一端口可绑定多个 IP（如同时监听 127.0.0.1:18789 和 [::1]:18789），集合结构确保不丢失。
 func (c *Container) AddListenEndpoint(port uint16, listenIP string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.ListenEndpoints[port] = listenIP
+	if _, ok := c.ListenEndpoints[port]; !ok {
+		c.ListenEndpoints[port] = make(map[string]struct{})
+	}
+	c.ListenEndpoints[port][listenIP] = struct{}{}
 }
 
-// RemoveListenEndpoint 删除该容器在 port 上的监听记录
-func (c *Container) RemoveListenEndpoint(port uint16) {
+// RemoveListenEndpoint 删除该容器在 port:listenIP 上的监听记录。
+// listenIP 为空时删除该端口所有绑定 IP（整个端口关闭）；
+// 否则仅删除指定 IP，当集合变空时自动清除端口条目。
+func (c *Container) RemoveListenEndpoint(port uint16, listenIP string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	delete(c.ListenEndpoints, port)
+	if listenIP == "" {
+		delete(c.ListenEndpoints, port)
+		return
+	}
+	if ips, ok := c.ListenEndpoints[port]; ok {
+		delete(ips, listenIP)
+		if len(ips) == 0 {
+			delete(c.ListenEndpoints, port)
+		}
+	}
 }
 
-// GetListenEndpointsSnapshot 返回 ListenEndpoints 的深拷贝（线程安全）
-func (c *Container) GetListenEndpointsSnapshot() map[uint16]string {
+// GetListenEndpointsSnapshot 返回 ListenEndpoints 的深拷贝（线程安全）。
+// 返回 map[uint16][]string：端口 → 该端口绑定的所有 IP 列表（可能含多个）。
+func (c *Container) GetListenEndpointsSnapshot() map[uint16][]string {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	snapshot := make(map[uint16]string, len(c.ListenEndpoints))
-	for port, ip := range c.ListenEndpoints {
-		snapshot[port] = ip
+	snapshot := make(map[uint16][]string, len(c.ListenEndpoints))
+	for port, ips := range c.ListenEndpoints {
+		sl := make([]string, 0, len(ips))
+		for ip := range ips {
+			sl = append(sl, ip)
+		}
+		snapshot[port] = sl
 	}
 	return snapshot
 }

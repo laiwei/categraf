@@ -542,22 +542,32 @@ func (ins *Instance) collectListenEndpoints(container *containers.Container, bas
 		}
 	}
 
-	for port, listenIP := range endpoints {
+	for port, boundIPs := range endpoints {
 		portStr := strconv.Itoa(int(port))
-		var listenIPs []string
-		if listenIP == "" || listenIP == "0.0.0.0" || listenIP == "::" {
-			// 监听所有接口：展开为主机实际 IP（便于 JOIN）
-			listenIPs = ins.hostIPs
-		} else {
-			listenIPs = []string{listenIP}
-		}
-		for _, ip := range listenIPs {
-			tags := mergeTags(serverTags, map[string]string{
-				"listen_ip": ip,
-				"port":      portStr,
-			})
-			// Gauge = 1（presence metric，存在即为 1，消失代表端口已关闭）
-			slist.PushFront(types.NewSample(inputName, "listen_endpoint", 1.0, tags))
+		// 同一端口可能绑定多个 IP（如同时监听 127.0.0.1 和 ::1）；
+		// 0.0.0.0/:: 展开为主机所有非回环 IP，具体 IP 原样保留。
+		// seen 用于去重：防止 0.0.0.0 与 :: 双绑场景生成重复指标。
+		seen := make(map[string]struct{})
+		for _, listenIP := range boundIPs {
+			var expandIPs []string
+			if listenIP == "" || listenIP == "0.0.0.0" || listenIP == "::" {
+				// 监听所有接口：展开为主机实际 IP（便于 JOIN）
+				expandIPs = ins.hostIPs
+			} else {
+				expandIPs = []string{listenIP}
+			}
+			for _, ip := range expandIPs {
+				if _, dup := seen[ip]; dup {
+					continue
+				}
+				seen[ip] = struct{}{}
+				tags := mergeTags(serverTags, map[string]string{
+					"listen_ip": ip,
+					"port":      portStr,
+				})
+				// Gauge = 1（presence metric，存在即为 1，消失代表端口已关闭）
+				slist.PushFront(types.NewSample(inputName, "listen_endpoint", 1.0, tags))
+			}
 		}
 	}
 }
