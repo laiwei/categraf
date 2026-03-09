@@ -1100,9 +1100,14 @@ func (t *Tracer) pollConnections() int {
 	t.listenPorts = discoveredListens
 	t.listenMu.Unlock()
 
-	// 新出现的监听端口 → ListenOpen（PID=0 的事件会被 registry.processEvent 跳过）
+	// 新出现的监听端口 → ListenOpen
+	// netlink 路径下 Pid=0（内核不返回 PID），registry.processEvent 会丢弃 Pid=0 事件。
+	// 因此对 Pid=0 的新端口，补调 gopsutil 按端口号反查 PID，以确保 listen_endpoint 指标正常上报。
 	for key, ev := range listenEvents {
 		if _, existed := prevListenPorts[key]; !existed {
+			if ev.Pid == 0 {
+				ev.Pid, ev.Comm = lookupListenPIDByPort(key.Port)
+			}
 			ev.Timestamp = nowNano
 			select {
 			case t.eventChan <- ev:
@@ -1387,6 +1392,22 @@ func isTrackedTCPConnection(c gopsnet.ConnectionStat) bool {
 	}
 
 	return true
+}
+
+// lookupListenPIDByPort 在 netlink 不返回 PID 的情况下，通过 gopsutil 按端口反查
+// 正在监听该端口的进程 PID 和进程名。找不到时返回 (0, "")，调用方需处理 Pid=0 的情况。
+func lookupListenPIDByPort(port uint16) (pid uint32, comm string) {
+	conns, err := gopsnet.Connections("tcp")
+	if err != nil {
+		return 0, ""
+	}
+	for _, c := range conns {
+		if strings.ToUpper(c.Status) == "LISTEN" && uint16(c.Laddr.Port) == port && c.Pid > 0 {
+			p := uint32(c.Pid)
+			return p, readProcComm(p)
+		}
+	}
+	return 0, ""
 }
 
 func connectionFD(c gopsnet.ConnectionStat) uint64 {
