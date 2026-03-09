@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"sort"
 	"strings"
@@ -305,7 +306,9 @@ func addProtocol(protocols *[]string, proto string) {
 // 内嵌 HTTP API 服务
 // ─────────────────────────────────────────────────────────────
 
-// startAPIServer 在 APIAddr 上启动内嵌 HTTP 服务（若 APIAddr 为空则不启动）
+// startAPIServer 在 APIAddr 上启动内嵌 HTTP 服务（若 APIAddr 为空则不启动）。
+// 采用 net.Listen（同步 bind）+ goroutine Serve 模式：
+// 确保函数返回时端口已绑定，后续 SeedListenPorts() 能通过 gopsutil 找到该端口。
 func (ins *Instance) startAPIServer() {
 	if ins.APIAddr == "" {
 		return
@@ -329,9 +332,16 @@ func (ins *Instance) startAPIServer() {
 		IdleTimeout:  60 * time.Second,
 	}
 
+	// 同步 bind：net.Listen 在此处完成 bind 系统调用，kprobe 事件已入队列，
+	// 后续 SeedListenPorts() 通过 gopsutil 也能立即找到此端口。
+	ln, err := net.Listen("tcp", ins.APIAddr)
+	if err != nil {
+		log.Printf("E! servicemap: API server listen on %s failed: %v", ins.APIAddr, err)
+		return
+	}
 	go func() {
 		log.Printf("I! servicemap: graph API listening on http://%s/graph", ins.APIAddr)
-		if err := ins.apiServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := ins.apiServer.Serve(ln); err != nil && err != http.ErrServerClosed {
 			log.Printf("E! servicemap: API server error: %v", err)
 		}
 	}()

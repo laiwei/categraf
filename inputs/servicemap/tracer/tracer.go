@@ -826,6 +826,47 @@ func (t *Tracer) syncBPFByteCounters() {
 	}
 }
 
+// SeedListenPorts 使用 gopsutil 扫描当前所有 LISTEN 端口并向 registry 发出 ListenOpen 事件。
+// 与 seedExistingConnections 不同，此函数设计为在 registry 和 API server 完全启动后调用：
+//   - API server 端口（如 :9099）在 startAPIServer 同步 bind 后即可被此函数发现
+//   - 同时更新 t.listenPorts，确保 polling 模式不会将这些端口重复发出 ListenOpen
+//
+// 兼容 eBPF 和 polling 两种模式；重复调用 AddListenEndpoint 无害（幂等）。
+func (t *Tracer) SeedListenPorts() {
+	conns, err := gopsnet.Connections("tcp")
+	if err != nil {
+		log.Printf("W! servicemap: seed listen ports failed: %v", err)
+		return
+	}
+
+	nowNano := uint64(time.Now().UnixNano())
+	count := 0
+	for _, c := range conns {
+		if strings.ToUpper(c.Status) != "LISTEN" {
+			continue
+		}
+		pid := uint32(c.Pid)
+		if pid == 0 {
+			continue
+		}
+		event := Event{
+			Type:      EventTypeListenOpen,
+			Timestamp: nowNano,
+			Pid:       pid,
+			SrcAddr:   endpoint(c.Laddr.IP, c.Laddr.Port),
+			SrcPort:   uint16(c.Laddr.Port),
+			Comm:      readProcComm(pid),
+		}
+		t.handleListenEvent(&event)
+		select {
+		case t.eventChan <- event:
+			count++
+		default:
+		}
+	}
+	log.Printf("I! servicemap: seeded %d listen endpoints via gopsutil", count)
+}
+
 // seedExistingConnections 在 eBPF 启动后一次性扫描当前系统 TCP 连接和监听端口。
 // eBPF kprobe 只能捕获 attach 之后新发生的事件，预存连接对 kprobe 不可见。
 // 使用 gopsutil（而非 netlink）因为需要 PID 信息来将连接映射到容器/进程。

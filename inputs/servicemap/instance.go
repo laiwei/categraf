@@ -142,8 +142,18 @@ func (ins *Instance) Init() error {
 
 	ins.registry = reg
 
-	// 启动内嵌 Graph API server
+	// 启动内嵌 Graph API server（同步 bind 端口后返回，goroutine 在后台 Accept）
 	ins.startAPIServer()
+
+	// 全量扫描当前所有 LISTEN 端口并写入 registry。
+	// 必须在 startAPIServer 之后调用，确保 API server 端口（如 :9099）已 bind：
+	//   - eBPF 模式：seedExistingConnections 在 registry 创建前运行，且 :9099 彼时未 bind，
+	//               需要此处补充；kprobe 事件也可能因竞争未被 processEvent 处理。
+	//   - polling 模式：首次 pollConnections 可能早于 startAPIServer bind，
+	//                  此处保证后绑端口也能被捕获。
+	if ins.tracer != nil {
+		ins.tracer.SeedListenPorts()
+	}
 
 	log.Printf("I! servicemap: instance initialized successfully")
 	return nil
