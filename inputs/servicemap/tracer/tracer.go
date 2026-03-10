@@ -132,6 +132,10 @@ const (
 	// P0-2: 连接过期超时
 	connectionGCInterval = 30 * time.Second
 	connectionTimeout    = 5 * time.Minute
+
+	// listenRefreshInterval 是周期刷新监听端口状态的间隔。
+	// 必须 < registry.containerTimeout（5min），确保工作中的监听进程在 GC 前已刷新 LastActivity。
+	listenRefreshInterval = 2 * time.Minute
 )
 
 // Tracer eBPF追踪器
@@ -342,7 +346,8 @@ func (t *Tracer) Start() error {
 	t.seedExistingConnections()
 
 	t.launchBackground(t.startConnectionGC)
-	t.launchBackground(t.startBPFByteSync) // 定期从 BPF map 同步字节计数器到 Go 侧
+	t.launchBackground(t.startBPFByteSync)       // 定期从 BPF map 同步字节计数器到 Go 侧
+	t.launchBackground(t.startListenRefreshLoop) // 定期刷新监听端口状态，防止纯监听进程被 GC 误杀
 	log.Println("I! servicemap: eBPF tracer started")
 	t.started = true
 	return nil
@@ -357,6 +362,7 @@ func (t *Tracer) startFallbackMode() {
 	}
 	t.launchBackground(t.startPollingTracer)
 	t.launchBackground(t.startConnectionGC)
+	t.launchBackground(t.startListenRefreshLoop) // 定期刷新监听端口状态，防止纯监听进程被 GC 误杀
 	t.started = true
 }
 
@@ -823,6 +829,29 @@ func (t *Tracer) syncBPFByteCounters() {
 
 	if synced > 0 {
 		log.Printf("D! servicemap: synced byte counters for %d active connections from BPF map", synced)
+	}
+}
+
+// startListenRefreshLoop 周期调用 SeedListenPorts，刷新监听端口对应容器的 LastActivity。
+//
+// 解决的问题：纯监听进程（nc/nginx/sshd 等）在没有 TCP 连接的情况下，容器的 LastActivity
+// 将永远停止在 ListenOpen 事件被处理的时刻。经过 containerTimeout（5分钟）后，
+// registry.gcContainers 会删除这些容器。而删除后下一个轮询周期不会重新发出
+// ListenOpen（该端口已在 t.listenPorts 中，不是“新端口”），导致监听端点永久消失。
+//
+// 周期刷新确保：
+//   - 容器未被 GC：ListenOpen 将 LastActivity 刷新，GC 计时器重置
+//   - 容器已被 GC：ListenOpen 触发 getOrCreateContainer 重建容器
+func (t *Tracer) startListenRefreshLoop() {
+	ticker := time.NewTicker(listenRefreshInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-t.closeChan:
+			return
+		case <-ticker.C:
+			t.SeedListenPorts()
+		}
 	}
 }
 

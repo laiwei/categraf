@@ -592,6 +592,28 @@ func (c *Container) RemoveListenEndpoint(port uint16, listenIP string) {
 	}
 }
 
+// HasActiveListenPorts 返回该容器是否有任意端口在操作系统中仍处于监听状态。
+// isListening 是坥平 tracer.IsListening 传入的回调，避免导入循环依赖。
+// 用于 GC 内保护纯监听进程（nc/nginx/sshd 等）不被误杀。
+func (c *Container) HasActiveListenPorts(isListening func(port uint16) bool) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	for port := range c.ListenEndpoints {
+		if isListening(port) {
+			return true
+		}
+	}
+	return false
+}
+
+// RefreshLastActivity 将 LastActivity 设置为指定时刻（线程安全）。
+// 用于 GC 中对仍有活跃监听端口的容器重置超时计时器。
+func (c *Container) RefreshLastActivity(now time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.LastActivity = now
+}
+
 // GetListenEndpointsSnapshot 返回 ListenEndpoints 的深拷贝（线程安全）。
 // 返回 map[uint16][]string：端口 → 该端口绑定的所有 IP 列表（可能含多个）。
 func (c *Container) GetListenEndpointsSnapshot() map[uint16][]string {

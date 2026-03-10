@@ -961,6 +961,13 @@ func (r *Registry) gcContainers() {
 		if c.ActiveConnectionCount() > 0 {
 			continue
 		}
+		// 双保险：如果容器有未关闭的监听端口，刷新 LastActivity 而非删除。
+		// startListenRefreshLoop 周期刷新是主要机制，此处是 GC 中的丬保暝：
+		// 即使周期刷新和 GC 出现时序竞争，也能防止纯监听进程被误杀。
+		if r.tracer != nil && c.HasActiveListenPorts(r.tracer.IsListening) {
+			c.RefreshLastActivity(now)
+			continue
+		}
 		// 跳过最近活跃的容器
 		if now.Sub(c.LastActivity) < containerTimeout {
 			continue
