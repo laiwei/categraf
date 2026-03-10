@@ -181,44 +181,77 @@ eBPF 仅支持 Linux。在非 Linux 系统上：
 创建配置文件 `conf/input.servicemap/servicemap.toml`:
 
 ```toml
+# 采集间隔（秒）
+interval = 5
+
 [[instances]]
-interval = 60
 
-# 启用 TCP 连接跟踪
+# ─── TCP / HTTP / L7 开关 ───────────────────────────────
 enable_tcp = true
-
-# 启用 HTTP 请求跟踪
 enable_http = true
-enable_l7_tracing = true
+# 设为 true 可关闭 L7 协议解析（MySQL/Postgres/Redis/Kafka）
+disable_l7_tracing = false
 
-# 容器发现
-enable_docker = true
-enable_k8s = true
-enable_cgroup = true
+# ─── 资源限制（0 = 使用默认值）────────────────────
+# max_tracked_connections = 50000
+# max_containers = 5000
 
-# 过滤配置
-ignore_ports = [22, 9100]
-ignore_cidrs = ["127.0.0.0/8"]
-
-# Docker label 白名单：只有列出的 label key 才会透传为 Prometheus 标签
-# 留空则不透传任何 Docker label（推荐，防止高基数标签导致时序爆炸）
-# label_allowlist = ["app", "version", "team"]
-
-# Graph API 服务地址（可选）
-# 启用后在该地址上同时暴露：
-#   /graph         — JSON 服务拓扑图（供 servicemap-aggregator 和可视化使用）
-#   /graph/text    — 纯文本摘要
-#   /graph/view    — 内嵌浏览器可视化页面
-#   /graph/debug   — 调试信息（原始容器/连接状态）
-#   /metrics       — Prometheus text format（可被 Prometheus 直接 scrape）
-#   /health        — 健康探针（始终返回 200 "ok"）
-# 留空则不启动 Graph API 服务器
+# ─── Graph API 服务地址 ─────────────────────────────
+# 启用后可通过以下方式查看服务拓扑：
+#   curl http://localhost:9099/graph                  # JSON 完整输出
+#   curl http://localhost:9099/graph?filter=nc        # 按名称过滤
+#   curl http://localhost:9099/graph?edges_only=true  # 仅有连接的节点
+#   curl http://localhost:9099/graph/text             # 人类可读文本格式（含 ASCII 拓扑）
+#   curl http://localhost:9099/graph/text?filter=nc   # 文本 + 过滤
+#   浏览器打开 http://localhost:9099/graph/view       # 交互式可视化拓扑
+#   curl http://localhost:9099/graph/debug            # 诊断信息
+#   curl http://localhost:9099/graph/debug?search=nc  # 搜索特定容器
+#   curl http://localhost:9099/health                 # 健康检查
 api_addr = ":9099"
 
-# 附加标签（框架自动注入到所有指标）
+# ─── 过滤配置 ────────────────────────────────────
+# 忽略的端口列表（如 SSH、监控端口等）
+ignore_ports = [22, 9100]
+
+# 忽略的 CIDR 列表（如本地回环）。
+# 同时作用于：
+#   1) edge_* 指标中的 destination_host / destination_port
+#   2) listen_endpoint 指标中的 listen_ip
+# 例如：
+#   - 配置 ["127.0.0.0/8"] 后，会同时过滤 127.0.0.1 与 ::1
+#   - 若希望保留 localhost 拓扑边，请不要忽略 127.0.0.0/8
+ignore_cidrs = ["127.0.0.0/8"]
+
+# ─── 容器发现配置 ──────────────────────────────
+# Docker socket 路径（空值使用默认 /var/run/docker.sock）
+docker_socket = "/var/run/docker.sock"
+
+# 启用 Docker 容器发现
+enable_docker = true
+
+# 启用 Kubernetes 容器发现（需同时配置 kubeconfig_path）
+enable_k8s = false
+
+# 启用 Cgroup 容器发现（最基础的方式）
+enable_cgroup = true
+
+# Kubernetes kubeconfig 路径（留空使用 in-cluster 配置）
+# kubeconfig_path = ""
+
+# Docker label 白名单：只有在此列表中的 label key 才会被输出为 Prometheus 标签。
+# 留空则不透传任何 Docker label（推荐，避免高基数标签导致时序爆炸）。
+# label_allowlist = ["app", "version", "service"]
+
+# ─── 附加标签 ──────────────────────────────────
 [instances.labels]
   # env = "production"
   # cluster = "cluster-1"
+
+## 注意事项：
+## 1. 此插件需要 root 权限运行（eBPF 需要 CAP_SYS_ADMIN）
+## 2. Linux 内核版本需 >= 4.16
+## 3. 需要挂载 /sys/fs/cgroup 和 /proc
+## 4. 建议在容器中以 privileged 模式运行
 ```
 
 ## 指标列表
